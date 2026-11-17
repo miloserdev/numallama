@@ -1,0 +1,19 @@
+# build outputs
+/runq
+/runq_prof
+/build/
+*.o
+# python
+__pycache__/
+*.pyc
+# editors
+.vscode/
+# model files and calibration stats are large and live outside the repo
+*.gguf
+*.npz
+models/
+/tests/dump_logits
+/tests/encode
+/tests/check_batch
+/tests/check_multi
+/tests/check_draft
