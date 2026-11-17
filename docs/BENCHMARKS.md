@@ -37,6 +37,19 @@ Quality, Llama 3.2 3B, mean KL divergence to full precision on the same 4 x 512-
 | llama.cpp Q4_0 | 0.025 | 94.6% |
 | numallama Q4 (symmetric, groups of 32) | 0.038 | 92.8% |
 
+## Mixture of experts: Qwen3-30B-A3B-Instruct-2507 (abliterated), Q8 (32 GB)
+
+128 experts x 768, 8 active per token (~3.3B active parameters out of 30.5B), 48 layers.
+
+| | 1 socket | 2 sockets |
+|---|---|---|
+| decode | 36–43 tok/s | ~41 tok/s |
+| prefill (batched, grouped by expert) | — | 204 tok/s (token by token: 55) |
+
+Logits vs an fp32 numpy reference: top-1 97.7%, mean KL 0.0075. Decode is barrier-bound
+(~10 synchronizations per layer x 48 layers): ~40% of the time is spent waiting; reducing the
+number of cross-socket synchronizations is the next step for MoE.
+
 ## Speculative decoding (Llama 3.1 8B Q8, 2 sockets, greedy)
 
 | Task | plain | prompt lookup (`-k 8`) | + draft Llama 3.2 1B (`-d`) |

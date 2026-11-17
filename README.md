@@ -1,12 +1,15 @@
-# numallama — fast NUMA-aware CPU inference for Llama 3.x and Qwen2.5
+# numallama — fast NUMA-aware CPU inference for Llama 3.x, Qwen2.5 and Qwen3 / Qwen3-MoE
 
-numallama (code name) is a small C inference engine (one `.c` file + a header, no dependencies) for Llama 3.x and Qwen2.5
-models, tuned for large Arm servers (Ampere Altra / Neoverse N1, NEON + dotprod) and multi-socket
+numallama (code name) is a small C inference engine (one `.c` file + a header, no dependencies) for Llama 3.x, Qwen2.5 and
+Qwen3 / Qwen3-MoE models, tuned for large Arm servers (Ampere Altra / Neoverse N1, NEON + dotprod) and multi-socket
 NUMA machines. It started as a fork of [jameswdelancey/llama3.c](https://github.com/jameswdelancey/llama3.c),
 itself derived from Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama2.c).
 
 Highlights:
 
+- **Mixture of experts (Qwen3-MoE, e.g. Qwen3-30B-A3B)**: int8 router, top-k routing, every expert
+  split evenly between the NUMA nodes; batched prefill groups the tokens by expert so every expert is
+  read once per block. Also Qwen3 attention (head_dim != dim / heads, per-head q/k RMSNorm).
 - **int8 (Q8) and 4-bit (Q4) weights** with NEON `sdot` kernels (single token, 4x4 batched).
 - **Multi-socket NUMA**: every weight matrix and the KV cache are split between the sockets
   (`mbind`), each socket's threads compute only its rows, per-node work counters and per-node
@@ -58,6 +61,10 @@ python3 scripts/export_hf_q8.py /path/to/Llama-3.1-8B-Instruct llama31_8b_q80.bi
 python3 scripts/export_hf_q8.py /path/to/model model_q4.bin --q4                 # all matrices
 python3 scripts/export_hf_q8.py /path/to/model model_q4.bin --q4 wq,wk,wv,wo,w1,w3
 
+# Qwen3-MoE (e.g. Qwen3-30B-A3B-Instruct-2507): ~32 GB in Q8
+python3 scripts/export_hf_q8.py /path/to/Qwen3-30B-A3B-Instruct-2507 qwen3_30b_a3b_q80.bin
+python3 scripts/export_tokenizer.py /path/to/Qwen3-30B-A3B-Instruct-2507 qwen3_tokenizer.bin
+
 # Qwen2.5: calibrate, export with SmoothQuant, export its tokenizer
 python3 scripts/calibrate.py /path/to/Qwen2.5-7B-Instruct calib.txt qwen7b.npz
 python3 scripts/export_hf_q8.py /path/to/Qwen2.5-7B-Instruct qwen7b_q80.bin --imatrix qwen7b.npz --smooth 0.5
@@ -87,7 +94,7 @@ python3 scripts/export_tokenizer.py /path/to/Qwen2.5-7B-Instruct qwen7b_tokenize
 | `-T <n>` | threads (default 0 = all idle CPUs of the used NUMA nodes, at most 96 per node) |
 | `-N <n>` | NUMA nodes to use (default 0 = all); weights are split between them |
 | `-c <n>` | context window (KV cache size), default 8192 |
-| `-k <n>` | max prompt-lookup draft length, default 8, `0` = off |
+| `-k <n>` | max prompt-lookup draft length, default 8, `0` = off (not yet for MoE / Qwen3 models) |
 | `-d <file>` | draft model for speculative decoding |
 | `-f <file>` | tools file, enables tool calling in chat |
 | `-t`, `-p`, `-s` | temperature, top-p, seed |

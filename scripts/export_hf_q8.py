@@ -10,13 +10,17 @@ Header extension (inside the 256-byte v2 header, after group_size, all little-en
     int arch (0 = llama3, 1 = qwen2), float norm_eps, int qkv_bias,
     int special_start (first special token id), int bos_id, int eos_id
     int q4_mask: bit k set = matrix kind k (0 wq, 1 wk, 2 wv, 3 wo, 4 w1, 5 w2, 6 w3) is stored as Q4
+    int head_dim, n_experts, n_active, moe_hidden, qk_norm, norm_topk   (Qwen3 / Qwen3-MoE; 0 = n/a)
+fp32 section: attention norms, ffn norms, final norm, [qkv biases], [q_norm (L, head_dim), k_norm (L, head_dim)]
+MoE layers: router wg (L, n_experts, dim) in Q8 after wo; w1/w3 (L, n_experts * moe_hidden, dim) and
+w2 (L, n_experts * dim, moe_hidden), every expert a contiguous block of rows.
 If qkv_bias, the fp32 section continues after the final norm with bq (L, dim), bk (L, kv_dim), bv (L, kv_dim).
 Q8 tensors: int8 values, then fp32 scales per `gs` values. Q4 tensors: groups of 32 values packed in
 16 bytes (byte k = value k in the low nibble, value k+16 in the high nibble, stored as q+8), then fp32
 scales per 32 values. Embedding / classifier are always Q8.
 
     python3 export_hf_q8.py <hf dir> <out.bin> [gs] [--q4 [kinds]]   kinds e.g. wq,wk,wo,w1,w3 (default all)
-Supported: LlamaForCausalLM (Llama 3.x), Qwen2ForCausalLM (Qwen2.5).
+Supported: LlamaForCausalLM (Llama 3.x), Qwen2ForCausalLM (Qwen2.5), Qwen3ForCausalLM, Qwen3MoeForCausalLM.
 """
 import json
 import os
@@ -125,7 +129,7 @@ def load_imatrix(path):
 def _quant_job(key):
     kind, l = key
     w = _JOB["get"][kind](l)
-    if kind in _JOB["q4"]:
+    if kind in _JOB["q4"] and kind != "wg":
         imp = _JOB["imp"].get(f"{INPUT_OF[kind]}.{l}.sq") if _JOB["imp"] else None
         q, sc, err = quantize_q4(w, imp=imp)
     else:
@@ -172,8 +176,15 @@ def main():
     nkv = cfg.get("num_key_value_heads", nh)
     vocab = cfg["vocab_size"]
     seq_len = cfg["max_position_embeddings"]
-    head_dim = cfg.get("head_dim", dim // nh)
-    assert head_dim * nh == dim, "head_dim * n_heads must equal dim"
+    head_dim = cfg.get("head_dim") or dim // nh
+    mt = cfg.get("model_type", "llama")
+    moe = mt == "qwen3_moe"
+    n_experts = cfg.get("num_experts", 0) if moe else 0
+    n_active = cfg.get("num_experts_per_tok", 0) if moe else 0
+    moe_hidden = cfg.get("moe_intermediate_size", 0) if moe else 0
+    if moe:
+        hidden = moe_hidden # the group size must divide the rows of w2 (= one expert's hidden size)
+    qk_norm = int("model.layers.0.self_attn.q_norm.weight" in T)
     emb = T["model.embed_tokens.weight"]
     shared = cfg.get("tie_word_embeddings", False) or "lm_head.weight" not in T
     if not shared and np.array_equal(emb, T["lm_head.weight"]):
@@ -198,15 +209,15 @@ def main():
     out.write(struct.pack("<B", int(shared)))
     out.write(struct.pack("<i", gs))
     out.write(struct.pack("<ffffi", *rope))
-    mt = cfg.get("model_type", "llama")
-    arch = {"llama": 0, "qwen2": 1}[mt]
+    arch = {"llama": 0, "qwen2": 1, "qwen3": 2, "qwen3_moe": 2}[mt]
     qkv_bias = int(f"model.layers.0.self_attn.q_proj.bias" in T)
-    special_start = {0: 128000, 1: 151643}[arch]
+    special_start = {0: 128000, 1: 151643, 2: 151643}[arch]
     eos = cfg.get("eos_token_id", 0)
     eos = eos[0] if isinstance(eos, list) else eos
     bos = cfg.get("bos_token_id") or special_start
     out.write(struct.pack("<ifiiii", arch, float(cfg.get("rms_norm_eps", 1e-5)), qkv_bias, special_start, bos, eos))
     out.write(struct.pack("<i", q4_mask))
+    out.write(struct.pack("<6i", head_dim, n_experts, n_active, moe_hidden, qk_norm, int(bool(cfg.get("norm_topk_prob", False)))))
     out.write(b"\0" * (256 - out.tell()))
 
     p = "model.layers.{}."
@@ -254,6 +265,11 @@ def main():
             w = w / S("w2_in", l)[:, None]
         return w
 
+    def experts(l, name):
+        """all experts of a MoE layer stacked along the rows (expert e = rows block e)"""
+        q = p.format(l)
+        return np.concatenate([T[f"{q}mlp.experts.{e}.{name}.weight"].astype(np.float32) for e in range(n_experts)], 0)
+
     def norm(name, key, l):
         n = T[p.format(l) + name].astype(np.float32)
         return n / S(key, l) if SM else n
@@ -271,6 +287,11 @@ def main():
         for l in range(L):
             bv = T[p.format(l) + "self_attn.v_proj.bias"].astype(np.float32)
             out.write((bv / S("v", l) if SM else bv).tobytes())
+    if qk_norm: # per-head norms, permuted inside the head like the q/k rows
+        for l in range(L):
+            out.write(hf_to_meta_qk(T[p.format(l) + "self_attn.q_norm.weight"].astype(np.float32), 1).tobytes())
+        for l in range(L):
+            out.write(hf_to_meta_qk(T[p.format(l) + "self_attn.k_norm.weight"].astype(np.float32), 1).tobytes())
 
     maxerr = 0.0
 
@@ -287,9 +308,9 @@ def main():
         lambda l: hf_to_meta_qk(eff("wk", l), nkv),
         lambda l: eff("wv", l),
         lambda l: eff("wo", l),
-        lambda l: eff("w1", l),
-        lambda l: eff("w2", l),
-        lambda l: eff("w3", l),
+        (lambda l: experts(l, "gate_proj")) if moe else (lambda l: eff("w1", l)),
+        (lambda l: experts(l, "down_proj")) if moe else (lambda l: eff("w2", l)),
+        (lambda l: experts(l, "up_proj")) if moe else (lambda l: eff("w3", l)),
     ]
     imp = None
     if stats is not None:   # importance of the (smoothed) inputs: E[(x/s)^2]
@@ -299,7 +320,11 @@ def main():
                 v = stats[f"{key}.{l}.sq"]
                 imp[f"{key}.{l}.sq"] = v / S(key, l) ** 2 if SM else v
     _JOB.update(get=dict(zip(KINDS, getters)), q4=q4_kinds, gs=gs, imp=imp)
-    keys = [(kind, l) for kind in KINDS for l in range(L)]
+    keys = [(kind, l) for kind in KINDS[:4] for l in range(L)]
+    if moe:
+        _JOB["get"]["wg"] = lambda l: T[p.format(l) + "mlp.gate.weight"]
+        keys += [("wg", l) for l in range(L)]
+    keys += [(kind, l) for kind in KINDS[4:] for l in range(L)]
     import multiprocessing as mp
     with mp.get_context("fork").Pool(min(len(keys), os.cpu_count() or 1, 64)) as pool:
         for blob, err in pool.imap(_quant_job, keys, chunksize=1):
@@ -309,7 +334,8 @@ def main():
         write_q(T["lm_head.weight"])
     out.close()
     print(f"dim={dim} hidden={hidden} layers={L} heads={nh} kv_heads={nkv} vocab={vocab} "
-          f"seq_len={seq_len} shared={shared} gs={gs} rope={rope} arch={mt} qkv_bias={qkv_bias} q4={q4_kinds}")
+          f"seq_len={seq_len} shared={shared} gs={gs} rope={rope} arch={mt} qkv_bias={qkv_bias} q4={q4_kinds} "
+          f"head_dim={head_dim} experts={n_experts}x{moe_hidden} top{n_active} qk_norm={qk_norm}")
     print(f"max quantization error {maxerr:.5f}; wrote {os.path.getsize(out_path) / 1e9:.2f} GB")
 
 

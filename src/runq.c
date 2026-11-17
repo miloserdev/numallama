@@ -32,7 +32,7 @@ double ROPE_THETA = 500000.0; // Llama 3 default
 double ROPE_FACTOR = 0.0;     // > 0 enables llama3 rope scaling (Llama 3.1 / 3.2)
 double ROPE_LOW_FREQ = 1.0, ROPE_HIGH_FREQ = 4.0, ROPE_ORIG_CTX = 8192.0;
 // architecture info from the extended header
-enum { ARCH_LLAMA3 = 0, ARCH_QWEN2 = 1 };
+enum { ARCH_LLAMA3 = 0, ARCH_QWEN2 = 1, ARCH_QWEN3 = 2 }; // Qwen2/3: ChatML template, Qwen tokenizer
 int ARCH = ARCH_LLAMA3;
 float NORM_EPS = 1e-5f;
 int QKV_BIAS = 0;
@@ -71,6 +71,15 @@ typedef struct {
   int n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
   int vocab_size; // vocabulary size, usually 4096 (byte-level)
   int seq_len;    // max sequence length
+  // ---- not part of the 7-int block in the file: derived / extended header
+  int head_dim;   // per-head size (Qwen3: 128 even when dim / n_heads differs)
+  int q_dim;      // n_heads * head_dim
+  int kv_dim;     // n_kv_heads * head_dim
+  int n_experts;  // MoE: experts per layer (0 = dense FFN)
+  int n_active;   // MoE: experts per token
+  int moe_hidden; // MoE: hidden size of one expert
+  int qk_norm;    // RMSNorm on every q / k head before RoPE (Qwen3)
+  int norm_topk;  // MoE: renormalize the top-k router weights
 } Config;
 
 typedef struct {
@@ -98,7 +107,10 @@ typedef struct {
   QuantizedTensor *w3; // (layer, hidden_dim, dim)
   // final rmsnorm
   float *rms_final_weight; // (dim,)
-  float *bq, *bk, *bv;     // (layer, dim) / (layer, kv_dim) qkv biases (Qwen2), or NULL
+  float *bq, *bk, *bv;     // (layer, q_dim) / (layer, kv_dim) qkv biases (Qwen2), or NULL
+  float *q_norm, *k_norm;  // (layer, head_dim) per-head RMSNorm weights (Qwen3), or NULL
+  QuantizedTensor *wg;     // MoE router (layer, n_experts, dim), or NULL; w1/w3 are then (layer, n_experts * moe_hidden, dim)
+                           // and w2 (layer, n_experts * dim, moe_hidden): expert e owns a contiguous block of rows
   // (optional) classifier weights for the logits, on the last layer
   QuantizedTensor *wcls;
 } TransformerWeights;
@@ -117,6 +129,7 @@ typedef struct {
   float *v;           // value (dim,)
   float *att;         // buffer for scores/attention values (n_heads, seq_len)
   float *logits;      // output logits
+  float *router;      // MoE router logits (n_experts)
   // kv cache
   float *key_cache;   // (layer, seq_len, dim)
   float *value_cache; // (layer, seq_len, dim)
@@ -144,15 +157,19 @@ typedef struct {
 
 void malloc_run_state(RunState *s, Config *p) {
   // we calloc instead of malloc to keep valgrind happy
-  int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+  int kv_dim = p->kv_dim;
+  int hid = p->hidden_dim;
+  if (p->n_experts > 0 && p->n_active * p->moe_hidden > hid) hid = p->n_active * p->moe_hidden;
+  int qd = p->q_dim > p->dim ? p->q_dim : p->dim;
   s->x = calloc(p->dim, sizeof(float));
-  s->xb = calloc(p->dim, sizeof(float));
+  s->xb = calloc(qd, sizeof(float));
   s->xb2 = calloc(p->dim, sizeof(float));
-  s->hb = calloc(p->hidden_dim, sizeof(float));
-  s->hb2 = calloc(p->hidden_dim, sizeof(float));
+  s->hb = calloc(hid, sizeof(float));
+  s->hb2 = calloc(hid, sizeof(float));
+  s->router = calloc(p->n_experts > 0 ? p->n_experts : 1, sizeof(float));
   s->xq = (QuantizedTensor){.q = calloc(p->dim, sizeof(int8_t)), .s = calloc(p->dim, sizeof(float))};
   s->hq = (QuantizedTensor){.q = calloc(p->hidden_dim, sizeof(int8_t)), .s = calloc(p->hidden_dim, sizeof(float))};
-  s->q = calloc(p->dim, sizeof(float));
+  s->q = calloc(p->q_dim, sizeof(float));
   s->k = calloc(kv_dim, sizeof(float));
   s->v = calloc(kv_dim, sizeof(float));
   s->att = calloc((size_t)p->n_heads * p->seq_len, sizeof(float));
@@ -238,7 +255,7 @@ QuantizedTensor *init_quantized_tensors(void **ptr, int n, int size_each, int bi
 }
 
 void memory_map_weights(TransformerWeights *w, Config *p, void *ptr, uint8_t shared_classifier) {
-  int head_size = p->dim / p->n_heads;
+  const int q_dim = p->q_dim, kv_dim = p->kv_dim;
   // first are the parameters that are kept in fp32 (the rmsnorm (1D) weights)
   float *fptr = (float *)ptr; // cast our pointer to float*
   w->rms_att_weight = fptr;
@@ -249,13 +266,19 @@ void memory_map_weights(TransformerWeights *w, Config *p, void *ptr, uint8_t sha
   fptr += p->dim;
   w->bq = w->bk = w->bv = NULL;
   if (QKV_BIAS) {
-    int kv_dim = p->n_kv_heads * head_size;
     w->bq = fptr;
-    fptr += p->n_layers * p->dim;
+    fptr += p->n_layers * q_dim;
     w->bk = fptr;
     fptr += p->n_layers * kv_dim;
     w->bv = fptr;
     fptr += p->n_layers * kv_dim;
+  }
+  w->q_norm = w->k_norm = NULL;
+  if (p->qk_norm) {
+    w->q_norm = fptr;
+    fptr += p->n_layers * p->head_dim;
+    w->k_norm = fptr;
+    fptr += p->n_layers * p->head_dim;
   }
 
   // now read all the quantized weights
@@ -265,14 +288,20 @@ void memory_map_weights(TransformerWeights *w, Config *p, void *ptr, uint8_t sha
   w->token_embedding_table = malloc((size_t)p->vocab_size * p->dim * sizeof(float));
   // (dequantized by read_checkpoint once the data is loaded)
 
-  w->wq = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_heads * head_size), Q4_MASK & 1 ? 4 : 8);
-  w->wk = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_kv_heads * head_size), Q4_MASK & 2 ? 4 : 8);
-  w->wv = init_quantized_tensors(&ptr, p->n_layers, p->dim * (p->n_kv_heads * head_size), Q4_MASK & 4 ? 4 : 8);
-  w->wo = init_quantized_tensors(&ptr, p->n_layers, (p->n_heads * head_size) * p->dim, Q4_MASK & 8 ? 4 : 8);
+  w->wq = init_quantized_tensors(&ptr, p->n_layers, p->dim * q_dim, Q4_MASK & 1 ? 4 : 8);
+  w->wk = init_quantized_tensors(&ptr, p->n_layers, p->dim * kv_dim, Q4_MASK & 2 ? 4 : 8);
+  w->wv = init_quantized_tensors(&ptr, p->n_layers, p->dim * kv_dim, Q4_MASK & 4 ? 4 : 8);
+  w->wo = init_quantized_tensors(&ptr, p->n_layers, q_dim * p->dim, Q4_MASK & 8 ? 4 : 8);
 
-  w->w1 = init_quantized_tensors(&ptr, p->n_layers, p->dim * p->hidden_dim, Q4_MASK & 16 ? 4 : 8);
-  w->w2 = init_quantized_tensors(&ptr, p->n_layers, p->hidden_dim * p->dim, Q4_MASK & 32 ? 4 : 8);
-  w->w3 = init_quantized_tensors(&ptr, p->n_layers, p->dim * p->hidden_dim, Q4_MASK & 64 ? 4 : 8);
+  w->wg = NULL;
+  int ffn = p->hidden_dim; // rows of w1/w3 (dense) or experts * moe_hidden
+  if (p->n_experts > 0) {
+    w->wg = init_quantized_tensors(&ptr, p->n_layers, p->n_experts * p->dim, 8);
+    ffn = p->n_experts * p->moe_hidden;
+  }
+  w->w1 = init_quantized_tensors(&ptr, p->n_layers, p->dim * ffn, Q4_MASK & 16 ? 4 : 8);
+  w->w2 = init_quantized_tensors(&ptr, p->n_layers, ffn * p->dim, Q4_MASK & 32 ? 4 : 8);
+  w->w3 = init_quantized_tensors(&ptr, p->n_layers, p->dim * ffn, Q4_MASK & 64 ? 4 : 8);
 
   w->wcls = shared_classifier ? w->q_tokens : init_quantized_tensors(&ptr, 1, p->dim * p->vocab_size, 8);
 }
@@ -298,15 +327,35 @@ static void place_tensor(QuantizedTensor *t, int n, int rows, int cols) {
       bind_range(t[i].s + lo * spr, (hi - lo) * spr * sizeof(float), NODE_ID[k]);
     }
 }
+// MoE: every expert block (rows [e*rows_per_expert, (e+1)*rows_per_expert)) is split between the
+// nodes like a dense matrix, so the 8 experts of a token always put the same load on every node
+static void place_experts(QuantizedTensor *t, int n, int experts, int rows_per_expert, int cols) {
+  size_t bpr = t->bits == 4 ? cols / 2 : cols, spr = t->bits == 4 ? cols / 32 : cols / GS;
+  for (int i = 0; i < n; i++)
+    for (int e = 0; e < experts; e++)
+      for (int k = 0; k < NN; k++) {
+        int lo, hi;
+        node_rows(rows_per_expert, k, &lo, &hi);
+        size_t r0 = (size_t)e * rows_per_expert + lo;
+        bind_range(t[i].q + r0 * bpr, (hi - lo) * bpr, NODE_ID[k]);
+        bind_range(t[i].s + r0 * spr, (hi - lo) * spr * sizeof(float), NODE_ID[k]);
+      }
+}
 static void place_weights(TransformerWeights *w, Config *p) {
-  int hs = p->dim / p->n_heads, kv_dim = p->n_kv_heads * hs;
-  place_tensor(w->wq, p->n_layers, p->dim, p->dim);
-  place_tensor(w->wk, p->n_layers, kv_dim, p->dim);
-  place_tensor(w->wv, p->n_layers, kv_dim, p->dim);
-  place_tensor(w->wo, p->n_layers, p->dim, p->dim);
-  place_tensor(w->w1, p->n_layers, p->hidden_dim, p->dim);
-  place_tensor(w->w2, p->n_layers, p->dim, p->hidden_dim);
-  place_tensor(w->w3, p->n_layers, p->hidden_dim, p->dim);
+  place_tensor(w->wq, p->n_layers, p->q_dim, p->dim);
+  place_tensor(w->wk, p->n_layers, p->kv_dim, p->dim);
+  place_tensor(w->wv, p->n_layers, p->kv_dim, p->dim);
+  place_tensor(w->wo, p->n_layers, p->dim, p->q_dim);
+  if (p->n_experts > 0) {
+    place_tensor(w->wg, p->n_layers, p->n_experts, p->dim);
+    place_experts(w->w1, p->n_layers, p->n_experts, p->moe_hidden, p->dim);
+    place_experts(w->w3, p->n_layers, p->n_experts, p->moe_hidden, p->dim);
+    place_experts(w->w2, p->n_layers, p->n_experts, p->dim, p->moe_hidden);
+  } else {
+    place_tensor(w->w1, p->n_layers, p->hidden_dim, p->dim);
+    place_tensor(w->w2, p->n_layers, p->dim, p->hidden_dim);
+    place_tensor(w->w3, p->n_layers, p->hidden_dim, p->dim);
+  }
   place_tensor(w->wcls, 1, p->vocab_size, p->dim);
 }
 #endif
@@ -337,7 +386,8 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weigh
   }
   int header_size = 256; // the header size for version 2 in bytes
   // read in the Config
-  if (fread(config, sizeof(Config), 1, file) != 1) {
+  memset(config, 0, sizeof(Config));
+  if (fread(config, 7 * sizeof(int), 1, file) != 1) {
     exit(EXIT_FAILURE);
   }
   // read in flags
@@ -377,6 +427,16 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weigh
   }
   int q4mask = 0;
   if (fread(&q4mask, sizeof(int), 1, file) == 1) Q4_MASK = q4mask;
+  int ext2[6] = {0}; // head_dim, n_experts, n_active, moe_hidden, qk_norm, norm_topk
+  if (fread(ext2, sizeof(ext2), 1, file) != 1) memset(ext2, 0, sizeof(ext2));
+  config->head_dim = ext2[0] > 0 ? ext2[0] : config->dim / config->n_heads;
+  config->n_experts = ext2[1];
+  config->n_active = ext2[2];
+  config->moe_hidden = ext2[3];
+  config->qk_norm = ext2[4];
+  config->norm_topk = ext2[5];
+  config->q_dim = config->n_heads * config->head_dim;
+  config->kv_dim = config->n_kv_heads * config->head_dim;
   // figure out the file size
   fseek(file, 0, SEEK_END); // move file pointer to end of file
   *file_size = ftell(file); // get the file size, in bytes
@@ -420,7 +480,7 @@ void build_transformer(Transformer *t, char *checkpoint_path, int ctx) {
 #if defined(__linux__)
   if (NN > 1) { // KV cache of kv head g lives on the node that runs its attention
     Config *p = &t->config;
-    int hs = p->dim / p->n_heads;
+    int hs = p->head_dim;
     size_t head_bytes = (size_t)p->seq_len * hs * sizeof(float);
     for (int l = 0; l < p->n_layers; l++)
       for (int k = 0; k < NN; k++) {
@@ -550,7 +610,56 @@ static inline int grab_rows(int k, int d, const ThreadBuf* tb, int* r0, int* r1)
     *r1 = lo + (b + chunk < n ? b + chunk : n);
     return 1;
 }
-#define WORK_PHASES 6 // per layer: q, k, v, wo, w1/w3, w2 (+1 classifier)
+// like grab_rows, over a node-local virtual range [0, n) (MoE: the node's halves of the selected experts)
+static inline int grab_virtual(int k, int n, const ThreadBuf* tb, int* r0, int* r1) {
+    int chunk = (n / (tb->nthn * 4) + 15) & ~15;
+    if (chunk < 16) chunk = 16;
+    int b = atomic_fetch_add_explicit(&P.work[tb->node][P.seq & 1][k].v, chunk, memory_order_relaxed);
+    if (b >= n) return 0;
+    *r0 = b;
+    *r1 = b + chunk < n ? b + chunk : n;
+    return 1;
+}
+// rows [e*rows, (e+1)*rows) of a tensor as a tensor of its own (an expert of a MoE layer)
+static inline QuantizedTensor expert_view(const QuantizedTensor* t, int e, int rows, int cols) {
+    size_t bpr = t->bits == 4 ? cols / 2 : cols, spr = t->bits == 4 ? cols / 32 : cols / GS;
+    QuantizedTensor v = {t->q + (size_t)e * rows * bpr, t->s + (size_t)e * rows * spr, t->bits};
+    return v;
+}
+#define MOE_MAX_ACTIVE 16
+// MoE routing (Qwen3-MoE): softmax over the experts, top-k, optional renormalization
+static void moe_route(const float* logits, int E, int k, int renorm, int* sel, float* wt) {
+    float m = logits[0], z = 0.0f;
+    for (int e = 1; e < E; e++) m = logits[e] > m ? logits[e] : m;
+    for (int e = 0; e < E; e++) z += expf(logits[e] - m);
+    for (int j = 0; j < k; j++) { sel[j] = -1; wt[j] = -1.0f; }
+    for (int e = 0; e < E; e++) { // insertion into the sorted top-k
+        float pr = expf(logits[e] - m) / z;
+        int j = k - 1;
+        if (pr <= wt[j]) continue;
+        while (j > 0 && wt[j - 1] < pr) { wt[j] = wt[j - 1]; sel[j] = sel[j - 1]; j--; }
+        wt[j] = pr;
+        sel[j] = e;
+    }
+    if (renorm) {
+        float sum = 0.0f;
+        for (int j = 0; j < k; j++) sum += wt[j];
+        for (int j = 0; j < k; j++) wt[j] /= sum;
+    }
+}
+// per-head RMSNorm (Qwen3 q_norm / k_norm) followed by RoPE on adjacent pairs
+static inline void head_norm_rope(float* v, const float* w, int hs, const float* rc, const float* rs) {
+    float ss = 0.0f;
+    for (int i = 0; i < hs; i++) ss += v[i] * v[i];
+    float inv = 1.0f / sqrtf(ss / hs + NORM_EPS);
+    for (int i = 0; i < hs; i++) v[i] = w[i] * (v[i] * inv);
+    for (int i = 0; i < hs; i += 2) {
+        float v0 = v[i], v1 = v[i + 1];
+        v[i] = v0 * rc[i / 2] - v1 * rs[i / 2];
+        v[i + 1] = v0 * rs[i / 2] + v1 * rc[i / 2];
+    }
+}
+#define WORK_PHASES 7 // per layer: q, k, v, wo, w1/w3 (or experts), w2, MoE router (+1 classifier)
 
 // ---------------------------------------------------------------------------- profiling (-DPROFILE)
 enum { PH_ROPE, PH_NORM, PH_QKV, PH_ATT, PH_MERGE, PH_WO, PH_FNORM, PH_W13, PH_QH, PH_W2, PH_CLS, PH_BARRIER, PH_IDLE, PH_N };
@@ -962,10 +1071,12 @@ static void forward_thread(int tid) {
     const int pos = P.pos;
     float* x = s->x;
     const int dim = p->dim;
-    const int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    const int kv_dim = p->kv_dim;
+    const int q_dim = p->q_dim;
+    const int qkn = p->qk_norm;
     const int kv_mul = p->n_heads / p->n_kv_heads;
     const int hidden_dim = p->hidden_dim;
-    const int head_size = dim / p->n_heads;
+    const int head_size = p->head_dim;
     const int n_heads = p->n_heads;
     // split the context into chunks of at least 64 positions (enough parallelism, cheap merge)
     const int C = (pos + 1) / 64 < 1 ? 1 : ((pos + 1) / 64 < P.C ? (pos + 1) / 64 : P.C);
@@ -1001,10 +1112,10 @@ static void forward_thread(int tid) {
 
         PROF(tid, PH_QKV);
         // fused q|k|v matmul over rows [0, dim + 2*kv_dim), k and v go straight to the kv cache
-        while (grab_rows(WORK_PHASES * l + 0, dim, tb, &r0, &r1)) {
+        while (grab_rows(WORK_PHASES * l + 0, q_dim, tb, &r0, &r1)) {
             matmul_rows(s->q, nq, ns, w->wq + l, dim, r0, r1);
-            if (w->bq) for (int i = r0; i < r1; i++) s->q[i] += w->bq[(size_t)l * dim + i];
-            for (int i = r0; i < r1; i += 2) {
+            if (w->bq) for (int i = r0; i < r1; i++) s->q[i] += w->bq[(size_t)l * q_dim + i];
+            if (!qkn) for (int i = r0; i < r1; i += 2) {
                 int j = (i % head_size) / 2;
                 float v0 = s->q[i], v1 = s->q[i + 1];
                 s->q[i]     = v0 * tb->rope_c[j] - v1 * tb->rope_s[j];
@@ -1014,13 +1125,13 @@ static void forward_thread(int tid) {
         while (grab_rows(WORK_PHASES * l + 1, kv_dim, tb, &r0, &r1)) {
             matmul_rows(s->k, nq, ns, w->wk + l, dim, r0, r1);
             if (w->bk) for (int i = r0; i < r1; i++) s->k[i] += w->bk[(size_t)l * kv_dim + i];
-            for (int i = r0; i < r1; i += 2) {
+            if (!qkn) for (int i = r0; i < r1; i += 2) {
                 int j = (i % head_size) / 2;
                 float v0 = s->k[i], v1 = s->k[i + 1];
                 s->k[i]     = v0 * tb->rope_c[j] - v1 * tb->rope_s[j];
                 s->k[i + 1] = v0 * tb->rope_s[j] + v1 * tb->rope_c[j];
             }
-            for (int i = r0; i < r1; i++) { kc[(size_t)(i / head_size) * p->seq_len * head_size + i % head_size] = s->k[i]; }
+            if (!qkn) for (int i = r0; i < r1; i++) { kc[(size_t)(i / head_size) * p->seq_len * head_size + i % head_size] = s->k[i]; }
         }
         while (grab_rows(WORK_PHASES * l + 2, kv_dim, tb, &r0, &r1)) {
             matmul_rows(s->v, nq, ns, w->wv + l, dim, r0, r1);
@@ -1028,23 +1139,41 @@ static void forward_thread(int tid) {
             for (int i = r0; i < r1; i++) { vc[(size_t)(i / head_size) * p->seq_len * head_size + i % head_size] = s->v[i]; }
         }
         barrier(tb);
+        if (qkn) { // per-head q/k RMSNorm + RoPE (needs whole heads), k into the cache
+            for (int task = tid; task < n_heads + p->n_kv_heads; task += P.nth) {
+                if (task < n_heads) {
+                    head_norm_rope(s->q + (size_t)task * head_size, w->q_norm + (size_t)l * head_size, head_size, tb->rope_c, tb->rope_s);
+                } else {
+                    int g = task - n_heads;
+                    float* kv = s->k + (size_t)g * head_size;
+                    head_norm_rope(kv, w->k_norm + (size_t)l * head_size, head_size, tb->rope_c, tb->rope_s);
+                    memcpy(kc + (size_t)g * p->seq_len * head_size, kv, head_size * sizeof(float));
+                }
+            }
+            barrier(tb);
+        }
 
         PROF(tid, PH_ATT);
         // attention: work items are (kv head group, chunk of the context); the kv_mul query heads
         // sharing a kv head are processed together so K and V are read once. Merged with online softmax.
         int g0, g1;
         node_groups(p->n_kv_heads, tb->node, &g0, &g1);
-        for (int item = tb->ltid; item < (g1 - g0) * C; item += tb->nthn) {
-            int g = g0 + item / C, c = item % C;
+        // few kv heads (GQA): also split the query heads of a group into HS subsets so that
+        // every thread of the node gets an item; K/V are then read once per subset
+        int HS = 1;
+        while (HS < kv_mul && (g1 - g0) * C * HS * 2 <= tb->nthn && kv_mul % (HS * 2) == 0) HS *= 2;
+        const int hper = kv_mul / HS;
+        for (int item = tb->ltid; item < (g1 - g0) * C * HS; item += tb->nthn) {
+            int g = g0 + item / (C * HS), c = (item / HS) % C, hsub = item % HS;
             int t0 = (int)((long)T * c / C), t1 = (int)((long)T * (c + 1) / C);
             const float* kb = s->key_cache + loff + (size_t)g * p->seq_len * head_size;
             const float* vb = s->value_cache + loff + (size_t)g * p->seq_len * head_size;
             float m[KV_MUL_MAX], sum[KV_MUL_MAX];
-            for (int r = 0; r < kv_mul; r++) m[r] = -FLT_MAX;
+            for (int r = 0; r < hper; r++) m[r] = -FLT_MAX;
             for (int t = t0; t < t1; t++) {
                 const float* k = kb + (size_t)t * head_size;
-                for (int r = 0; r < kv_mul; r++) {
-                    int h = g * kv_mul + r;
+                for (int r = 0; r < hper; r++) {
+                    int h = g * kv_mul + hsub * hper + r;
                     const float* q = s->q + h * head_size;
                     float score = 0.0f;
                     for (int i = 0; i < head_size; i++) { score += q[i] * k[i]; }
@@ -1053,8 +1182,8 @@ static void forward_thread(int tid) {
                     m[r] = score > m[r] ? score : m[r];
                 }
             }
-            for (int r = 0; r < kv_mul; r++) {
-                int h = g * kv_mul + r;
+            for (int r = 0; r < hper; r++) {
+                int h = g * kv_mul + hsub * hper + r;
                 float* att = s->att + (size_t)h * p->seq_len;
                 float sm = 0.0f;
                 for (int t = t0; t < t1; t++) { float e = expf(att[t] - m[r]); att[t] = e; sm += e; }
@@ -1063,15 +1192,15 @@ static void forward_thread(int tid) {
             }
             for (int t = t0; t < t1; t++) {
                 const float* v = vb + (size_t)t * head_size;
-                for (int r = 0; r < kv_mul; r++) {
-                    int h = g * kv_mul + r;
+                for (int r = 0; r < hper; r++) {
+                    int h = g * kv_mul + hsub * hper + r;
                     float e = s->att[(size_t)h * p->seq_len + t];
                     float* acc = P.part + ((size_t)h * C + c) * (head_size + 2) + 2;
                     for (int i = 0; i < head_size; i++) { acc[i] += e * v[i]; }
                 }
             }
-            for (int r = 0; r < kv_mul; r++) {
-                float* pr = P.part + ((size_t)(g * kv_mul + r) * C + c) * (head_size + 2);
+            for (int r = 0; r < hper; r++) {
+                float* pr = P.part + ((size_t)(g * kv_mul + hsub * hper + r) * C + c) * (head_size + 2);
                 pr[0] = m[r];
                 pr[1] = sum[r];
             }
@@ -1108,7 +1237,7 @@ static void forward_thread(int tid) {
         PROF(tid, PH_WO);
         // output projection + residual
         while (grab_rows(WORK_PHASES * l + 3, dim, tb, &r0, &r1)) {
-            matmul_rows(s->xb2, nq, ns, w->wo + l, dim, r0, r1);
+            matmul_rows(s->xb2, nq, ns, w->wo + l, q_dim, r0, r1);
             for (int i = r0; i < r1; i++) { x[i] = xin[i] + s->xb2[i]; }
         }
         barrier(tb);
@@ -1118,25 +1247,65 @@ static void forward_thread(int tid) {
         node_norm_quant(tb, x, w->rms_ffn_weight + l * dim, dim);
 
         PROF(tid, PH_W13);
-        // fused w1|w3 + SwiGLU
-        while (grab_rows(WORK_PHASES * l + 4, hidden_dim, tb, &r0, &r1)) {
-            matmul_rows(s->hb, nq, ns, w->w1 + l, dim, r0, r1);
-            matmul_rows(s->hb2, nq, ns, w->w3 + l, dim, r0, r1);
-            for (int i = r0; i < r1; i++) {
-                float val = s->hb[i];
-                val *= (1.0f / (1.0f + expf(-val)));
-                s->hb[i] = val * s->hb2[i];
+        if (p->n_experts > 0) { // ---- MoE FFN
+            const int E = p->n_experts, A = p->n_active, mh = p->moe_hidden;
+            while (grab_rows(WORK_PHASES * l + 6, E, tb, &r0, &r1)) matmul_rows(s->router, nq, ns, w->wg + l, dim, r0, r1);
+            barrier(tb);
+            int sel[MOE_MAX_ACTIVE];
+            float wt[MOE_MAX_ACTIVE];
+            moe_route(s->router, E, A, p->norm_topk, sel, wt); // same result in every thread
+            int lo, hi;
+            node_rows(mh, tb->node, &lo, &hi);
+            const int half = hi - lo;
+            while (grab_virtual(WORK_PHASES * l + 4, A * half, tb, &r0, &r1)) {
+                for (int v = r0; v < r1;) {
+                    int j = v / half, vend = (j + 1) * half < r1 ? (j + 1) * half : r1;
+                    int a0 = lo + (v - j * half), a1 = lo + (vend - j * half);
+                    QuantizedTensor e1 = expert_view(w->w1 + l, sel[j], mh, dim), e3 = expert_view(w->w3 + l, sel[j], mh, dim);
+                    float* h1 = s->hb + (size_t)j * mh;
+                    float* h3 = s->hb2 + (size_t)j * mh;
+                    matmul_rows(h1, nq, ns, &e1, dim, a0, a1);
+                    matmul_rows(h3, nq, ns, &e3, dim, a0, a1);
+                    for (int i = a0; i < a1; i++) {
+                        float val = h1[i];
+                        val *= (1.0f / (1.0f + expf(-val)));
+                        h1[i] = val * h3[i] * wt[j];
+                    }
+                    v = vend;
+                }
             }
-        }
-        barrier(tb);
+            barrier(tb);
+            PROF(tid, PH_QH);
+            node_quant(tb, s->hb, A * mh);
+            PROF(tid, PH_W2);
+            while (grab_rows(WORK_PHASES * l + 5, dim, tb, &r0, &r1)) {
+                for (int j = 0; j < A; j++) {
+                    QuantizedTensor e2 = expert_view(w->w2 + l, sel[j], dim, mh);
+                    matmul_rows(tb->xb, nq + (size_t)j * mh, ns + (size_t)j * mh / GS, &e2, mh, r0, r1);
+                    for (int i = r0; i < r1; i++) x[i] += tb->xb[i];
+                }
+            }
+        } else { // ---- dense FFN
+            // fused w1|w3 + SwiGLU
+            while (grab_rows(WORK_PHASES * l + 4, hidden_dim, tb, &r0, &r1)) {
+                matmul_rows(s->hb, nq, ns, w->w1 + l, dim, r0, r1);
+                matmul_rows(s->hb2, nq, ns, w->w3 + l, dim, r0, r1);
+                for (int i = r0; i < r1; i++) {
+                    float val = s->hb[i];
+                    val *= (1.0f / (1.0f + expf(-val)));
+                    s->hb[i] = val * s->hb2[i];
+                }
+            }
+            barrier(tb);
 
-        PROF(tid, PH_QH);
-        // w2 + residual
-        node_quant(tb, s->hb, hidden_dim);
-        PROF(tid, PH_W2);
-        while (grab_rows(WORK_PHASES * l + 5, dim, tb, &r0, &r1)) {
-            matmul_rows(s->xb2, nq, ns, w->w2 + l, hidden_dim, r0, r1);
-            for (int i = r0; i < r1; i++) { x[i] += s->xb2[i]; }
+            PROF(tid, PH_QH);
+            // w2 + residual
+            node_quant(tb, s->hb, hidden_dim);
+            PROF(tid, PH_W2);
+            while (grab_rows(WORK_PHASES * l + 5, dim, tb, &r0, &r1)) {
+                matmul_rows(s->xb2, nq, ns, w->w2 + l, hidden_dim, r0, r1);
+                for (int i = r0; i < r1; i++) { x[i] += s->xb2[i]; }
+            }
         }
         barrier(tb);
     }
@@ -1344,7 +1513,7 @@ static void* pool_worker(void* arg) {
 static void init_model_runtime(Transformer* t) {
     Config* p = &t->config;
     if (p->n_layers > P_max_layers) P_max_layers = p->n_layers; // counters are reset for the deepest model
-    int head_size = p->dim / p->n_heads;
+    int head_size = p->head_dim;
     ROPE_THETA = t->g.rope_theta; ROPE_FACTOR = t->g.rope_factor; ROPE_LOW_FREQ = t->g.rope_low;
     ROPE_HIGH_FREQ = t->g.rope_high; ROPE_ORIG_CTX = t->g.rope_orig;
     {   // context chunks per kv head: enough items for the threads of the smallest node
@@ -1393,7 +1562,7 @@ static void use_model(Transformer* t) {
 
 void init_pool(Transformer* t, int nth) {
     Config* p = &t->config;
-    int head_size = p->dim / p->n_heads;
+    int head_size = p->head_dim;
     if (nth < 1) nth = 1;
     if (p->dim % GS != 0 || p->hidden_dim % GS != 0) {
         fprintf(stderr, "group size %d must divide dim %d and hidden_dim %d; re-export the model\n",
@@ -1410,9 +1579,12 @@ void init_pool(Transformer* t, int nth) {
     init_model_runtime(t);
     use_model(t);
     int qmax = p->dim > p->hidden_dim ? p->dim : p->hidden_dim;
+    if (p->q_dim > qmax) qmax = p->q_dim;
+    if (p->n_experts > 0 && p->n_active * p->moe_hidden > qmax) qmax = p->n_active * p->moe_hidden;
+    if (p->n_active > MOE_MAX_ACTIVE) { fprintf(stderr, "at most %d active experts are supported\n", MOE_MAX_ACTIVE); exit(EXIT_FAILURE); }
     P.tb = calloc(nth, sizeof(ThreadBuf));
     for (int i = 0; i < nth; i++) {
-        P.tb[i].xb = calloc(p->dim, sizeof(float));
+        P.tb[i].xb = calloc(p->q_dim > p->dim ? p->q_dim : p->dim, sizeof(float));
         P.tb[i].q = calloc(qmax, sizeof(int8_t));
         P.tb[i].s = calloc(qmax / GS + 1, sizeof(float));
         P.tb[i].rope_c = calloc(head_size / 2, sizeof(float));
@@ -1532,6 +1704,14 @@ typedef struct {
     float* rope_s;
     float* att;       // (nth, kv_mul, seq_len) per-thread attention scratch
     float* logits_all; // when set: (B, vocab) logits of every position (speculative verification)
+    // MoE prefill (sized for BATCH_MAX tokens x n_active slots)
+    float* router;     // (B, n_experts)
+    int *moe_sel, *moe_cnt, *moe_fill, *moe_tok;
+    float *moe_wt, *moe_w;
+    int8_t* gxq; float* gxs; // gathered quantized ffn inputs per slot
+    float *gh, *gh3;   // (slots, moe_hidden)
+    int8_t* gq; float* gqs;
+    float* gout;       // (slots, dim)
 } Batch;
 
 static Batch BT;
@@ -1549,6 +1729,97 @@ static inline void tok_range(int B, int tid, int nth, int* b0, int* b1) {
     *b1 = (int)((long)B * (tid + 1) / nth);
 }
 
+/* MoE FFN for a block of B tokens (prefill). Input: BT.xq/BT.xs (normalized + quantized ffn input).
+ * Tokens are grouped by expert so every expert's weights are read once per block:
+ * router (batched) -> top-k per token -> per-expert token lists with gathered inputs ->
+ * w1/w3 + weighted SwiGLU per expert (this node's half of the expert's rows) -> quantize ->
+ * w2 per expert on this node's rows of dim, summed into the residual stream. */
+static void moe_batch(ThreadBuf* tb, int l, int B) {
+    Transformer* transformer = P.t;
+    Config* p = &transformer->config;
+    TransformerWeights* w = &transformer->weights;
+    const int tid = (int)(tb - P.tb), nth = P.nth;
+    const int dim = p->dim, E = p->n_experts, A = p->n_active, mh = p->moe_hidden;
+    const int ngd = dim / GS, ngm = mh / GS;
+    int r0, r1;
+    // router logits for all tokens
+    part_range_node(E, tb, &r0, &r1);
+    matmul_rows_batch(BT.router, E, BT.xq, BT.xs, B, w->wg + l, dim, r0, r1);
+    barrier(tb);
+    // routing and grouping (one thread; B*A entries)
+    if (tid == 0) {
+        int* cnt = BT.moe_cnt;
+        memset(cnt, 0, (E + 1) * sizeof(int));
+        for (int b = 0; b < B; b++) {
+            moe_route(BT.router + (size_t)b * E, E, A, p->norm_topk, BT.moe_sel + b * A, BT.moe_wt + b * A);
+            for (int j = 0; j < A; j++) cnt[BT.moe_sel[b * A + j] + 1]++;
+        }
+        for (int e = 0; e < E; e++) cnt[e + 1] += cnt[e]; // prefix sums: expert e owns slots [cnt[e], cnt[e+1])
+        int* fill = BT.moe_fill;
+        memcpy(fill, cnt, E * sizeof(int));
+        for (int b = 0; b < B; b++)
+            for (int j = 0; j < A; j++) {
+                int e = BT.moe_sel[b * A + j], slot = fill[e]++;
+                BT.moe_tok[slot] = b;
+                BT.moe_w[slot] = BT.moe_wt[b * A + j];
+                memcpy(BT.gxq + (size_t)slot * dim, BT.xq + (size_t)b * dim, dim);
+                memcpy(BT.gxs + (size_t)slot * ngd, BT.xs + (size_t)b * ngd, ngd * sizeof(float));
+            }
+    }
+    barrier(tb);
+    const int* off = BT.moe_cnt;
+    // w1/w3 + SwiGLU: this node's half of every used expert, split among the node's threads
+    int lo, hi;
+    node_rows(mh, tb->node, &lo, &hi);
+    const int half = hi - lo, tot = E * half;
+    int v0 = (int)((long)tot * tb->ltid / tb->nthn), v1 = (int)((long)tot * (tb->ltid + 1) / tb->nthn);
+    v0 &= ~3; if (tb->ltid == tb->nthn - 1) v1 = tot; else v1 &= ~3;
+    for (int v = v0; v < v1;) {
+        int e = v / half, vend = (e + 1) * half < v1 ? (e + 1) * half : v1;
+        int n = off[e + 1] - off[e];
+        if (n > 0) {
+            int a0 = lo + (v - e * half), a1 = lo + (vend - e * half);
+            QuantizedTensor e1 = expert_view(w->w1 + l, e, mh, dim), e3 = expert_view(w->w3 + l, e, mh, dim);
+            float* h1 = BT.gh + (size_t)off[e] * mh;
+            float* h3 = BT.gh3 + (size_t)off[e] * mh;
+            matmul_rows_batch(h1, mh, BT.gxq + (size_t)off[e] * dim, BT.gxs + (size_t)off[e] * ngd, n, &e1, dim, a0, a1);
+            matmul_rows_batch(h3, mh, BT.gxq + (size_t)off[e] * dim, BT.gxs + (size_t)off[e] * ngd, n, &e3, dim, a0, a1);
+            for (int t = 0; t < n; t++) {
+                float wgt = BT.moe_w[off[e] + t];
+                float* x1 = h1 + (size_t)t * mh;
+                const float* x3 = h3 + (size_t)t * mh;
+                for (int i = a0; i < a1; i++) {
+                    float val = x1[i];
+                    val *= (1.0f / (1.0f + expf(-val)));
+                    x1[i] = val * x3[i] * wgt;
+                }
+            }
+        }
+        v = vend;
+    }
+    barrier(tb);
+    // quantize the hidden activations of every slot
+    const int S = off[E];
+    int s0, s1;
+    tok_range(S, tid, nth, &s0, &s1);
+    for (int sl = s0; sl < s1; sl++)
+        quantize_vec(BT.gq + (size_t)sl * mh, BT.gqs + (size_t)sl * ngm, BT.gh + (size_t)sl * mh, mh);
+    barrier(tb);
+    // w2: this node's rows of dim, for every used expert, then add every slot into its token
+    part_range_node(dim, tb, &r0, &r1);
+    for (int e = 0; e < E; e++) {
+        int n = off[e + 1] - off[e];
+        if (n == 0 || r0 >= r1) continue;
+        QuantizedTensor e2 = expert_view(w->w2 + l, e, dim, mh);
+        matmul_rows_batch(BT.gout + (size_t)off[e] * dim, dim, BT.gq + (size_t)off[e] * mh, BT.gqs + (size_t)off[e] * ngm, n, &e2, mh, r0, r1);
+    }
+    for (int sl = 0; sl < S && r0 < r1; sl++) {
+        float* x = BT.x + (size_t)BT.moe_tok[sl] * dim;
+        const float* o = BT.gout + (size_t)sl * dim;
+        for (int i = r0; i < r1; i++) x[i] += o[i];
+    }
+}
+
 static void forward_batch_thread(int tid) {
     Transformer* transformer = P.t;
     Config* p = &transformer->config;
@@ -1558,12 +1829,14 @@ static void forward_batch_thread(int tid) {
     const int nth = P.nth;
     const int B = BT.B, pos0 = BT.pos0;
     const int dim = p->dim;
-    const int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    const int kv_dim = p->kv_dim;
+    const int q_dim = p->q_dim;
+    const int qkn = p->qk_norm;
     const int kv_mul = p->n_heads / p->n_kv_heads;
     const int hidden_dim = p->hidden_dim;
-    const int head_size = dim / p->n_heads;
+    const int head_size = p->head_dim;
     const int hs2 = head_size / 2;
-    const int ngd = dim / GS, ngh = hidden_dim / GS;
+    const int ngd = dim / GS, ngh = hidden_dim / GS, ngq = q_dim / GS;
     const float att_scale = 1.0f / sqrtf((float)head_size);
     int r0, r1, b0, b1;
 
@@ -1592,12 +1865,13 @@ static void forward_batch_thread(int tid) {
         // fused q|k|v for all tokens
         {
             int a, e;
-            part_range_node(dim, tb, &a, &e);
+            part_range_node(q_dim, tb, &a, &e);
             if (a < e) {
-                matmul_rows_batch(BT.q, dim, BT.xq, BT.xs, B, w->wq + l, dim, a, e);
+                matmul_rows_batch(BT.q, q_dim, BT.xq, BT.xs, B, w->wq + l, dim, a, e);
                 for (int b = 0; b < B; b++) {
-                    float* q = BT.q + (size_t)b * dim;
-                    if (w->bq) for (int i = a; i < e; i++) q[i] += w->bq[(size_t)l * dim + i];
+                    float* q = BT.q + (size_t)b * q_dim;
+                    if (w->bq) for (int i = a; i < e; i++) q[i] += w->bq[(size_t)l * q_dim + i];
+                    if (qkn) continue; // per-head norm + RoPE after the barrier
                     const float* rc = BT.rope_c + b * hs2;
                     const float* rs = BT.rope_s + b * hs2;
                     for (int i = a; i < e; i += 2) {
@@ -1614,6 +1888,7 @@ static void forward_batch_thread(int tid) {
                 for (int b = 0; b < B; b++) {
                     float* k = BT.k + (size_t)b * kv_dim;
                     if (w->bk) for (int i = a; i < e; i++) k[i] += w->bk[(size_t)l * kv_dim + i];
+                    if (qkn) continue; // per-head norm + RoPE + cache after the barrier
                     const float* rc = BT.rope_c + b * hs2;
                     const float* rs = BT.rope_s + b * hs2;
                     float* kc = s->key_cache + loff + (size_t)(pos0 + b) * head_size;
@@ -1638,6 +1913,23 @@ static void forward_batch_thread(int tid) {
             }
         }
         barrier(tb);
+        if (qkn) { // per-head RMSNorm + RoPE of q and k of every token, k into the cache
+            const int nh = p->n_heads, nk = p->n_kv_heads;
+            for (int task = tid; task < B * (nh + nk); task += nth) {
+                int b = task / (nh + nk), h = task % (nh + nk);
+                const float* rc = BT.rope_c + b * hs2;
+                const float* rs = BT.rope_s + b * hs2;
+                if (h < nh) {
+                    head_norm_rope(BT.q + (size_t)b * q_dim + (size_t)h * head_size, w->q_norm + (size_t)l * head_size, head_size, rc, rs);
+                } else {
+                    int g = h - nh;
+                    float* kv = BT.k + (size_t)b * kv_dim + (size_t)g * head_size;
+                    head_norm_rope(kv, w->k_norm + (size_t)l * head_size, head_size, rc, rs);
+                    memcpy(s->key_cache + loff + ((size_t)g * p->seq_len + pos0 + b) * head_size, kv, head_size * sizeof(float));
+                }
+            }
+            barrier(tb);
+        }
 
         // causal attention: work items are (kv group, token); each item handles the kv_mul query
         // heads of its group, so K and V rows are loaded once per item
@@ -1649,7 +1941,7 @@ static void forward_batch_thread(int tid) {
             int T = pos0 + b + 1;
             const float* kb = s->key_cache + loff + (size_t)g * p->seq_len * head_size;
             const float* vb = s->value_cache + loff + (size_t)g * p->seq_len * head_size;
-            const float* qb = BT.q + (size_t)b * dim + (size_t)g * kv_mul * head_size;
+            const float* qb = BT.q + (size_t)b * q_dim + (size_t)g * kv_mul * head_size;
             float m[KV_MUL_MAX], sum[KV_MUL_MAX];
             for (int r = 0; r < kv_mul; r++) m[r] = -FLT_MAX;
             for (int t = 0; t < T; t++) {
@@ -1669,7 +1961,7 @@ static void forward_batch_thread(int tid) {
                 for (int t = 0; t < T; t++) { float ev = expf(ar[t] - m[r]); ar[t] = ev; sm += ev; }
                 sum[r] = 1.0f / sm;
             }
-            float* ob = BT.xb + (size_t)b * dim + (size_t)g * kv_mul * head_size;
+            float* ob = BT.xb + (size_t)b * q_dim + (size_t)g * kv_mul * head_size;
             memset(ob, 0, kv_mul * head_size * sizeof(float));
             for (int t = 0; t < T; t++) {
                 const float* v = vb + (size_t)t * head_size;
@@ -1688,13 +1980,13 @@ static void forward_batch_thread(int tid) {
 
         // quantize the attention output, split over tokens
         for (int b = b0; b < b1; b++) {
-            quantize_vec(BT.xq + (size_t)b * dim, BT.xs + (size_t)b * ngd, BT.xb + (size_t)b * dim, dim);
+            quantize_vec(BT.xq + (size_t)b * q_dim, BT.xs + (size_t)b * ngq, BT.xb + (size_t)b * q_dim, q_dim);
         }
         barrier(tb);
 
         // output projection + residual
         part_range_node(dim, tb, &r0, &r1);
-        matmul_rows_batch(BT.xb2, dim, BT.xq, BT.xs, B, w->wo + l, dim, r0, r1);
+        matmul_rows_batch(BT.xb2, dim, BT.xq, BT.xs, B, w->wo + l, q_dim, r0, r1);
         for (int b = 0; b < B; b++) {
             float* x = BT.x + (size_t)b * dim;
             const float* o = BT.xb2 + (size_t)b * dim;
@@ -1709,34 +2001,38 @@ static void forward_batch_thread(int tid) {
         }
         barrier(tb);
 
-        // fused w1|w3 + SwiGLU
-        part_range_node(hidden_dim, tb, &r0, &r1);
-        matmul_rows_batch(BT.hb, hidden_dim, BT.xq, BT.xs, B, w->w1 + l, dim, r0, r1);
-        matmul_rows_batch(BT.hb2, hidden_dim, BT.xq, BT.xs, B, w->w3 + l, dim, r0, r1);
-        for (int b = 0; b < B; b++) {
-            float* h1 = BT.hb + (size_t)b * hidden_dim;
-            const float* h3 = BT.hb2 + (size_t)b * hidden_dim;
-            for (int i = r0; i < r1; i++) {
-                float val = h1[i];
-                val *= (1.0f / (1.0f + expf(-val)));
-                h1[i] = val * h3[i];
+        if (p->n_experts > 0) {
+            moe_batch(tb, l, B);
+        } else {
+            // fused w1|w3 + SwiGLU
+            part_range_node(hidden_dim, tb, &r0, &r1);
+            matmul_rows_batch(BT.hb, hidden_dim, BT.xq, BT.xs, B, w->w1 + l, dim, r0, r1);
+            matmul_rows_batch(BT.hb2, hidden_dim, BT.xq, BT.xs, B, w->w3 + l, dim, r0, r1);
+            for (int b = 0; b < B; b++) {
+                float* h1 = BT.hb + (size_t)b * hidden_dim;
+                const float* h3 = BT.hb2 + (size_t)b * hidden_dim;
+                for (int i = r0; i < r1; i++) {
+                    float val = h1[i];
+                    val *= (1.0f / (1.0f + expf(-val)));
+                    h1[i] = val * h3[i];
+                }
             }
-        }
-        barrier(tb);
+            barrier(tb);
 
-        // quantize the hidden activations, split over tokens
-        for (int b = b0; b < b1; b++) {
-            quantize_vec(BT.xq + (size_t)b * hidden_dim, BT.xs + (size_t)b * ngh, BT.hb + (size_t)b * hidden_dim, hidden_dim);
-        }
-        barrier(tb);
+            // quantize the hidden activations, split over tokens
+            for (int b = b0; b < b1; b++) {
+                quantize_vec(BT.xq + (size_t)b * hidden_dim, BT.xs + (size_t)b * ngh, BT.hb + (size_t)b * hidden_dim, hidden_dim);
+            }
+            barrier(tb);
 
-        // w2 + residual
-        part_range_node(dim, tb, &r0, &r1);
-        matmul_rows_batch(BT.xb2, dim, BT.xq, BT.xs, B, w->w2 + l, hidden_dim, r0, r1);
-        for (int b = 0; b < B; b++) {
-            float* x = BT.x + (size_t)b * dim;
-            const float* o = BT.xb2 + (size_t)b * dim;
-            for (int i = r0; i < r1; i++) { x[i] += o[i]; }
+            // w2 + residual
+            part_range_node(dim, tb, &r0, &r1);
+            matmul_rows_batch(BT.xb2, dim, BT.xq, BT.xs, B, w->w2 + l, hidden_dim, r0, r1);
+            for (int b = 0; b < B; b++) {
+                float* x = BT.x + (size_t)b * dim;
+                const float* o = BT.xb2 + (size_t)b * dim;
+                for (int i = r0; i < r1; i++) { x[i] += o[i]; }
+            }
         }
         barrier(tb);
     }
@@ -1924,14 +2220,15 @@ static void forward_multi_thread(int tid) {
 
 static void init_batch(Transformer* t) {
     Config* p = &t->config;
-    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    int head_size = p->dim / p->n_heads;
+    int kv_dim = p->kv_dim, q_dim = p->q_dim, head_size = p->head_dim;
     int qmax = p->dim > p->hidden_dim ? p->dim : p->hidden_dim;
+    if (q_dim > qmax) qmax = q_dim;
+    int wide = q_dim > p->dim ? q_dim : p->dim;
     size_t B = BATCH_MAX;
     BT.x = calloc(B * p->dim, sizeof(float));
-    BT.xb = calloc(B * p->dim, sizeof(float));
+    BT.xb = calloc(B * wide, sizeof(float));
     BT.xb2 = calloc(B * p->dim, sizeof(float));
-    BT.q = calloc(B * p->dim, sizeof(float));
+    BT.q = calloc(B * q_dim, sizeof(float));
     BT.k = calloc(B * kv_dim, sizeof(float));
     BT.v = calloc(B * kv_dim, sizeof(float));
     BT.hb = calloc(B * p->hidden_dim, sizeof(float));
@@ -1941,6 +2238,23 @@ static void init_batch(Transformer* t) {
     BT.rope_c = calloc(B * (head_size / 2), sizeof(float));
     BT.rope_s = calloc(B * (head_size / 2), sizeof(float));
     BT.att = calloc((size_t)P.nth * (p->n_heads / p->n_kv_heads) * p->seq_len, sizeof(float));
+    if (p->n_experts > 0) {
+        size_t S = B * p->n_active, E = p->n_experts, mh = p->moe_hidden;
+        BT.router = calloc(B * E, sizeof(float));
+        BT.moe_sel = calloc(B * p->n_active, sizeof(int));
+        BT.moe_wt = calloc(B * p->n_active, sizeof(float));
+        BT.moe_cnt = calloc(E + 1, sizeof(int));
+        BT.moe_fill = calloc(E + 1, sizeof(int));
+        BT.moe_tok = calloc(S, sizeof(int));
+        BT.moe_w = calloc(S, sizeof(float));
+        BT.gxq = calloc(S * p->dim, 1);
+        BT.gxs = calloc(S * (p->dim / GS), sizeof(float));
+        BT.gh = calloc(S * mh, sizeof(float));
+        BT.gh3 = calloc(S * mh, sizeof(float));
+        BT.gq = calloc(S * mh, 1);
+        BT.gqs = calloc(S * (mh / GS), sizeof(float));
+        BT.gout = calloc(S * p->dim, sizeof(float));
+    }
 }
 
 /* Process n tokens starting at position pos0 (prompt prefill). Fills the KV cache and returns
@@ -1948,13 +2262,15 @@ static void init_batch(Transformer* t) {
 /* Speculative verification: run n (<= SPEC_MAX) tokens at positions pos0.. and return the
  * logits of every position as an (n, vocab) array (row i = distribution after token i). */
 #define SPEC_MAX SPEC_MAX_TOK
+// the batched / multi-token paths support dense models with q_dim == dim and no qk-norm
+static int needs_token_path(const Config* p) { return p->n_experts > 0 || p->qk_norm || p->q_dim != p->dim; }
 static float* SPEC_LOGITS = NULL;
 float* forward_all(Transformer* transformer, const int* tokens, int n, int pos0) {
     use_model(transformer);
     int V = transformer->config.vocab_size;
     if (!SPEC_LOGITS) SPEC_LOGITS = malloc((size_t)SPEC_MAX * V * sizeof(float));
-    if (n == 1) {
-        memcpy(SPEC_LOGITS, forward(transformer, tokens[0], pos0), V * sizeof(float));
+    if (n == 1 || needs_token_path(&transformer->config)) {
+        for (int i = 0; i < n; i++) memcpy(SPEC_LOGITS + (size_t)i * V, forward(transformer, tokens[i], pos0 + i), V * sizeof(float));
         return SPEC_LOGITS;
     }
     Config* p = &transformer->config;
@@ -1983,6 +2299,7 @@ float* forward_all(Transformer* transformer, const int* tokens, int n, int pos0)
 
 float* forward_batch(Transformer* transformer, const int* tokens, int n, int pos0) {
     use_model(transformer);
+
     float* logits = NULL;
     for (int done = 0; done < n;) {
         int B = n - done < BATCH_MAX ? n - done : BATCH_MAX;
@@ -2192,7 +2509,7 @@ static int pretoken_len(const unsigned char *s) {
   // \p{N}{1,3}
   if (cp_is_number(c)) {
     int i = n, d, m, k = 1;
-    int maxd = ARCH == ARCH_QWEN2 ? 1 : 3; // \p{N} (Qwen2) vs \p{N}{1,3} (Llama 3)
+    int maxd = ARCH >= ARCH_QWEN2 ? 1 : 3; // \p{N} (Qwen2) vs \p{N}{1,3} (Llama 3)
     while (k < maxd && s[i] && (m = utf8_decode(s + i, &d), cp_is_number(d))) { i += m; k++; }
     return i;
   }
@@ -2687,13 +3004,13 @@ static Tools *g_tools = NULL; // set by -f tools.json
 #define QWEN_TOOL_CALL_END 151658
 
 static int is_end_token(int t) {
-  if (ARCH == ARCH_QWEN2) return t == QWEN_IM_END || t == QWEN_ENDOFTEXT;
+  if (ARCH >= ARCH_QWEN2) return t == QWEN_IM_END || t == QWEN_ENDOFTEXT;
   return t == LLAMA3_EOT || t == LLAMA3_EOS || t == LLAMA3_EOM;
 }
 
 // text that follows the end token of an assistant message in the template
-static const char *after_end(void) { return ARCH == ARCH_QWEN2 ? "\n" : ""; }
-static const char *end_text(void) { return ARCH == ARCH_QWEN2 ? "<|im_end|>" : "<|eot_id|>"; }
+static const char *after_end(void) { return ARCH >= ARCH_QWEN2 ? "\n" : ""; }
+static const char *end_text(void) { return ARCH >= ARCH_QWEN2 ? "<|im_end|>" : "<|eot_id|>"; }
 
 // append the tokens of plain text (special tokens are NOT recognized: user content can't inject them)
 static int push_text(Tokenizer *tk, const char *s, int *msg, int m) {
@@ -2746,11 +3063,21 @@ static int push_tpl(Tokenizer *tk, const char *s, int *msg, int m) {
 static int build_system(Tokenizer *tk, const char *sys_text, int *msg, int m) {
   SBuf b = {0};
   sb_puts(&b, "");
-  if (ARCH == ARCH_QWEN2) {
+  if (ARCH >= ARCH_QWEN2) {
+    if (ARCH == ARCH_QWEN3 && !sys_text[0] && !g_tools) { // Qwen3: no default system message
+      free(b.buf);
+      return m;
+    }
     sb_puts(&b, "<|im_start|>system\n");
-    sb_puts(&b, sys_text[0] ? sys_text : "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.");
+    if (ARCH == ARCH_QWEN3) {
+      sb_puts(&b, sys_text);
+      if (sys_text[0] && g_tools) sb_puts(&b, "\n\n");
+    } else {
+      sb_puts(&b, sys_text[0] ? sys_text : "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.");
+      if (g_tools) sb_puts(&b, "\n\n");
+    }
     if (g_tools) {
-      sb_puts(&b, "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+      sb_puts(&b, "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
                   "You are provided with function signatures within <tools></tools> XML tags:\n<tools>");
       char *tp = tools_prompt(g_tools, -1, "\n", "");
       sb_puts(&b, tp);
@@ -2787,7 +3114,7 @@ static int build_system(Tokenizer *tk, const char *sys_text, int *msg, int m) {
 
 static int build_user(Tokenizer *tk, const char *prefix, const char *text, int *msg, int m) {
   m = push_tpl(tk, prefix, msg, m);
-  if (ARCH == ARCH_QWEN2) {
+  if (ARCH >= ARCH_QWEN2) {
     m = push_tpl(tk, "<|im_start|>user\n", msg, m);
     m = push_text(tk, text, msg, m);
     m = push_tpl(tk, "<|im_end|>\n<|im_start|>assistant\n", msg, m);
@@ -2801,7 +3128,7 @@ static int build_user(Tokenizer *tk, const char *prefix, const char *text, int *
 
 static int build_tool_results(Tokenizer *tk, const char *prefix, char **outs, int n, int *msg, int m) {
   m = push_tpl(tk, prefix, msg, m);
-  if (ARCH == ARCH_QWEN2) {
+  if (ARCH >= ARCH_QWEN2) {
     m = push_tpl(tk, "<|im_start|>user", msg, m);
     for (int i = 0; i < n; i++) {
       m = push_tpl(tk, "\n<tool_response>\n", msg, m);
@@ -2903,18 +3230,18 @@ typedef struct {   // streaming state of one assistant message
 // handle one generated (non-end) token: print it or collect it into a tool call
 static void reply_token(ReplyState *rs, Tokenizer *tk, int next) {
   SBuf *buf = &rs->buf;
-  if (ARCH == ARCH_QWEN2 && next == QWEN_TOOL_CALL) {
+  if (ARCH >= ARCH_QWEN2 && next == QWEN_TOOL_CALL) {
     rs->mode = 2;
     buf->len = 0;
     buf->buf[0] = '\0';
-  } else if (ARCH == ARCH_QWEN2 && next == QWEN_TOOL_CALL_END) {
+  } else if (ARCH >= ARCH_QWEN2 && next == QWEN_TOOL_CALL_END) {
     if (rs->mode == 2 && rs->n_calls < MAX_CALLS_PER_REPLY) {
       JNode *c = normalize_call(json_parse(buf->buf, NULL));
       if (c) rs->calls[rs->n_calls++] = c;
       else { printf("<tool_call>%s</tool_call>", buf->buf); fflush(stdout); }
     }
     rs->mode = 1;
-  } else if (ARCH != ARCH_QWEN2 && next == LLAMA3_PYTHON_TAG) {
+  } else if (ARCH < ARCH_QWEN2 && next == LLAMA3_PYTHON_TAG) {
     rs->mode = 2;
   } else {
     char *piece = decode(tk, rs->token, next);
@@ -2922,7 +3249,7 @@ static void reply_token(ReplyState *rs, Tokenizer *tk, int next) {
     if (ok) {
       if (rs->mode == 2) {
         sb_puts(buf, piece);
-      } else if (ARCH == ARCH_QWEN2 || rs->mode == 1) {
+      } else if (ARCH >= ARCH_QWEN2 || rs->mode == 1) {
         if (rs->mode == 0) { // skip leading whitespace of the message
           const char *p = piece;
           while (*p && isspace((unsigned char)*p)) p++;
@@ -3019,7 +3346,7 @@ static int chat_reply(Transformer *tr, Tokenizer *tk, Sampler *sp, ChatHistory *
     if (stop) break;
     if (pending < 0) memcpy(own, L + (size_t)k * V, (size_t)V * sizeof(float)); // all accepted
   }
-  if (ARCH != ARCH_QWEN2 && rs.mode == 2) {
+  if (ARCH < ARCH_QWEN2 && rs.mode == 2) {
     JNode *c = normalize_call(json_parse(rs.buf.buf, NULL));
     if (c) calls[rs.n_calls++] = c;
     else printf("%s", rs.buf.buf); // looked like JSON but is not a call: show it as text
@@ -3261,6 +3588,11 @@ int main(int argc, char *argv[]) {
 #endif
   build_transformer(&transformer, checkpoint_path, ctx);
   init_pool(&transformer, nthreads);
+  if (needs_token_path(&transformer.config) && (SPEC_K > 0 || draft_path)) {
+    // no multi-token path for this model yet: speculation would only cost time
+    SPEC_K = 0;
+    draft_path = NULL;
+  }
   Transformer draft;
   if (draft_path) {
     build_transformer(&draft, draft_path, transformer.config.seq_len);

@@ -6,7 +6,7 @@ md = sys.argv[1]; cfg = json.load(open(md + '/config.json')); T = {}
 for f in sorted(x for x in os.listdir(md) if x.endswith('.safetensors')): T.update(load_safetensors(os.path.join(md, f)))
 ids = [int(x) for x in open(sys.argv[2]).read().split()]
 D, H, KV, L = cfg['hidden_size'], cfg['num_attention_heads'], cfg['num_key_value_heads'], cfg['num_hidden_layers']
-hd = D // H; eps = cfg['rms_norm_eps']; N = len(ids)
+hd = cfg.get('head_dim') or D // H; eps = cfg['rms_norm_eps']; N = len(ids)
 inv = 1.0 / cfg['rope_theta'] ** (np.arange(0, hd, 2) / hd)
 rs = cfg.get('rope_scaling')
 if rs and rs.get('rope_type') == 'llama3':
@@ -25,16 +25,32 @@ mask = np.triu(np.full((N, N), -np.inf, np.float32), 1)
 for l in range(L):
     p = f'model.layers.{l}.'
     h = rms(x, g(p + 'input_layernorm.weight'))
-    q = rot((h @ g(p + 'self_attn.q_proj.weight').T + gb(p + 'self_attn.q_proj.bias')).reshape(N, H, hd))
-    k = rot((h @ g(p + 'self_attn.k_proj.weight').T + gb(p + 'self_attn.k_proj.bias')).reshape(N, KV, hd))
+    q = (h @ g(p + 'self_attn.q_proj.weight').T + gb(p + 'self_attn.q_proj.bias')).reshape(N, H, hd)
+    k = (h @ g(p + 'self_attn.k_proj.weight').T + gb(p + 'self_attn.k_proj.bias')).reshape(N, KV, hd)
+    if p + 'self_attn.q_norm.weight' in T:  # Qwen3: per-head RMSNorm before RoPE
+        q = rms(q, g(p + 'self_attn.q_norm.weight')); k = rms(k, g(p + 'self_attn.k_norm.weight'))
+    q, k = rot(q), rot(k)
     v = (h @ g(p + 'self_attn.v_proj.weight').T + gb(p + 'self_attn.v_proj.bias')).reshape(N, KV, hd)
     k = np.repeat(k, H // KV, 1); v = np.repeat(v, H // KV, 1)
     s = np.einsum('qhd,khd->hqk', q, k) / np.sqrt(hd) + mask
     s = np.exp(s - s.max(-1, keepdims=True)); s /= s.sum(-1, keepdims=True)
-    x = x + np.einsum('hqk,khd->qhd', s, v).reshape(N, D) @ g(p + 'self_attn.o_proj.weight').T
+    x = x + np.einsum('hqk,khd->qhd', s, v).reshape(N, H * hd) @ g(p + 'self_attn.o_proj.weight').T
     h = rms(x, g(p + 'post_attention_layernorm.weight'))
-    a = h @ g(p + 'mlp.gate_proj.weight').T; b = h @ g(p + 'mlp.up_proj.weight').T
-    x = x + (a / (1 + np.exp(-a)) * b) @ g(p + 'mlp.down_proj.weight').T
+    if cfg.get('num_experts'):  # Qwen3-MoE: softmax router, top-k, optional renormalization
+        r = h @ g(p + 'mlp.gate.weight').T
+        r = np.exp(r - r.max(1, keepdims=True)); r /= r.sum(1, keepdims=True)
+        K = cfg['num_experts_per_tok']; top = np.argsort(-r, 1)[:, :K]; wts = np.take_along_axis(r, top, 1)
+        if cfg.get('norm_topk_prob'): wts = wts / wts.sum(1, keepdims=True)
+        out = np.zeros_like(x)
+        for e in np.unique(top):
+            tok, slot = np.nonzero(top == e)
+            he = h[tok]; q_ = p + f'mlp.experts.{e}.'
+            a = he @ g(q_ + 'gate_proj.weight').T; b = he @ g(q_ + 'up_proj.weight').T
+            out[tok] += (wts[tok, slot][:, None]) * ((a / (1 + np.exp(-a)) * b) @ g(q_ + 'down_proj.weight').T)
+        x = x + out
+    else:
+        a = h @ g(p + 'mlp.gate_proj.weight').T; b = h @ g(p + 'mlp.up_proj.weight').T
+        x = x + (a / (1 + np.exp(-a)) * b) @ g(p + 'mlp.down_proj.weight').T
 W = g('lm_head.weight') if 'lm_head.weight' in T else g('model.embed_tokens.weight')
 logits = rms(x, g('model.norm.weight')) @ W.T
 c = np.fromfile(sys.argv[3], np.float32).reshape(N, -1)[:, :logits.shape[1]]
