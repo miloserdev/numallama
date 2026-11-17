@@ -1,0 +1,62 @@
+{
+  "root": "..",
+  "timeout_sec": 10,
+  "max_output": 3000,
+  "tools": [
+    {
+      "name": "ls",
+      "description": "List the files in a directory of the workspace, with sizes and dates.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "Directory to list, relative to the workspace.", "default": "."}
+        },
+        "required": []
+      },
+      "command": ["ls", "-la", "--", "{path}"],
+      "path_params": ["path"]
+    },
+    {
+      "name": "cat",
+      "description": "Show the contents of a text file in the workspace.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {"type": "string", "description": "File to show, relative to the workspace."}
+        },
+        "required": ["path"]
+      },
+      "command": ["cat", "--", "{path}"],
+      "path_params": ["path"]
+    },
+    {
+      "name": "grep",
+      "description": "Search text files in the workspace for lines matching a pattern; prints file:line:text.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": {"type": "string", "description": "Text or basic regular expression to search for."},
+          "path": {"type": "string", "description": "File or directory to search, relative to the workspace.", "default": "."}
+        },
+        "required": ["pattern"]
+      },
+      "command": ["grep", "-rnI", "--max-count=20", "-e", "{pattern}", "--", "{path}"],
+      "path_params": ["path"],
+      "allow_dash": ["pattern"]
+    },
+    {
+      "name": "find",
+      "description": "Find files in the workspace whose name matches a glob pattern such as *.c",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string", "description": "File name glob pattern, e.g. *.py or README*"},
+          "path": {"type": "string", "description": "Directory to search in, relative to the workspace.", "default": "."}
+        },
+        "required": ["name"]
+      },
+      "command": ["find", "{path}", "-maxdepth", "5", "-name", "{name}"],
+      "path_params": ["path"]
+    }
+  ]
+}
