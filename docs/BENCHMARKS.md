@@ -14,17 +14,20 @@ single socket under `numactl -N0 -m0 -t 96`; for 2 sockets the best of `--numa d
 
 | Model | llama.cpp 1 socket | numallama 1 socket | numallama 2 sockets | llama.cpp best 2-socket |
 |---|---|---|---|---|
-| Llama 3.2 3B Q8 | 36 / **512** | 48 / 489 | **76** / 490 | 4.6 / 249 |
-| Llama 3.2 3B Q4 (llama.cpp Q4_0) | 64 / **803** | 70 / 430 | **103** / 490 | 21 / 394 |
+| Llama 3.2 3B Q8 | 36 / 512 | 48 / 1125 | **76** / **1172** | 4.6 / 249 |
+| Llama 3.2 3B Q4 (llama.cpp Q4_0) | 64 / 803 | 70 / 756 | **103** / **923** | 21 / 394 |
 | Llama 3.2 3B Q4_K_M (llama.cpp) | 64 / 568 | — | — | — |
-| Llama 3.1 8B Q8 | 19 / **274** | 21 / 183 | **39** / 214 | 3.6 / 140 |
-| Llama 3.1 8B Q4 (llama.cpp Q4_K_M) | 29 / **246** | 34 / 181 | **58** / 223 | 0.8 / 132 |
+| Llama 3.1 8B Q8 | 19 / 274 | 21 / 437 | **39** / **680** | 3.6 / 140 |
+| Llama 3.1 8B Q4 (llama.cpp Q4_K_M) | 29 / 246 | 34 / 341 | **58** / **495** | 0.8 / 132 |
 
-(decode / prefill; numallama decode re-measured after the synchronization rework below, prefill before it)
+(decode / prefill 512 tokens)
 
 - llama.cpp does not scale to the second socket on this machine: its per-op barriers collapse as
   soon as the thread count exceeds the truly idle cores, and the weights are not split by node.
-- llama.cpp is faster at prefill (repacked 4x4 weight layout, tuned GEMM kernels).
+- Prefill: Q8 weights are repacked at load into 4-row blocks interleaved by 4 bytes, so one `sdot` by
+  lane gives 4 rows at once (no horizontal reductions) and each weight vector serves 8 tokens; every
+  socket quantizes the block inputs into its own memory. llama.cpp still wins 3B Q4 prefill on one
+  socket (our Q4 kernel is not repacked yet).
 
 Quality, Llama 3.2 3B, mean KL divergence to full precision on the same 4 x 512-token chunks
 (second half of each chunk scored, as `llama-perplexity --kl-divergence`):
@@ -44,7 +47,7 @@ Quality, Llama 3.2 3B, mean KL divergence to full precision on the same 4 x 512-
 | | 1 socket | 2 sockets |
 |---|---|---|
 | decode | 47 tok/s | **71 tok/s** |
-| prefill (batched, grouped by expert) | — | 202 tok/s (token by token: 65) |
+| prefill 512 tokens (batched, grouped by expert) | — | 523 tok/s (token by token: 69) |
 
 Logits vs an fp32 numpy reference: top-1 97.7%, mean KL 0.0075.
 
@@ -65,6 +68,19 @@ Tried and dropped: smaller work chunks / byte-capped chunks (shorter row runs st
 finer attention chunks (16 positions), Megatron-style column split of wo/w2 (two cross-socket
 barriers per layer instead of four: +1% on MoE, 0 on 8B, +10 GB and +5 s load).
 The remaining waiting (~30%) is load skew at ~12 barriers per layer, not barrier latency.
+
+## Prefill rework (512 tokens, 2 sockets, tok/s)
+
+| Step | 3B Q8 | 8B Q8 | Qwen3-30B-A3B |
+|---|---|---|---|
+| before | 492 | 214 | 215 |
+| packed Q8 layout + sdot-by-lane 4x8 kernel | 611 | 382 | 249 |
+| MoE: dynamic expert chunks, parallel gather | | | 328 |
+| q+k+v as one balanced static range | 729 | 425 | 333 |
+| per-node quantized block inputs | **1172** | **680** | **523** |
+
+Tried and dropped: dynamic 16-row chunks for the batched matmuls (every chunk re-reads the inputs of
+all tokens: 8B 382 -> 301).
 
 ## Speculative decoding, Qwen3-30B-A3B (MoE), 2 sockets, greedy, prompt lookup (`-k 8`)
 

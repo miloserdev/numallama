@@ -361,6 +361,61 @@ static void place_weights(TransformerWeights *w, Config *p) {
 }
 #endif
 
+/* Q8 weight layout. After loading, every int8 matrix is repacked in place into blocks of 4 rows:
+ * per block and quantization group, GS/4 chunks of 16 bytes [row0 k..k+3 | row1 | row2 | row3],
+ * and the scales of a block as [group][4 rows]. One `sdot` by lane (4 weight rows x 4 activations)
+ * then yields the 4 rows in the 4 lanes, with no horizontal reductions; the batched kernel reuses
+ * every weight vector for 8 tokens. Row offsets of multiples of 4 (node splits, experts) keep their
+ * meaning, only the order inside a block changes. */
+typedef struct { QuantizedTensor *t; int rows, cols; } PackJob;
+static void *pack_job(void *arg) {
+  PackJob *j = arg;
+  const int n = j->cols, ng = n / GS;
+  int8_t *tq = malloc((size_t)4 * n);
+  float *ts = malloc((size_t)4 * ng * sizeof(float));
+  for (int b = 0; b < j->rows / 4; b++) {
+    int8_t *q = j->t->q + (size_t)b * 4 * n;
+    float *sc = j->t->s + (size_t)b * 4 * ng;
+    memcpy(tq, q, (size_t)4 * n);
+    memcpy(ts, sc, (size_t)4 * ng * sizeof(float));
+    for (int g = 0; g < ng; g++) {
+      for (int kk = 0; kk < GS / 4; kk++)
+        for (int r = 0; r < 4; r++) memcpy(q + (size_t)g * GS * 4 + kk * 16 + r * 4, tq + (size_t)r * n + g * GS + kk * 4, 4);
+      for (int r = 0; r < 4; r++) sc[g * 4 + r] = ts[(size_t)r * ng + g];
+    }
+  }
+  free(tq);
+  free(ts);
+  return NULL;
+}
+static void pack_q8(TransformerWeights *w, Config *p) {
+  struct { QuantizedTensor *t; int n, rows, cols; } list[] = {
+    {w->wq, p->n_layers, p->q_dim, p->dim}, {w->wk, p->n_layers, p->kv_dim, p->dim}, {w->wv, p->n_layers, p->kv_dim, p->dim},
+    {w->wo, p->n_layers, p->dim, p->q_dim},
+    {w->w1, p->n_layers, p->n_experts > 0 ? p->n_experts * p->moe_hidden : p->hidden_dim, p->dim},
+    {w->w3, p->n_layers, p->n_experts > 0 ? p->n_experts * p->moe_hidden : p->hidden_dim, p->dim},
+    {w->w2, p->n_layers, p->n_experts > 0 ? p->n_experts * p->dim : p->dim, p->n_experts > 0 ? p->moe_hidden : p->hidden_dim},
+    {w->wg, w->wg ? p->n_layers : 0, p->n_experts, p->dim}, {w->wcls, 1, p->vocab_size, p->dim}};
+  int nj = 0;
+  for (size_t k = 0; k < sizeof(list) / sizeof(list[0]); k++) nj += list[k].n;
+  PackJob *jobs = malloc(nj * sizeof(PackJob));
+  pthread_t *th = malloc(nj * sizeof(pthread_t));
+  int m = 0;
+  for (size_t k = 0; k < sizeof(list) / sizeof(list[0]); k++)
+    for (int l = 0; l < list[k].n; l++) {
+      if (list[k].t[l].bits != 8) continue;
+      if (list[k].rows % 4 || list[k].cols % GS) { fprintf(stderr, "Q8 matrix %d x %d: rows must be a multiple of 4\n", list[k].rows, list[k].cols); exit(EXIT_FAILURE); }
+      jobs[m++] = (PackJob){list[k].t + l, list[k].rows, list[k].cols};
+    }
+  for (int a = 0; a < m; a += 128) { // at most 128 threads at a time
+    int e = a + 128 < m ? a + 128 : m;
+    for (int k = a; k < e; k++) pthread_create(&th[k], NULL, pack_job, &jobs[k]);
+    for (int k = a; k < e; k++) pthread_join(th[k], NULL);
+  }
+  free(jobs);
+  free(th);
+}
+
 void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weights, int *fd, float **data, ssize_t *file_size) {
   FILE *file = fopen(checkpoint, "rb");
   if (!file) {
@@ -462,6 +517,7 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weigh
   }
   fclose(file);
   dequantize(weights->q_tokens, weights->token_embedding_table, config->vocab_size * config->dim);
+  pack_q8(weights, config); // after the embeddings were dequantized (the classifier may share them)
   for (int k = 0; k < NN; k++) weights->wg_node[k] = weights->wg;
 #if defined(__linux__)
   if (NN > 1 && config->n_experts > 0) { // the router is small (n_experts x dim): replicate it on every node
@@ -980,48 +1036,58 @@ static void quantize_vec(int8_t* q, float* s, const float* x, int n) {
 }
 
 // out[i] = W[i,:] . x  for rows i in [r0, r1); x is quantized (xq, xs), n % GS == 0
+// scalar access to the packed Q8 layout (row i, column k)
+static inline int8_t q8_at(const QuantizedTensor* w, int n, int i, int k) {
+    return w->q[(size_t)(i / 4) * 4 * n + (size_t)(k / GS) * GS * 4 + ((k % GS) / 4) * 16 + (i % 4) * 4 + k % 4];
+}
+static inline float q8_scale(const QuantizedTensor* w, int n, int i, int g) {
+    return w->s[(size_t)(i / 4) * 4 * (n / GS) + g * 4 + i % 4];
+}
+static void matmul_rows_q8_scalar(float* out, const int8_t* xq, const float* xs, const QuantizedTensor* w, int n, int r0, int r1) {
+    for (int i = r0; i < r1; i++) {
+        float val = 0.0f;
+        for (int g = 0; g < n / GS; g++) {
+            int32_t iv = 0;
+            for (int k = g * GS; k < (g + 1) * GS; k++) iv += (int32_t)xq[k] * q8_at(w, n, i, k);
+            val += (float)iv * q8_scale(w, n, i, g) * xs[g];
+        }
+        out[i] = val;
+    }
+}
 static void matmul_rows_q8(float* out, const int8_t* xq, const float* xs,
                         const QuantizedTensor* w, int n, int r0, int r1) {
     const int ng = n / GS;
     int i = r0;
 #if defined(__ARM_FEATURE_DOTPROD)
-    if (GS % 16 == 0) {
+    if (GS % 16 == 0 && r0 % 4 == 0) {
+        const int8_t* qend = w->q + (size_t)r1 * n;
         for (; i + 4 <= r1; i += 4) {
-            const int8_t* w0 = w->q + (size_t)i * n;
-            const int8_t* w1 = w0 + n;
-            const int8_t* w2 = w1 + n;
-            const int8_t* w3 = w2 + n;
-            const float* s0 = w->s + (size_t)i * ng;
+            const int8_t* wb = w->q + (size_t)i * n;
+            const float* sb = w->s + (size_t)i * ng;
             float32x4_t acc = vdupq_n_f32(0.0f);
             for (int g = 0; g < ng; g++) {
-                int32x4_t a0 = vdupq_n_s32(0), a1 = a0, a2 = a0, a3 = a0;
-                const int off = g * GS;
-                for (int k = 0; k < GS; k += 16) {
-                    int8x16_t xv = vld1q_s8(xq + off + k);
-                    a0 = vdotq_s32(a0, vld1q_s8(w0 + off + k), xv);
-                    a1 = vdotq_s32(a1, vld1q_s8(w1 + off + k), xv);
-                    a2 = vdotq_s32(a2, vld1q_s8(w2 + off + k), xv);
-                    a3 = vdotq_s32(a3, vld1q_s8(w3 + off + k), xv);
+                const int8_t* wg = wb + (size_t)g * GS * 4;
+                if (wg + 4096 + 256 <= qend) { // one block is a single stream: keep it ahead, within the range
+                    __builtin_prefetch(wg + 4096, 0, 0);
+                    __builtin_prefetch(wg + 4096 + 64, 0, 0);
+                    __builtin_prefetch(wg + 4096 + 128, 0, 0);
+                    __builtin_prefetch(wg + 4096 + 192, 0, 0);
                 }
-                int32x4_t r = vpaddq_s32(vpaddq_s32(a0, a1), vpaddq_s32(a2, a3));
-                float32x4_t ws = { s0[g], s0[g + ng], s0[g + 2 * ng], s0[g + 3 * ng] };
-                acc = vfmaq_f32(acc, vcvtq_f32_s32(r), vmulq_n_f32(ws, xs[g]));
+                int32x4_t a = vdupq_n_s32(0), b = a;
+                for (int k = 0; k < GS; k += 16) {
+                    int8x16_t xv = vld1q_s8(xq + g * GS + k);
+                    a = vdotq_laneq_s32(a, vld1q_s8(wg + k * 4), xv, 0);
+                    b = vdotq_laneq_s32(b, vld1q_s8(wg + k * 4 + 16), xv, 1);
+                    a = vdotq_laneq_s32(a, vld1q_s8(wg + k * 4 + 32), xv, 2);
+                    b = vdotq_laneq_s32(b, vld1q_s8(wg + k * 4 + 48), xv, 3);
+                }
+                acc = vfmaq_f32(acc, vcvtq_f32_s32(vaddq_s32(a, b)), vmulq_n_f32(vld1q_f32(sb + g * 4), xs[g]));
             }
             vst1q_f32(out + i, acc);
         }
     }
 #endif
-    for (; i < r1; i++) {
-        const int8_t* wr = w->q + (size_t)i * n;
-        const float* sr = w->s + (size_t)i * ng;
-        float val = 0.0f;
-        for (int g = 0; g < ng; g++) {
-            int32_t ival = 0;
-            for (int k = 0; k < GS; k++) { ival += (int32_t)xq[g * GS + k] * (int32_t)wr[g * GS + k]; }
-            val += (float)ival * sr[g] * xs[g];
-        }
-        out[i] = val;
-    }
+    if (i < r1) matmul_rows_q8_scalar(out, xq, xs, w, n, i, r1);
 }
 
 // ----------------------------------------------------------------------------
@@ -1114,45 +1180,58 @@ static void matmul_rows_batch_q4(float* out, int ldo, const int8_t* xq, const fl
         for (int t = 0; t < B; t++) matmul_rows_q4(out + (size_t)t * ldo, xq + (size_t)t * n, xs + (size_t)t * ngx, w, n, i, r1);
 }
 
+// tile of 4 rows x TT tokens on the packed layout
+#define Q8_TILE(TT)                                                                                        \
+    do {                                                                                                   \
+        float32x4_t acc[TT];                                                                               \
+        for (int u = 0; u < TT; u++) acc[u] = vdupq_n_f32(0.0f);                                           \
+        for (int g = 0; g < ng; g++) {                                                                     \
+            int32x4_t a[TT];                                                                               \
+            for (int u = 0; u < TT; u++) a[u] = vdupq_n_s32(0);                                            \
+            const int8_t* wg = wb + (size_t)g * GS * 4;                                                    \
+            for (int k = 0; k < GS; k += 16) {                                                             \
+                int8x16_t w0 = vld1q_s8(wg + k * 4), w1 = vld1q_s8(wg + k * 4 + 16);                       \
+                int8x16_t w2 = vld1q_s8(wg + k * 4 + 32), w3 = vld1q_s8(wg + k * 4 + 48);                  \
+                for (int u = 0; u < TT; u++) {                                                             \
+                    int8x16_t xv = vld1q_s8(xq + (size_t)(t + u) * n + g * GS + k);                         \
+                    a[u] = vdotq_laneq_s32(a[u], w0, xv, 0);                                               \
+                    a[u] = vdotq_laneq_s32(a[u], w1, xv, 1);                                               \
+                    a[u] = vdotq_laneq_s32(a[u], w2, xv, 2);                                               \
+                    a[u] = vdotq_laneq_s32(a[u], w3, xv, 3);                                               \
+                }                                                                                          \
+            }                                                                                              \
+            const float32x4_t ws = vld1q_f32(sb + g * 4);                                                  \
+            for (int u = 0; u < TT; u++)                                                                   \
+                acc[u] = vfmaq_f32(acc[u], vcvtq_f32_s32(a[u]), vmulq_n_f32(ws, xs[(size_t)(t + u) * ng + g])); \
+        }                                                                                                  \
+        for (int u = 0; u < TT; u++) vst1q_f32(out + (size_t)(t + u) * ldo + i, acc[u]);                    \
+    } while (0)
 static void matmul_rows_batch_q8(float* out, int ldo, const int8_t* xq, const float* xs, int B,
                                  const QuantizedTensor* w, int n, int r0, int r1) {
     const int ng = n / GS;
-    int i = r0;
+    int iend = r0;
 #if defined(__ARM_FEATURE_DOTPROD)
-    if (GS % 16 == 0) {
-        for (; i + 4 <= r1; i += 4) {
-            const int8_t* w0 = w->q + (size_t)i * n;
-            const float* s0 = w->s + (size_t)i * ng;
-            int t = 0;
-            for (; t + 4 <= B; t += 4) {
-                float32x4_t acc[4] = {vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)};
-                for (int g = 0; g < ng; g++) {
-                    int32x4_t a[4][4];
-                    for (int u = 0; u < 4; u++)
-                        for (int r = 0; r < 4; r++) a[u][r] = vdupq_n_s32(0);
-                    const int off = g * GS;
-                    for (int k = 0; k < GS; k += 16) {
-                        int8x16_t wv[4];
-                        for (int r = 0; r < 4; r++) wv[r] = vld1q_s8(w0 + (size_t)r * n + off + k);
-                        for (int u = 0; u < 4; u++) {
-                            const int8x16_t xv = vld1q_s8(xq + (size_t)(t + u) * n + off + k);
-                            for (int r = 0; r < 4; r++) a[u][r] = vdotq_s32(a[u][r], wv[r], xv);
-                        }
-                    }
-                    const float32x4_t ws = {s0[g], s0[g + ng], s0[g + 2 * ng], s0[g + 3 * ng]};
-                    for (int u = 0; u < 4; u++) {
-                        int32x4_t rr = vpaddq_s32(vpaddq_s32(a[u][0], a[u][1]), vpaddq_s32(a[u][2], a[u][3]));
-                        acc[u] = vfmaq_f32(acc[u], vcvtq_f32_s32(rr), vmulq_n_f32(ws, xs[(size_t)(t + u) * ng + g]));
-                    }
-                }
-                for (int u = 0; u < 4; u++) vst1q_f32(out + (size_t)(t + u) * ldo + i, acc[u]);
+    if (GS % 16 == 0 && r0 % 4 == 0) {
+        iend = r0 + (r1 - r0) / 4 * 4;
+        // token tiles outside, the thread's rows inside: its weights stay in L2, the tile's inputs in L1
+        int t = 0;
+        for (; t + 8 <= B; t += 8)
+            for (int i = r0; i < iend; i += 4) {
+                const int8_t* wb = w->q + (size_t)i * n;
+                const float* sb = w->s + (size_t)i * ng;
+                Q8_TILE(8);
             }
-            for (; t < B; t++) matmul_rows_q8(out + (size_t)t * ldo, xq + (size_t)t * n, xs + (size_t)t * ng, w, n, i, i + 4);
-        }
+        for (; t + 4 <= B; t += 4)
+            for (int i = r0; i < iend; i += 4) {
+                const int8_t* wb = w->q + (size_t)i * n;
+                const float* sb = w->s + (size_t)i * ng;
+                Q8_TILE(4);
+            }
+        for (; t < B; t++) matmul_rows_q8(out + (size_t)t * ldo, xq + (size_t)t * n, xs + (size_t)t * ng, w, n, r0, iend);
     }
 #endif
-    if (i < r1)
-        for (int t = 0; t < B; t++) matmul_rows_q8(out + (size_t)t * ldo, xq + (size_t)t * n, xs + (size_t)t * ng, w, n, i, r1);
+    if (iend < r1)
+        for (int t = 0; t < B; t++) matmul_rows_q8_scalar(out + (size_t)t * ldo, xq + (size_t)t * n, xs + (size_t)t * ng, w, n, iend, r1);
 }
 
 static void matmul_rows(float* out, const int8_t* xq, const float* xs, const QuantizedTensor* w, int n, int r0, int r1) {
@@ -1892,6 +1971,8 @@ typedef struct {
     // MoE prefill (sized for BATCH_MAX tokens x n_active slots)
     float* router;     // (B, n_experts)
     int *moe_sel, *moe_cnt, *moe_fill, *moe_tok;
+    int *moe_ue, moe_U;  // the experts used by the block (ascending), their number
+    struct WorkCounter* moe_ctr; // per node: dynamic chunks of the w1/w3 phase
     float *moe_wt, *moe_w;
     int8_t* gxq; float* gxs; // gathered quantized ffn inputs per slot
     float *gh, *gh3;   // (slots, moe_hidden)
@@ -1914,6 +1995,15 @@ static inline void tok_range(int B, int tid, int nth, int* b0, int* b1) {
     *b1 = (int)((long)B * (tid + 1) / nth);
 }
 
+/* Per-node copies of the quantized inputs of the batched matmuls: every node normalizes / quantizes
+ * all tokens itself into memory bound to it, so the 96 threads of a socket never stream their
+ * inputs from the other socket (that made 2 sockets slower than 1 for prefill). */
+static struct {
+    int8_t* xq; float* xs;   // (B, max(dim, hidden_dim, q_dim)) block inputs
+    int8_t* gxq; float* gxs; // MoE: gathered ffn inputs per slot
+    int8_t* gq; float* gqs;  // MoE: quantized hidden activations per slot
+} BN[MAX_NODES];
+
 /* MoE FFN for a block of B tokens (prefill). Input: BT.xq/BT.xs (normalized + quantized ffn input).
  * Tokens are grouped by expert so every expert's weights are read once per block:
  * router (batched) -> top-k per token -> per-expert token lists with gathered inputs ->
@@ -1927,9 +2017,12 @@ static void moe_batch(ThreadBuf* tb, int l, int B) {
     const int dim = p->dim, E = p->n_experts, A = p->n_active, mh = p->moe_hidden;
     const int ngd = dim / GS, ngm = mh / GS;
     int r0, r1;
+    int8_t* XQ = BN[tb->node].xq; float* XS = BN[tb->node].xs;
+    int8_t* GXQ = BN[tb->node].gxq; float* GXS = BN[tb->node].gxs;
+    int8_t* GQ = BN[tb->node].gq; float* GQS = BN[tb->node].gqs;
     // router logits for all tokens
     part_range_node(E, tb, &r0, &r1);
-    matmul_rows_batch(BT.router, E, BT.xq, BT.xs, B, w->wg + l, dim, r0, r1);
+    matmul_rows_batch(BT.router, E, XQ, XS, B, w->wg + l, dim, r0, r1);
     barrier(tb);
     // routing and grouping (one thread; B*A entries)
     if (tid == 0) {
@@ -1947,28 +2040,41 @@ static void moe_batch(ThreadBuf* tb, int l, int B) {
                 int e = BT.moe_sel[b * A + j], slot = fill[e]++;
                 BT.moe_tok[slot] = b;
                 BT.moe_w[slot] = BT.moe_wt[b * A + j];
-                memcpy(BT.gxq + (size_t)slot * dim, BT.xq + (size_t)b * dim, dim);
-                memcpy(BT.gxs + (size_t)slot * ngd, BT.xs + (size_t)b * ngd, ngd * sizeof(float));
             }
+        BT.moe_U = 0;
+        for (int e = 0; e < E; e++) if (cnt[e + 1] > cnt[e]) BT.moe_ue[BT.moe_U++] = e;
+        for (int k = 0; k < NN; k++) atomic_store_explicit(&BT.moe_ctr[k].v, 0, memory_order_relaxed);
     }
     barrier(tb);
     const int* off = BT.moe_cnt;
-    // w1/w3 + SwiGLU: this node's half of every used expert, split among the node's threads
+    { // gather the quantized inputs of the slots (all threads)
+        int s0, s1;
+        tok_range(off[E], tb->ltid, tb->nthn, &s0, &s1); // every node gathers all slots into its buffer
+        for (int sl = s0; sl < s1; sl++) {
+            int b = BT.moe_tok[sl];
+            memcpy(GXQ + (size_t)sl * dim, XQ + (size_t)b * dim, dim);
+            memcpy(GXS + (size_t)sl * ngd, XS + (size_t)b * ngd, ngd * sizeof(float));
+        }
+    }
+    barrier(tb);
+    // w1/w3 + SwiGLU: this node's half of every used expert, in dynamic 16-row chunks (the cost of a
+    // chunk is proportional to the expert's token count, so a static split would be badly unbalanced)
     int lo, hi;
     node_rows(mh, tb->node, &lo, &hi);
-    const int half = hi - lo, tot = E * half;
-    int v0 = (int)((long)tot * tb->ltid / tb->nthn), v1 = (int)((long)tot * (tb->ltid + 1) / tb->nthn);
-    v0 &= ~3; if (tb->ltid == tb->nthn - 1) v1 = tot; else v1 &= ~3;
-    for (int v = v0; v < v1;) {
-        int e = v / half, vend = (e + 1) * half < v1 ? (e + 1) * half : v1;
+    const int half = hi - lo, U = BT.moe_U;
+    const int cpe = (half + 15) / 16; // chunks per expert
+    for (;;) {
+        int tk = atomic_fetch_add_explicit(&BT.moe_ctr[tb->node].v, 1, memory_order_relaxed);
+        if (tk >= U * cpe) break;
+        int u = tk / cpe, e = BT.moe_ue[u], c = tk % cpe;
         int n = off[e + 1] - off[e];
-        if (n > 0) {
-            int a0 = lo + (v - e * half), a1 = lo + (vend - e * half);
+        {
+            int a0 = lo + c * 16, a1 = lo + (c * 16 + 16 < half ? c * 16 + 16 : half);
             QuantizedTensor e1 = expert_view(w->w1 + l, e, mh, dim), e3 = expert_view(w->w3 + l, e, mh, dim);
             float* h1 = BT.gh + (size_t)off[e] * mh;
             float* h3 = BT.gh3 + (size_t)off[e] * mh;
-            matmul_rows_batch(h1, mh, BT.gxq + (size_t)off[e] * dim, BT.gxs + (size_t)off[e] * ngd, n, &e1, dim, a0, a1);
-            matmul_rows_batch(h3, mh, BT.gxq + (size_t)off[e] * dim, BT.gxs + (size_t)off[e] * ngd, n, &e3, dim, a0, a1);
+            matmul_rows_batch(h1, mh, GXQ + (size_t)off[e] * dim, GXS + (size_t)off[e] * ngd, n, &e1, dim, a0, a1);
+            matmul_rows_batch(h3, mh, GXQ + (size_t)off[e] * dim, GXS + (size_t)off[e] * ngd, n, &e3, dim, a0, a1);
             for (int t = 0; t < n; t++) {
                 float wgt = BT.moe_w[off[e] + t];
                 float* x1 = h1 + (size_t)t * mh;
@@ -1980,28 +2086,28 @@ static void moe_batch(ThreadBuf* tb, int l, int B) {
                 }
             }
         }
-        v = vend;
     }
     barrier(tb);
     // quantize the hidden activations of every slot
     const int S = off[E];
     int s0, s1;
-    tok_range(S, tid, nth, &s0, &s1);
+    tok_range(S, tb->ltid, tb->nthn, &s0, &s1); // every node quantizes all slots into its buffer
     for (int sl = s0; sl < s1; sl++)
-        quantize_vec(BT.gq + (size_t)sl * mh, BT.gqs + (size_t)sl * ngm, BT.gh + (size_t)sl * mh, mh);
+        quantize_vec(GQ + (size_t)sl * mh, GQS + (size_t)sl * ngm, BT.gh + (size_t)sl * mh, mh);
     barrier(tb);
     // w2: this node's rows of dim, for every used expert, then add every slot into its token
     part_range_node(dim, tb, &r0, &r1);
-    for (int e = 0; e < E; e++) {
-        int n = off[e + 1] - off[e];
-        if (n == 0 || r0 >= r1) continue;
-        QuantizedTensor e2 = expert_view(w->w2 + l, e, dim, mh);
-        matmul_rows_batch(BT.gout + (size_t)off[e] * dim, dim, BT.gq + (size_t)off[e] * mh, BT.gqs + (size_t)off[e] * ngm, n, &e2, mh, r0, r1);
-    }
-    for (int sl = 0; sl < S && r0 < r1; sl++) {
-        float* x = BT.x + (size_t)BT.moe_tok[sl] * dim;
-        const float* o = BT.gout + (size_t)sl * dim;
-        for (int i = r0; i < r1; i++) x[i] += o[i];
+    if (r0 < r1) {
+        for (int u = 0; u < BT.moe_U; u++) {
+            int e = BT.moe_ue[u], n = off[e + 1] - off[e];
+            QuantizedTensor e2 = expert_view(w->w2 + l, e, dim, mh);
+            matmul_rows_batch(BT.gout + (size_t)off[e] * dim, dim, GQ + (size_t)off[e] * mh, GQS + (size_t)off[e] * ngm, n, &e2, mh, r0, r1);
+        }
+        for (int sl = 0; sl < S; sl++) {
+            float* x = BT.x + (size_t)BT.moe_tok[sl] * dim;
+            const float* o = BT.gout + (size_t)sl * dim;
+            for (int i = r0; i < r1; i++) x[i] += o[i];
+        }
     }
 }
 
@@ -2023,7 +2129,10 @@ static void forward_batch_thread(int tid) {
     const int hs2 = head_size / 2;
     const int ngd = dim / GS, ngh = hidden_dim / GS, ngq = q_dim / GS;
     const float att_scale = 1.0f / sqrtf((float)head_size);
-    int r0, r1, b0, b1;
+    int r0, r1, b0, b1, n0, n1;
+    int8_t* XQ = BN[tb->node].xq; // the node's quantized block inputs
+    float* XS = BN[tb->node].xs;
+    tok_range(B, tb->ltid, tb->nthn, &n0, &n1); // this thread's tokens for the node-local quantizations
 
     // embeddings and RoPE tables for this thread's share of the tokens
     tok_range(B, tid, nth, &b0, &b1);
@@ -2035,24 +2144,40 @@ static void forward_batch_thread(int tid) {
             BT.rope_s[b * hs2 + j] = (float)sin(val);
         }
     }
-    (void)tb;
+    barrier(tb); // the node-local normalizations below read tokens written by other threads
+    // static row ranges: a thread keeps a tile of token inputs in L1 over its whole range (dynamic
+    // 16-row chunks re-read all B inputs per chunk and were slower). q, k and v are split as one
+    // range of q_dim + 2 kv_dim rows so that every thread gets the same number of rows
+    int qa, qe, ka, ke, va, ve;
+    {
+        int qlo, qhi, klo, khi, x0, x1;
+        node_rows(q_dim, tb->node, &qlo, &qhi);
+        node_rows(kv_dim, tb->node, &klo, &khi);
+        const int nq = qhi - qlo, nk = khi - klo, tot = (nq + 2 * nk) / 4;
+        x0 = 4 * (int)((long)tot * tb->ltid / tb->nthn);
+        x1 = 4 * (int)((long)tot * (tb->ltid + 1) / tb->nthn);
+        if (tb->ltid == tb->nthn - 1) x1 = nq + 2 * nk;
+        // intersect [x0, x1) with the three sub-ranges
+        qa = qlo + (x0 < nq ? x0 : nq); qe = qlo + (x1 < nq ? x1 : nq);
+        ka = klo + (x0 - nq < 0 ? 0 : (x0 - nq > nk ? nk : x0 - nq)); ke = klo + (x1 - nq < 0 ? 0 : (x1 - nq > nk ? nk : x1 - nq));
+        va = klo + (x0 - nq - nk < 0 ? 0 : (x0 - nq - nk > nk ? nk : x0 - nq - nk)); ve = klo + (x1 - nq - nk < 0 ? 0 : (x1 - nq - nk > nk ? nk : x1 - nq - nk));
+    }
 
     for (int l = 0; l < p->n_layers; l++) {
         size_t loff = (size_t)l * p->seq_len * kv_dim;
 
         // attention rmsnorm + quantize, split over tokens
-        for (int b = b0; b < b1; b++) {
-            rmsnorm(BT.xb + (size_t)b * dim, BT.x + (size_t)b * dim, w->rms_att_weight + l * dim, dim);
-            quantize_vec(BT.xq + (size_t)b * dim, BT.xs + (size_t)b * ngd, BT.xb + (size_t)b * dim, dim);
+        for (int b = n0; b < n1; b++) {
+            rmsnorm(tb->xb, BT.x + (size_t)b * dim, w->rms_att_weight + l * dim, dim);
+            quantize_vec(XQ + (size_t)b * dim, XS + (size_t)b * ngd, tb->xb, dim);
         }
         barrier(tb);
 
         // fused q|k|v for all tokens
         {
-            int a, e;
-            part_range_node(q_dim, tb, &a, &e);
+            int a = qa, e = qe;
             if (a < e) {
-                matmul_rows_batch(BT.q, q_dim, BT.xq, BT.xs, B, w->wq + l, dim, a, e);
+                matmul_rows_batch(BT.q, q_dim, XQ, XS, B, w->wq + l, dim, a, e);
                 for (int b = 0; b < B; b++) {
                     float* q = BT.q + (size_t)b * q_dim;
                     if (w->bq) for (int i = a; i < e; i++) q[i] += w->bq[(size_t)l * q_dim + i];
@@ -2067,9 +2192,9 @@ static void forward_batch_thread(int tid) {
                     }
                 }
             }
-            part_range_node(kv_dim, tb, &a, &e);
+            a = ka; e = ke;
             if (a < e) {
-                matmul_rows_batch(BT.k, kv_dim, BT.xq, BT.xs, B, w->wk + l, dim, a, e);
+                matmul_rows_batch(BT.k, kv_dim, XQ, XS, B, w->wk + l, dim, a, e);
                 for (int b = 0; b < B; b++) {
                     float* k = BT.k + (size_t)b * kv_dim;
                     if (w->bk) for (int i = a; i < e; i++) k[i] += w->bk[(size_t)l * kv_dim + i];
@@ -2086,9 +2211,9 @@ static void forward_batch_thread(int tid) {
                     for (int i = a; i < e; i++) { kc[(size_t)(i / head_size) * p->seq_len * head_size + i % head_size] = k[i]; }
                 }
             }
-            part_range_node(kv_dim, tb, &a, &e);
+            a = va; e = ve;
             if (a < e) {
-                matmul_rows_batch(BT.v, kv_dim, BT.xq, BT.xs, B, w->wv + l, dim, a, e);
+                matmul_rows_batch(BT.v, kv_dim, XQ, XS, B, w->wv + l, dim, a, e);
                 for (int b = 0; b < B; b++) {
                     float* v = BT.v + (size_t)b * kv_dim;
                     if (w->bv) for (int i = a; i < e; i++) v[i] += w->bv[(size_t)l * kv_dim + i];
@@ -2164,25 +2289,27 @@ static void forward_batch_thread(int tid) {
         barrier(tb);
 
         // quantize the attention output, split over tokens
-        for (int b = b0; b < b1; b++) {
-            quantize_vec(BT.xq + (size_t)b * q_dim, BT.xs + (size_t)b * ngq, BT.xb + (size_t)b * q_dim, q_dim);
+        for (int b = n0; b < n1; b++) {
+            quantize_vec(XQ + (size_t)b * q_dim, XS + (size_t)b * ngq, BT.xb + (size_t)b * q_dim, q_dim);
         }
         barrier(tb);
 
         // output projection + residual
         part_range_node(dim, tb, &r0, &r1);
-        matmul_rows_batch(BT.xb2, dim, BT.xq, BT.xs, B, w->wo + l, q_dim, r0, r1);
-        for (int b = 0; b < B; b++) {
-            float* x = BT.x + (size_t)b * dim;
-            const float* o = BT.xb2 + (size_t)b * dim;
-            for (int i = r0; i < r1; i++) { x[i] += o[i]; }
+        {
+            matmul_rows_batch(BT.xb2, dim, XQ, XS, B, w->wo + l, q_dim, r0, r1);
+            for (int b = 0; b < B; b++) {
+                float* x = BT.x + (size_t)b * dim;
+                const float* o = BT.xb2 + (size_t)b * dim;
+                for (int i = r0; i < r1; i++) { x[i] += o[i]; }
+            }
         }
         barrier(tb);
 
         // ffn rmsnorm + quantize, split over tokens
-        for (int b = b0; b < b1; b++) {
-            rmsnorm(BT.xb + (size_t)b * dim, BT.x + (size_t)b * dim, w->rms_ffn_weight + l * dim, dim);
-            quantize_vec(BT.xq + (size_t)b * dim, BT.xs + (size_t)b * ngd, BT.xb + (size_t)b * dim, dim);
+        for (int b = n0; b < n1; b++) {
+            rmsnorm(tb->xb, BT.x + (size_t)b * dim, w->rms_ffn_weight + l * dim, dim);
+            quantize_vec(XQ + (size_t)b * dim, XS + (size_t)b * ngd, tb->xb, dim);
         }
         barrier(tb);
 
@@ -2191,45 +2318,49 @@ static void forward_batch_thread(int tid) {
         } else {
             // fused w1|w3 + SwiGLU
             part_range_node(hidden_dim, tb, &r0, &r1);
-            matmul_rows_batch(BT.hb, hidden_dim, BT.xq, BT.xs, B, w->w1 + l, dim, r0, r1);
-            matmul_rows_batch(BT.hb2, hidden_dim, BT.xq, BT.xs, B, w->w3 + l, dim, r0, r1);
-            for (int b = 0; b < B; b++) {
-                float* h1 = BT.hb + (size_t)b * hidden_dim;
-                const float* h3 = BT.hb2 + (size_t)b * hidden_dim;
-                for (int i = r0; i < r1; i++) {
-                    float val = h1[i];
-                    val *= (1.0f / (1.0f + expf(-val)));
-                    h1[i] = val * h3[i];
+            {
+                matmul_rows_batch(BT.hb, hidden_dim, XQ, XS, B, w->w1 + l, dim, r0, r1);
+                matmul_rows_batch(BT.hb2, hidden_dim, XQ, XS, B, w->w3 + l, dim, r0, r1);
+                for (int b = 0; b < B; b++) {
+                    float* h1 = BT.hb + (size_t)b * hidden_dim;
+                    const float* h3 = BT.hb2 + (size_t)b * hidden_dim;
+                    for (int i = r0; i < r1; i++) {
+                        float val = h1[i];
+                        val *= (1.0f / (1.0f + expf(-val)));
+                        h1[i] = val * h3[i];
+                    }
                 }
             }
             barrier(tb);
 
             // quantize the hidden activations, split over tokens
-            for (int b = b0; b < b1; b++) {
-                quantize_vec(BT.xq + (size_t)b * hidden_dim, BT.xs + (size_t)b * ngh, BT.hb + (size_t)b * hidden_dim, hidden_dim);
+            for (int b = n0; b < n1; b++) {
+                quantize_vec(XQ + (size_t)b * hidden_dim, XS + (size_t)b * ngh, BT.hb + (size_t)b * hidden_dim, hidden_dim);
             }
             barrier(tb);
 
             // w2 + residual
             part_range_node(dim, tb, &r0, &r1);
-            matmul_rows_batch(BT.xb2, dim, BT.xq, BT.xs, B, w->w2 + l, hidden_dim, r0, r1);
-            for (int b = 0; b < B; b++) {
-                float* x = BT.x + (size_t)b * dim;
-                const float* o = BT.xb2 + (size_t)b * dim;
-                for (int i = r0; i < r1; i++) { x[i] += o[i]; }
+            {
+                matmul_rows_batch(BT.xb2, dim, XQ, XS, B, w->w2 + l, hidden_dim, r0, r1);
+                for (int b = 0; b < B; b++) {
+                    float* x = BT.x + (size_t)b * dim;
+                    const float* o = BT.xb2 + (size_t)b * dim;
+                    for (int i = r0; i < r1; i++) { x[i] += o[i]; }
+                }
             }
         }
         barrier(tb);
     }
 
     if (BT.logits_all) { // logits of every position
-        for (int b = b0; b < b1; b++) {
-            rmsnorm(BT.xb + (size_t)b * dim, BT.x + (size_t)b * dim, w->rms_final_weight, dim);
-            quantize_vec(BT.xq + (size_t)b * dim, BT.xs + (size_t)b * ngd, BT.xb + (size_t)b * dim, dim);
+        for (int b = n0; b < n1; b++) {
+            rmsnorm(tb->xb, BT.x + (size_t)b * dim, w->rms_final_weight, dim);
+            quantize_vec(XQ + (size_t)b * dim, XS + (size_t)b * ngd, tb->xb, dim);
         }
         barrier(tb);
         part_range_node(p->vocab_size, tb, &r0, &r1);
-        matmul_rows_batch(BT.logits_all, p->vocab_size, BT.xq, BT.xs, B, w->wcls, dim, r0, r1);
+        matmul_rows_batch(BT.logits_all, p->vocab_size, XQ, XS, B, w->wcls, dim, r0, r1);
         barrier(tb);
         return;
     }
@@ -2546,6 +2677,20 @@ static void init_batch(Transformer* t) {
     BT.hb2 = calloc(B * p->hidden_dim, sizeof(float));
     BT.xq = calloc(B * qmax, sizeof(int8_t));
     BT.xs = calloc(B * (qmax / GS + 1), sizeof(float));
+    for (int k = 0; k < NN; k++) {
+        size_t S = p->n_experts > 0 ? B * p->n_active : 0, mh = p->moe_hidden;
+        size_t sz[6] = {B * qmax, B * (qmax / GS + 1) * sizeof(float), S * p->dim, S * (p->dim / GS) * sizeof(float), S * mh, S * (mh / GS) * sizeof(float)};
+        void* ptr[6];
+        for (int j = 0; j < 6; j++) {
+            size_t b = (sz[j] + 4095) & ~(size_t)4095;
+            ptr[j] = b ? aligned_alloc(4096, b) : NULL;
+#if defined(__linux__)
+            if (b && NN > 1) bind_range(ptr[j], b, NODE_ID[k]);
+#endif
+            if (b) memset(ptr[j], 0, b);
+        }
+        BN[k].xq = ptr[0]; BN[k].xs = ptr[1]; BN[k].gxq = ptr[2]; BN[k].gxs = ptr[3]; BN[k].gq = ptr[4]; BN[k].gqs = ptr[5];
+    }
     BT.rope_c = calloc(B * (head_size / 2), sizeof(float));
     BT.rope_s = calloc(B * (head_size / 2), sizeof(float));
     BT.att = calloc((size_t)P.nth * (p->n_heads / p->n_kv_heads) * p->seq_len, sizeof(float));
@@ -2558,6 +2703,9 @@ static void init_batch(Transformer* t) {
         BT.moe_wt = calloc(B * p->n_active, sizeof(float));
         BT.moe_cnt = calloc(E + 1, sizeof(int));
         BT.moe_fill = calloc(E + 1, sizeof(int));
+        BT.moe_ue = calloc(E, sizeof(int));
+        BT.moe_ctr = aligned_alloc(64, MAX_NODES * sizeof(struct WorkCounter));
+        memset(BT.moe_ctr, 0, MAX_NODES * sizeof(struct WorkCounter));
         BT.moe_tok = calloc(S, sizeof(int));
         BT.moe_w = calloc(S, sizeof(float));
         BT.gxq = calloc(S * p->dim, 1);
