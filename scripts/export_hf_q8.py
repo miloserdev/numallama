@@ -188,6 +188,140 @@ def _quant_job(key):
     return q.tobytes() + sc.tobytes(), float(err)
 
 
+KINDS_HYB = KINDS + ["li", "lo"]   # + linear-attention input (qkv|z|b|a) and output projections
+
+
+def _hyb_job(key):
+    kind, l = key
+    w = _JOB["get"][kind](l)
+    if kind in _JOB["q4"]:
+        imp = _JOB["imp"].get(f"{_JOB['inp'][kind]}.{l}.sq") if _JOB["imp"] else None
+        if imp is not None:   # statistics rows can be wider (wo / out_proj share one width)
+            imp = np.asarray(imp)[: w.shape[-1]]
+        q, sc, err = quantize_q4(w, imp=imp)
+    else:
+        q, sc, err = quantize_q80(w, _JOB["gs"])
+    return q.tobytes() + sc.tobytes(), float(err)
+
+
+def export_qwen35(cfg_all, T, out_path, q4_kinds, stats, gs):
+    """Qwen3.5 / Qwen3.8 dense text model (model_type qwen3_5), arch 3. Hybrid layers: Gated DeltaNet
+    linear attention, every `full_attention_interval`-th layer gated full attention with partial RoPE.
+    Layout after the 256-byte header (which adds int hybrid[8] = full_interval, linear k heads,
+    linear v heads, k head dim, v head dim, conv kernel, attention output gate, rotary dims):
+    fp32: att norms (L, dim), ffn norms (L, dim), final norm, q_norm / k_norm (Lf, head_dim) of the full
+    layers, then for the linear layers conv (Ll, conv_dim, K), dt_bias (Ll, nv), A = -exp(A_log)
+    (Ll, nv), gated-norm weight (Ll, dv). All zero-centered RMSNorm weights are stored as 1 + w.
+    Quantized: embedding; full layers wq (q rows), wgate, wk, wv, wo; linear layers w_in = [qkv | z | b | a]
+    rows, w_out; every layer w1, w2, w3; classifier. Vision tower and MTP head are not exported."""
+    cfg = cfg_all.get("text_config", cfg_all)
+    P = "model.language_model." if "model.language_model.embed_tokens.weight" in T else "model."
+    dim, hidden, L = cfg["hidden_size"], cfg["intermediate_size"], cfg["num_hidden_layers"]
+    nh, nkv, hd = cfg["num_attention_heads"], cfg["num_key_value_heads"], cfg["head_dim"]
+    vocab, eps = cfg["vocab_size"], float(cfg["rms_norm_eps"])
+    rp = cfg.get("rope_parameters", {})
+    theta = float(rp.get("rope_theta", cfg.get("rope_theta", 10000.0)))
+    rot = int(hd * rp.get("partial_rotary_factor", cfg.get("partial_rotary_factor", 1.0)))
+    nk, nv = cfg["linear_num_key_heads"], cfg["linear_num_value_heads"]
+    dk, dv, K = cfg["linear_key_head_dim"], cfg["linear_value_head_dim"], cfg["linear_conv_kernel_dim"]
+    types = cfg["layer_types"]
+    interval = cfg.get("full_attention_interval", 4)
+    assert all((t == "full_attention") == ((l + 1) % interval == 0) for l, t in enumerate(types)), "irregular layer types"
+    full = [l for l in range(L) if types[l] == "full_attention"]
+    lin = [l for l in range(L) if types[l] != "full_attention"]
+    gate = int(cfg.get("attn_output_gate", True))
+    seq_len = min(int(cfg.get("max_position_embeddings", 262144)), 262144)
+    g = lambda n: T[P + n].astype(np.float32)
+    lay = lambda l, n: T[f"{P}layers.{l}.{n}"].astype(np.float32)
+    eos = 248046 if vocab > 200000 else cfg.get("eos_token_id", 0)
+    bos = cfg.get("bos_token_id") or 248044
+    special_start = 248044
+    q4_mask = sum(1 << KINDS_HYB.index(k) for k in q4_kinds)
+
+    out = open(out_path, "wb")
+    out.write(struct.pack("<Ii", 0x616B3432, 2))
+    out.write(struct.pack("<7i", dim, hidden, L, nh, nkv, vocab, seq_len))
+    out.write(struct.pack("<B", 0))
+    out.write(struct.pack("<i", gs))
+    out.write(struct.pack("<ffffi", theta, 0.0, 0.0, 0.0, 0))
+    out.write(struct.pack("<ifiiii", 3, eps, 0, special_start, bos, eos))
+    out.write(struct.pack("<i", q4_mask))
+    out.write(struct.pack("<6i", hd, 0, 0, 0, 1, 0))
+    out.write(struct.pack("<i", 1))   # q4_format
+    out.write(struct.pack("<8i", interval, nk, nv, dk, dv, K, gate, rot))
+    out.write(b"\0" * (256 - out.tell()))
+
+    for l in range(L):
+        out.write((1.0 + lay(l, "input_layernorm.weight")).tobytes())
+    for l in range(L):
+        out.write((1.0 + lay(l, "post_attention_layernorm.weight")).tobytes())
+    out.write((1.0 + g("norm.weight")).tobytes())
+    for l in full:
+        out.write((1.0 + lay(l, "self_attn.q_norm.weight")).tobytes())
+    for l in full:
+        out.write((1.0 + lay(l, "self_attn.k_norm.weight")).tobytes())
+    conv_dim = 2 * nk * dk + nv * dv
+    for l in lin:
+        out.write(lay(l, "linear_attn.conv1d.weight").reshape(conv_dim, K).tobytes())
+    for l in lin:
+        out.write(lay(l, "linear_attn.dt_bias").tobytes())
+    for l in lin:
+        out.write((-np.exp(lay(l, "linear_attn.A_log"))).astype(np.float32).tobytes())
+    for l in lin:
+        out.write(lay(l, "linear_attn.norm.weight").tobytes())
+
+    maxerr = 0.0
+    q, sc, err = quantize_q80(g("embed_tokens.weight"), gs)
+    out.write(q.tobytes()); out.write(sc.tobytes())
+
+    def qrows(l):
+        return lay(l, "self_attn.q_proj.weight").reshape(nh, 2, hd, dim)
+    getters = {
+        "wq": lambda i: qrows(full[i])[:, 0].reshape(nh * hd, dim),
+        "wg": lambda i: qrows(full[i])[:, 1].reshape(nh * hd, dim),
+        "wk": lambda i: lay(full[i], "self_attn.k_proj.weight"),
+        "wv": lambda i: lay(full[i], "self_attn.v_proj.weight"),
+        "wo": lambda i: lay(full[i], "self_attn.o_proj.weight"),
+        "li": lambda i: np.concatenate([lay(lin[i], "linear_attn." + n + ".weight") for n in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")], 0),
+        "lo": lambda i: lay(lin[i], "linear_attn.out_proj.weight"),
+        "w1": lambda l: lay(l, "mlp.gate_proj.weight"),
+        "w2": lambda l: lay(l, "mlp.down_proj.weight"),
+        "w3": lambda l: lay(l, "mlp.up_proj.weight"),
+    }
+    # importance: inputs of each kind; layer index = real layer
+    inp = {"wq": "att_in", "wg": "att_in", "wk": "att_in", "wv": "att_in", "li": "att_in",
+           "wo": "wo_in", "lo": "wo_in", "w1": "ffn_in", "w3": "ffn_in", "w2": "w2_in"}
+    imp = {}
+    if stats is not None:
+        for l in range(L):
+            for key in ("att_in", "wo_in", "ffn_in", "w2_in"):
+                imp[f"{key}.{l}.sq"] = stats[f"{key}.{l}.sq"]
+    real = {"wq": full, "wg": full, "wk": full, "wv": full, "wo": full, "li": lin, "lo": lin}
+    q4set = set(q4_kinds) | ({"wg"} if "wq" in q4_kinds else set())
+    def getter_real(kind):
+        f_ = getters[kind]
+        if kind in real:
+            idx = {l: i for i, l in enumerate(real[kind])}
+            return lambda l: f_(idx[l])
+        return f_
+    _JOB.update(get={k: getter_real(k) for k in getters}, q4=q4set, gs=gs, imp=imp if stats is not None else None, inp=inp)
+    keys = [(k, l) for k in ("wq", "wg", "wk", "wv", "wo") for l in full]
+    keys += [(k, l) for k in ("li", "lo") for l in lin]
+    keys += [(k, l) for k in ("w1", "w2", "w3") for l in range(L)]
+    import multiprocessing as mp
+    procs = int(os.environ.get("EXPORT_PROCS", "64"))
+    with mp.get_context("fork").Pool(min(len(keys), os.cpu_count() or 1, procs)) as pool:
+        for blob, err in pool.imap(_hyb_job, keys, chunksize=1):
+            out.write(blob)
+            maxerr = max(maxerr, err)
+    q, sc, err = quantize_q80(T["lm_head.weight"].astype(np.float32), gs)
+    out.write(q.tobytes()); out.write(sc.tobytes())
+    out.close()
+    print(f"qwen3_5: dim={dim} hidden={hidden} layers={L} (full {len(full)}, linear {len(lin)}) heads={nh}/{nkv}x{hd} "
+          f"rot={rot} linear={nk}k/{nv}v x {dk}/{dv} conv={K} vocab={vocab} q4={sorted(q4set)}")
+    print(f"max quantization error {maxerr:.5f}; wrote {os.path.getsize(out_path) / 1e9:.2f} GB")
+
+
 def main():
     args = [a for a in sys.argv[1:]]
     smooth_alpha = None
@@ -209,9 +343,6 @@ def main():
         else:
             q4_kinds = [k for k in KINDS if k != "wv"]   # wv (small, sensitive) stays Q8
             del args[i]
-    for k in q4_kinds:
-        assert k in KINDS, f"unknown matrix kind {k}"
-    q4_mask = sum(1 << KINDS.index(k) for k in q4_kinds)
     model_dir, out_path = args[0], args[1]
     gs = int(args[2]) if len(args) > 2 else 64
     cfg = json.load(open(os.path.join(model_dir, "config.json")))
@@ -219,6 +350,16 @@ def main():
     T = {}
     for f in files:
         T.update(load_safetensors(os.path.join(model_dir, f)))
+    if cfg.get("model_type") == "qwen3_5":
+        if "--q4" in sys.argv and q4_kinds == [k for k in KINDS if k != "wv"]:
+            q4_kinds = [k for k in KINDS_HYB if k != "wv"]
+        for k in q4_kinds:
+            assert k in KINDS_HYB, f"unknown matrix kind {k}"
+        export_qwen35(cfg, T, out_path, q4_kinds, load_imatrix(imatrix_path) if imatrix_path else None, gs)
+        return
+    for k in q4_kinds:
+        assert k in KINDS, f"unknown matrix kind {k}"
+    q4_mask = sum(1 << KINDS.index(k) for k in q4_kinds)
 
     dim = cfg["hidden_size"]
     hidden = cfg["intermediate_size"]

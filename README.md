@@ -1,12 +1,15 @@
-# numallama — fast NUMA-aware CPU inference for Llama 3.x, Qwen2.5 and Qwen3 / Qwen3-MoE
+# numallama — fast NUMA-aware CPU inference for Llama 3.x, Qwen2.5, Qwen3 / Qwen3-MoE and Qwen3.5 / 3.8
 
-numallama (code name) is a small C inference engine (one `.c` file + a header, no dependencies) for Llama 3.x, Qwen2.5 and
-Qwen3 / Qwen3-MoE models, tuned for large Arm servers (Ampere Altra / Neoverse N1, NEON + dotprod) and multi-socket
+numallama (code name) is a small C inference engine (one `.c` file + a header, no dependencies) for Llama 3.x, Qwen2.5,
+Qwen3 / Qwen3-MoE and the hybrid Qwen3.5 / Qwen3.8 dense models, tuned for large Arm servers (Ampere Altra / Neoverse N1, NEON + dotprod) and multi-socket
 NUMA machines. It started as a fork of [jameswdelancey/llama3.c](https://github.com/jameswdelancey/llama3.c),
 itself derived from Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama2.c).
 
 Highlights:
 
+- **Hybrid linear attention (Qwen3.5 / Qwen3.8 dense, e.g. Qwen3.8-27B)**: Gated DeltaNet layers with a
+  fixed-size recurrent state (no KV cache, ~150 MB for any context) and every 4th layer gated full attention
+  with partial RoPE; the state slices stay in each core's L2. Text only (no vision, MTP head not used yet).
 - **Mixture of experts (Qwen3-MoE, e.g. Qwen3-30B-A3B)**: int8 router, top-k routing, every expert
   split evenly between the NUMA nodes; batched prefill groups the tokens by expert so every expert is
   read once per block. Also Qwen3 attention (head_dim != dim / heads, per-head q/k RMSNorm).
@@ -75,6 +78,12 @@ python3 scripts/export_tokenizer.py /path/to/Qwen3-30B-A3B-Instruct-2507 qwen3_t
 ./runq qwen3_30b_a3b_q80.bin -z qwen3_tokenizer.bin -m imatrix -i data/calibration.txt -o qwen3_30b.imx
 EXPORT_PROCS=24 python3 scripts/export_hf_q8.py /path/to/Qwen3-30B-A3B-Instruct-2507 qwen3_30b_a3b_q4.bin --q4 --imatrix qwen3_30b.imx
 
+# Qwen3.8 dense (hybrid linear attention), e.g. Qwen3.8-27B: Q8 ~29 GB, Q4 ~17 GB
+python3 scripts/export_hf_q8.py /path/to/Qwen3.8-27B qwen38_27b_q80.bin
+python3 scripts/export_tokenizer.py /path/to/Qwen3.8-27B qwen38_tokenizer.bin
+./runq qwen38_27b_q80.bin -z qwen38_tokenizer.bin -m imatrix -i data/calibration.txt -o qwen38_27b.imx
+python3 scripts/export_hf_q8.py /path/to/Qwen3.8-27B qwen38_27b_q4.bin --q4 --imatrix qwen38_27b.imx
+
 # Qwen2.5: calibrate, export with SmoothQuant, export its tokenizer
 python3 scripts/calibrate.py /path/to/Qwen2.5-7B-Instruct calib.txt qwen7b.npz
 python3 scripts/export_hf_q8.py /path/to/Qwen2.5-7B-Instruct qwen7b_q80.bin --imatrix qwen7b.npz --smooth 0.5
@@ -106,7 +115,9 @@ are refused: re-export them.
 | `-T <n>` | threads (default 0 = all idle CPUs of the used NUMA nodes, at most 96 per node) |
 | `-N <n>` | NUMA nodes to use (default 0 = all); weights are split between them |
 | `-c <n>` | context window (KV cache size), default 8192 |
-| `-k <n>` | max prompt-lookup draft length, default 8, `0` = off (adaptive for MoE models) |
+| `-k <n>` | max prompt-lookup draft length, default 8, `0` = off (adaptive for MoE models; off for hybrid models: a recurrent state cannot drop rejected drafts) |
+| `-r <0\|1>` | Qwen3.5 / 3.8: `1` = reasoning (thinking shown dimmed), default `0` = answer directly |
+| `-o <file>` | output of `-m imatrix` (importance statistics for `--q4 --imatrix`) |
 | `-d <file>` | draft model for speculative decoding |
 | `-f <file>` | tools file, enables tool calling in chat |
 | `-t`, `-p`, `-s` | temperature, top-p, seed |

@@ -32,7 +32,7 @@ double ROPE_THETA = 500000.0; // Llama 3 default
 double ROPE_FACTOR = 0.0;     // > 0 enables llama3 rope scaling (Llama 3.1 / 3.2)
 double ROPE_LOW_FREQ = 1.0, ROPE_HIGH_FREQ = 4.0, ROPE_ORIG_CTX = 8192.0;
 // architecture info from the extended header
-enum { ARCH_LLAMA3 = 0, ARCH_QWEN2 = 1, ARCH_QWEN3 = 2 }; // Qwen2/3: ChatML template, Qwen tokenizer
+enum { ARCH_LLAMA3 = 0, ARCH_QWEN2 = 1, ARCH_QWEN3 = 2, ARCH_QWEN35 = 3 }; // Qwen*: ChatML template, Qwen tokenizer
 int ARCH = ARCH_LLAMA3;
 float NORM_EPS = 1e-5f;
 int QKV_BIAS = 0;
@@ -80,6 +80,11 @@ typedef struct {
   int moe_hidden; // MoE: hidden size of one expert
   int qk_norm;    // RMSNorm on every q / k head before RoPE (Qwen3)
   int norm_topk;  // MoE: renormalize the top-k router weights
+  // hybrid models (Qwen3.5 / Qwen3.8): every full_interval-th layer full attention, the others Gated DeltaNet
+  int hybrid, full_interval, n_attn; // n_attn: layers with full attention (all of them if not hybrid)
+  int lin_nk, lin_nv, lin_dk, lin_dv, conv_k; // linear attention: k / v heads, their dims, conv kernel
+  int attn_gate, rot_dim;  // full attention: sigmoid output gate, rotary dims (partial RoPE, rotate-half)
+  int conv_dim, lin_in;    // 2 nk dk + nv dv; rows of the fused input projection (conv_dim + nv dv + 2 nv)
 } Config;
 
 typedef struct {
@@ -109,6 +114,11 @@ typedef struct {
   float *rms_final_weight; // (dim,)
   float *bq, *bk, *bv;     // (layer, q_dim) / (layer, kv_dim) qkv biases (Qwen2), or NULL
   float *q_norm, *k_norm;  // (layer, head_dim) per-head RMSNorm weights (Qwen3), or NULL
+  // hybrid: full-attention tensors are indexed by full layer (n_attn), these by linear layer
+  QuantizedTensor *wgate;  // (n_attn, q_dim, dim) attention output gate
+  QuantizedTensor *w_in;   // (n_lin, lin_in, dim) [q k v (conv channels) | z | b | a]
+  QuantizedTensor *w_out;  // (n_lin, dim, nv dv)
+  float *conv_w, *dt_bias, *A, *lnorm; // (n_lin, conv_dim, K), (n_lin, nv), (n_lin, nv) = -exp(A_log), (n_lin, dv)
   QuantizedTensor *wg;     // MoE router (layer, n_experts, dim), or NULL; w1/w3 are then (layer, n_experts * moe_hidden, dim)
   QuantizedTensor *wg_node[8]; // per NUMA node: a node-local copy of the router (every node routes on its own)
                            // and w2 (layer, n_experts * dim, moe_hidden): expert e owns a contiguous block of rows
@@ -132,6 +142,12 @@ typedef struct {
   float *logits;      // output logits
   float *router;      // MoE router logits (n_experts)
   // kv cache
+  float *gate;        // (q_dim,) hybrid: attention output gate
+  float *lin;         // (lin_in,) hybrid: fused input projection (after conv / activations)
+  float *lin_o;       // (nv dv,) hybrid: recurrence output
+  float *lin_S;       // (n_lin, nv, dv, dk) recurrent states (row c of head h = column c of S)
+  float *conv_state;  // (n_lin, conv_dim, K - 1) last inputs of the causal convolutions
+  int next_pos;       // hybrid: the position the recurrent state is at (it can only advance)
   float *key_cache;   // (layer, seq_len, dim)
   float *value_cache; // (layer, seq_len, dim)
 } RunState;
@@ -175,8 +191,18 @@ void malloc_run_state(RunState *s, Config *p) {
   s->v = calloc(kv_dim, sizeof(float));
   s->att = calloc((size_t)p->n_heads * p->seq_len, sizeof(float));
   s->logits = calloc(p->vocab_size, sizeof(float));
-  s->key_cache = calloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float));
-  s->value_cache = calloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float));
+  s->key_cache = calloc((size_t)p->n_attn * p->seq_len * kv_dim, sizeof(float));
+  s->value_cache = calloc((size_t)p->n_attn * p->seq_len * kv_dim, sizeof(float));
+  s->gate = s->lin = s->lin_o = s->lin_S = s->conv_state = NULL;
+  s->next_pos = 0;
+  if (p->hybrid) {
+    int nlin = p->n_layers - p->n_attn;
+    s->gate = calloc(p->q_dim, sizeof(float));
+    s->lin = calloc(p->lin_in, sizeof(float));
+    s->lin_o = calloc((size_t)p->lin_nv * p->lin_dv, sizeof(float));
+    s->lin_S = malloc((size_t)nlin * p->lin_nv * p->lin_dv * p->lin_dk * sizeof(float)); // first touched by its threads
+    s->conv_state = calloc((size_t)nlin * p->conv_dim * (p->conv_k - 1), sizeof(float));
+  }
   // ensure all mallocs went fine
   if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q || !s->k || !s->v || !s->att || !s->logits || !s->key_cache || !s->value_cache) {
     fprintf(stderr, "malloc failed!\n");
@@ -201,6 +227,7 @@ void free_run_state(RunState *s) {
   free(s->logits);
   free(s->key_cache);
   free(s->value_cache);
+  free(s->gate); free(s->lin); free(s->lin_o); free(s->lin_S); free(s->conv_state);
 }
 
 // ----------------------------------------------------------------------------
@@ -277,9 +304,22 @@ void memory_map_weights(TransformerWeights *w, Config *p, void *ptr, uint8_t sha
   w->q_norm = w->k_norm = NULL;
   if (p->qk_norm) {
     w->q_norm = fptr;
-    fptr += p->n_layers * p->head_dim;
+    fptr += p->n_attn * p->head_dim;
     w->k_norm = fptr;
-    fptr += p->n_layers * p->head_dim;
+    fptr += p->n_attn * p->head_dim;
+  }
+  const int nlin = p->n_layers - p->n_attn;
+  w->conv_w = w->dt_bias = w->A = w->lnorm = NULL;
+  w->wgate = w->w_in = w->w_out = NULL;
+  if (p->hybrid) {
+    w->conv_w = fptr;
+    fptr += (size_t)nlin * p->conv_dim * p->conv_k;
+    w->dt_bias = fptr;
+    fptr += nlin * p->lin_nv;
+    w->A = fptr;
+    fptr += nlin * p->lin_nv;
+    w->lnorm = fptr;
+    fptr += nlin * p->lin_dv;
   }
 
   // now read all the quantized weights
@@ -289,10 +329,15 @@ void memory_map_weights(TransformerWeights *w, Config *p, void *ptr, uint8_t sha
   w->token_embedding_table = malloc((size_t)p->vocab_size * p->dim * sizeof(float));
   // (dequantized by read_checkpoint once the data is loaded)
 
-  w->wq = init_quantized_tensors(&ptr, p->n_layers, p->dim * q_dim, Q4_MASK & 1 ? 4 : 8);
-  w->wk = init_quantized_tensors(&ptr, p->n_layers, p->dim * kv_dim, Q4_MASK & 2 ? 4 : 8);
-  w->wv = init_quantized_tensors(&ptr, p->n_layers, p->dim * kv_dim, Q4_MASK & 4 ? 4 : 8);
-  w->wo = init_quantized_tensors(&ptr, p->n_layers, q_dim * p->dim, Q4_MASK & 8 ? 4 : 8);
+  w->wq = init_quantized_tensors(&ptr, p->n_attn, p->dim * q_dim, Q4_MASK & 1 ? 4 : 8);
+  if (p->hybrid && p->attn_gate) w->wgate = init_quantized_tensors(&ptr, p->n_attn, p->dim * q_dim, Q4_MASK & 1 ? 4 : 8);
+  w->wk = init_quantized_tensors(&ptr, p->n_attn, p->dim * kv_dim, Q4_MASK & 2 ? 4 : 8);
+  w->wv = init_quantized_tensors(&ptr, p->n_attn, p->dim * kv_dim, Q4_MASK & 4 ? 4 : 8);
+  w->wo = init_quantized_tensors(&ptr, p->n_attn, q_dim * p->dim, Q4_MASK & 8 ? 4 : 8);
+  if (p->hybrid) {
+    w->w_in = init_quantized_tensors(&ptr, nlin, p->lin_in * p->dim, Q4_MASK & 128 ? 4 : 8);
+    w->w_out = init_quantized_tensors(&ptr, nlin, p->dim * p->lin_nv * p->lin_dv, Q4_MASK & 256 ? 4 : 8);
+  }
 
   w->wg = NULL;
   int ffn = p->hidden_dim; // rows of w1/w3 (dense) or experts * moe_hidden
@@ -343,10 +388,15 @@ static void place_experts(QuantizedTensor *t, int n, int experts, int rows_per_e
       }
 }
 static void place_weights(TransformerWeights *w, Config *p) {
-  place_tensor(w->wq, p->n_layers, p->q_dim, p->dim);
-  place_tensor(w->wk, p->n_layers, p->kv_dim, p->dim);
-  place_tensor(w->wv, p->n_layers, p->kv_dim, p->dim);
-  place_tensor(w->wo, p->n_layers, p->dim, p->q_dim);
+  place_tensor(w->wq, p->n_attn, p->q_dim, p->dim);
+  place_tensor(w->wk, p->n_attn, p->kv_dim, p->dim);
+  place_tensor(w->wv, p->n_attn, p->kv_dim, p->dim);
+  place_tensor(w->wo, p->n_attn, p->dim, p->q_dim);
+  if (w->wgate) place_tensor(w->wgate, p->n_attn, p->q_dim, p->dim);
+  if (p->hybrid) {
+    place_tensor(w->w_in, p->n_layers - p->n_attn, p->lin_in, p->dim);
+    place_tensor(w->w_out, p->n_layers - p->n_attn, p->dim, p->lin_nv * p->lin_dv);
+  }
   if (p->n_experts > 0) {
     place_tensor(w->wg, p->n_layers, p->n_experts, p->dim);
     place_experts(w->w1, p->n_layers, p->n_experts, p->moe_hidden, p->dim);
@@ -412,8 +462,10 @@ static void *pack_job(void *arg) {
 }
 static void pack_q8(TransformerWeights *w, Config *p) {
   struct { QuantizedTensor *t; int n, rows, cols; } list[] = {
-    {w->wq, p->n_layers, p->q_dim, p->dim}, {w->wk, p->n_layers, p->kv_dim, p->dim}, {w->wv, p->n_layers, p->kv_dim, p->dim},
-    {w->wo, p->n_layers, p->dim, p->q_dim},
+    {w->wq, p->n_attn, p->q_dim, p->dim}, {w->wk, p->n_attn, p->kv_dim, p->dim}, {w->wv, p->n_attn, p->kv_dim, p->dim},
+    {w->wo, p->n_attn, p->dim, p->q_dim}, {w->wgate, w->wgate ? p->n_attn : 0, p->q_dim, p->dim},
+    {w->w_in, w->w_in ? p->n_layers - p->n_attn : 0, p->lin_in, p->dim},
+    {w->w_out, w->w_out ? p->n_layers - p->n_attn : 0, p->dim, p->lin_nv * p->lin_dv},
     {w->w1, p->n_layers, p->n_experts > 0 ? p->n_experts * p->moe_hidden : p->hidden_dim, p->dim},
     {w->w3, p->n_layers, p->n_experts > 0 ? p->n_experts * p->moe_hidden : p->hidden_dim, p->dim},
     {w->w2, p->n_layers, p->n_experts > 0 ? p->n_experts * p->dim : p->dim, p->n_experts > 0 ? p->moe_hidden : p->hidden_dim},
@@ -508,6 +560,16 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weigh
   if (fread(ext2, sizeof(ext2), 1, file) != 1) memset(ext2, 0, sizeof(ext2));
   int q4_format = 0;
   if (fread(&q4_format, sizeof(int), 1, file) != 1) q4_format = 0;
+  int hyb[8] = {0}; // full_interval, linear k heads, v heads, k dim, v dim, conv kernel, attention gate, rotary dims
+  if (fread(hyb, sizeof(hyb), 1, file) != 1) memset(hyb, 0, sizeof(hyb));
+  config->hybrid = ARCH == ARCH_QWEN35 && hyb[0] > 0;
+  config->full_interval = hyb[0];
+  config->n_attn = config->hybrid ? config->n_layers / hyb[0] : config->n_layers;
+  config->lin_nk = hyb[1]; config->lin_nv = hyb[2]; config->lin_dk = hyb[3]; config->lin_dv = hyb[4];
+  config->conv_k = hyb[5]; config->attn_gate = hyb[6];
+  config->rot_dim = hyb[7] > 0 ? hyb[7] : 0;
+  config->conv_dim = 2 * hyb[1] * hyb[3] + hyb[2] * hyb[4];
+  config->lin_in = config->conv_dim + hyb[2] * hyb[4] + 2 * hyb[2];
   if (Q4_MASK && q4_format != 1) {
     fprintf(stderr, "%s: old symmetric Q4 format, please re-export it with scripts/export_hf_q8.py --q4\n", checkpoint);
     exit(EXIT_FAILURE);
@@ -586,7 +648,7 @@ void build_transformer(Transformer *t, char *checkpoint_path, int ctx) {
     Config *p = &t->config;
     int hs = p->head_dim;
     size_t head_bytes = (size_t)p->seq_len * hs * sizeof(float);
-    for (int l = 0; l < p->n_layers; l++)
+    for (int l = 0; l < p->n_attn; l++)
       for (int k = 0; k < NN; k++) {
         int g0, g1;
         node_groups(p->n_kv_heads, k, &g0, &g1);
@@ -1319,7 +1381,277 @@ static void matmul_rows(float* out, const int8_t* xq, const float* xs, const Qua
     else matmul_rows_q8(out, xq, xs, w, n, r0, r1);
 }
 
+// ----------------------------------------------------------------------------
+// Hybrid models (Qwen3.5 / Qwen3.8): Gated DeltaNet linear attention + gated full attention
+static inline int hyb_full(const Config* p, int l) { return (l + 1) % p->full_interval == 0; }
+static inline int hyb_fidx(const Config* p, int l) { return (l + 1) / p->full_interval - 1; } // full layer index
+static inline int hyb_lidx(const Config* p, int l) { return l - (l + 1) / p->full_interval; }  // linear layer index
+static inline float silu_f(float x) { return x / (1.0f + expf(-x)); }
+// per-head RMSNorm (weights stored as 1 + w) and rotate-half RoPE on the first rot dims
+static inline void hyb_norm_rope(float* v, const float* w, int hs, int rot, const float* rc, const float* rs) {
+    float ss = 0.0f;
+    for (int i = 0; i < hs; i++) ss += v[i] * v[i];
+    const float inv = 1.0f / sqrtf(ss / hs + NORM_EPS);
+    for (int i = 0; i < hs; i++) v[i] = w[i] * (v[i] * inv);
+    const int h2 = rot / 2;
+    for (int i = 0; i < h2; i++) {
+        float x1 = v[i], x2 = v[i + h2];
+        v[i] = x1 * rc[i] - x2 * rs[i];
+        v[i + h2] = x2 * rc[i] + x1 * rs[i];
+    }
+}
+// conv / activations of fused input row r of linear layer li for one token (in place)
+static inline void hyb_in_row(const Config* p, const TransformerWeights* w, float* conv_state, int li, int r, float* val) {
+    const int K = p->conv_k, vd = p->lin_nv * p->lin_dv;
+    if (r < p->conv_dim) { // causal depthwise conv over the last K inputs, then SiLU
+        float* cs = conv_state + ((size_t)li * p->conv_dim + r) * (K - 1);
+        const float* cw = w->conv_w + ((size_t)li * p->conv_dim + r) * K;
+        float y = cw[K - 1] * *val;
+        for (int j = 0; j < K - 1; j++) y += cw[j] * cs[j];
+        for (int j = 0; j < K - 2; j++) cs[j] = cs[j + 1];
+        cs[K - 2] = *val;
+        *val = silu_f(y);
+    } else if (r >= p->conv_dim + vd && r < p->conv_dim + vd + p->lin_nv) { // b -> beta
+        *val = 1.0f / (1.0f + expf(-*val));
+    } else if (r >= p->conv_dim + vd + p->lin_nv) { // a -> decay = exp(-exp(A_log) * softplus(a + dt_bias))
+        int h = r - p->conv_dim - vd - p->lin_nv;
+        float a = *val + w->dt_bias[(size_t)li * p->lin_nv + h];
+        float sp = a > 20.0f ? a : log1pf(expf(a));
+        *val = expf(w->A[(size_t)li * p->lin_nv + h] * sp);
+    }
+}
+#define HYB_ROWS 32
+static int HYB_BATCH = 0; // hybrid models: batched prefill available // state rows (value dims) per recurrence item
+/* One token of the gated delta rule for item (head h, state rows c0..c0+HYB_ROWS): the state of a
+ * head is stored transposed, row c = column c of S (dk values), so every update is contiguous.
+ * lin: the fused input of the token (q, k, v after conv, z, beta, decay). */
+static inline void hyb_delta(const Config* p, float* S, const float* lin, int h, int c0, float* out) {
+    const int nk = p->lin_nk, nv = p->lin_nv, dk = p->lin_dk, dv = p->lin_dv, vd = nv * dv;
+    const int kh = h / (nv / nk);
+    const float* q = lin + (size_t)kh * dk;
+    const float* k = lin + (size_t)nk * dk + (size_t)kh * dk;
+    const float* v = lin + (size_t)2 * nk * dk + (size_t)h * dv;
+    const float beta = lin[p->conv_dim + vd + h], decay = lin[p->conv_dim + vd + nv + h];
+    float qq[256], kk[256], sq = 0.0f, sk = 0.0f;
+    for (int i = 0; i < dk; i++) { sq += q[i] * q[i]; sk += k[i] * k[i]; }
+    const float qn = 1.0f / sqrtf(sq + 1e-6f) / sqrtf((float)dk), kn = 1.0f / sqrtf(sk + 1e-6f);
+    for (int i = 0; i < dk; i++) { qq[i] = q[i] * qn; kk[i] = k[i] * kn; }
+    for (int c = c0; c < c0 + HYB_ROWS && c < dv; c++) {
+        float* row = S + (size_t)(c - c0) * dk;
+        float kvm = 0.0f;
+        for (int i = 0; i < dk; i++) { row[i] *= decay; kvm += row[i] * kk[i]; }
+        const float d = (v[c] - kvm) * beta;
+        float o = 0.0f;
+        for (int i = 0; i < dk; i++) { row[i] += kk[i] * d; o += row[i] * qq[i]; }
+        out[(size_t)h * dv + c] = o;
+    }
+}
+static inline float* hyb_state(const Config* p, const RunState* s, int li, int h, int c0) {
+    return s->lin_S + (((size_t)li * p->lin_nv + h) * p->lin_dv + c0) * p->lin_dk;
+}
+// gated RMSNorm of head h of the recurrence output (weight * norm(o) * silu(z)) into y
+static inline void hyb_gated_norm(const Config* p, const TransformerWeights* w, int li, const float* o, const float* z, float* y) {
+    const int dv = p->lin_dv;
+    float ss = 0.0f;
+    for (int c = 0; c < dv; c++) ss += o[c] * o[c];
+    const float inv = 1.0f / sqrtf(ss / dv + NORM_EPS);
+    const float* nw = w->lnorm + (size_t)li * dv;
+    for (int c = 0; c < dv; c++) y[c] = nw[c] * (o[c] * inv) * silu_f(z[c]);
+}
+
+/* Decode step of a hybrid model (one token). Synchronization is kept simple (global barriers between
+ * phases); the recurrence items are a fixed function of the thread, so every thread keeps its slice of
+ * the recurrent state (~16 KB per layer) in its own L2. */
+static void forward_hybrid_thread(int tid) {
+    Transformer* transformer = P.t;
+    Config* p = &transformer->config;
+    TransformerWeights* w = &transformer->weights;
+    RunState* s = &transformer->state;
+    ThreadBuf* tb = &P.tb[tid];
+    const int pos = P.pos, dim = p->dim, kv_dim = p->kv_dim, q_dim = p->q_dim, hidden_dim = p->hidden_dim;
+    const int hs = p->head_dim, n_heads = p->n_heads, kv_mul = n_heads / p->n_kv_heads, rot = p->rot_dim > 0 ? p->rot_dim : hs;
+    const int nv = p->lin_nv, dv = p->lin_dv, vd = nv * dv, nitems = nv * ((dv + HYB_ROWS - 1) / HYB_ROWS);
+    const int C = (pos + 1) / 64 < 1 ? 1 : ((pos + 1) / 64 < P.C ? (pos + 1) / 64 : P.C);
+    const int T = pos + 1;
+    const float att_scale = 1.0f / sqrtf((float)hs);
+    float* x = s->x;
+    const float* emb = w->token_embedding_table + (size_t)P.token * dim;
+    const int8_t* nq = NB[tb->node].q;
+    const float* ns = NB[tb->node].s;
+    int r0, r1;
+
+    if (tb->ltid == 0) {
+        struct WorkCounter* wc = P.work[tb->node][(P.seq + 1) & 1];
+        for (int k = 0; k < WORK_PHASES * P_max_layers + 1; k++) atomic_store_explicit(&wc[k].v, 0, memory_order_relaxed);
+    }
+    if (pos == 0) { // new sequence: zero the recurrent and conv states (each thread its own items)
+        const int nlin = p->n_layers - p->n_attn;
+        for (int li = 0; li < nlin; li++)
+            for (int it = tid; it < nitems; it += P.nth) {
+                int h = it / ((dv + HYB_ROWS - 1) / HYB_ROWS), c0 = (it % ((dv + HYB_ROWS - 1) / HYB_ROWS)) * HYB_ROWS;
+                int rows = c0 + HYB_ROWS < dv ? HYB_ROWS : dv - c0;
+                memset(hyb_state(p, s, li, h, c0), 0, (size_t)rows * p->lin_dk * sizeof(float));
+            }
+        size_t cn = (size_t)nlin * p->conv_dim * (p->conv_k - 1);
+        memset(s->conv_state + cn * tid / P.nth, 0, (cn * (tid + 1) / P.nth - cn * tid / P.nth) * sizeof(float));
+        barrier(tb);
+    }
+    for (int j = 0; j < rot / 2; j++) {
+        double val = pos * P.rope_freq[j];
+        tb->rope_c[j] = (float)cos(val);
+        tb->rope_s[j] = (float)sin(val);
+    }
+
+    for (int l = 0; l < p->n_layers; l++) {
+        const float* xin = (l == 0) ? emb : x;
+        PROF(tid, PH_NORM);
+        node_norm_quant(tb, xin, w->rms_att_weight + (size_t)l * dim, dim);
+        if (hyb_full(p, l)) {
+            const int fi = hyb_fidx(p, l);
+            const size_t loff = (size_t)fi * p->seq_len * kv_dim;
+            float* vc = s->value_cache + loff + (size_t)pos * hs;
+            PROF(tid, PH_QKV);
+            while (grab_rows(WORK_PHASES * l + 0, q_dim, tb, &r0, &r1)) matmul_rows(s->q, nq, ns, w->wq + fi, dim, r0, r1);
+            while (grab_rows(WORK_PHASES * l + 6, q_dim, tb, &r0, &r1)) matmul_rows(s->gate, nq, ns, w->wgate + fi, dim, r0, r1);
+            while (grab_rows(WORK_PHASES * l + 1, kv_dim, tb, &r0, &r1)) matmul_rows(s->k, nq, ns, w->wk + fi, dim, r0, r1);
+            while (grab_rows(WORK_PHASES * l + 2, kv_dim, tb, &r0, &r1)) {
+                matmul_rows(s->v, nq, ns, w->wv + fi, dim, r0, r1);
+                for (int i = r0; i < r1; i++) vc[(size_t)(i / hs) * p->seq_len * hs + i % hs] = s->v[i];
+            }
+            barrier(tb);
+            for (int task = tid; task < n_heads + p->n_kv_heads; task += P.nth) {
+                if (task < n_heads) {
+                    hyb_norm_rope(s->q + (size_t)task * hs, w->q_norm + (size_t)fi * hs, hs, rot, tb->rope_c, tb->rope_s);
+                } else {
+                    int g = task - n_heads;
+                    float* kv = s->k + (size_t)g * hs;
+                    hyb_norm_rope(kv, w->k_norm + (size_t)fi * hs, hs, rot, tb->rope_c, tb->rope_s);
+                    memcpy(s->key_cache + loff + (size_t)g * p->seq_len * hs + (size_t)pos * hs, kv, hs * sizeof(float));
+                }
+            }
+            barrier(tb);
+            PROF(tid, PH_ATT);
+            // attention items (kv group, context chunk, query-head subset) over all threads
+            int HS = 1;
+            while (HS < kv_mul && p->n_kv_heads * C * HS * 2 <= P.nth && kv_mul % (HS * 2) == 0) HS *= 2;
+            const int hper = kv_mul / HS;
+            for (int item = tid; item < p->n_kv_heads * C * HS; item += P.nth) {
+                int g = item / (C * HS), c = (item / HS) % C, hsub = item % HS;
+                int t0 = (int)((long)T * c / C), t1 = (int)((long)T * (c + 1) / C);
+                const float* kb = s->key_cache + loff + (size_t)g * p->seq_len * hs;
+                const float* vb = s->value_cache + loff + (size_t)g * p->seq_len * hs;
+                for (int r = 0; r < hper; r++) {
+                    int h = g * kv_mul + hsub * hper + r;
+                    const float* q = s->q + (size_t)h * hs;
+                    float* att = s->att + (size_t)h * p->seq_len;
+                    float m = -FLT_MAX;
+                    for (int t = t0; t < t1; t++) {
+                        const float* k = kb + (size_t)t * hs;
+                        float score = 0.0f;
+                        for (int i = 0; i < hs; i++) score += q[i] * k[i];
+                        score *= att_scale;
+                        att[t] = score;
+                        m = score > m ? score : m;
+                    }
+                    float* pr = P.part + ((size_t)h * C + c) * (hs + 2);
+                    float sm = 0.0f;
+                    float* acc = pr + 2;
+                    memset(acc, 0, hs * sizeof(float));
+                    for (int t = t0; t < t1; t++) {
+                        float e = expf(att[t] - m);
+                        sm += e;
+                        const float* v = vb + (size_t)t * hs;
+                        for (int i = 0; i < hs; i++) acc[i] += e * v[i];
+                    }
+                    pr[0] = m;
+                    pr[1] = sm;
+                }
+            }
+            barrier(tb);
+            PROF(tid, PH_MERGE);
+            // merge every head (each node for itself), apply the sigmoid gate, quantize into the node buffer
+            int h0 = (int)((long)n_heads * tb->ltid / tb->nthn), h1 = (int)((long)n_heads * (tb->ltid + 1) / tb->nthn);
+            for (int h = h0; h < h1; h++) {
+                float* xb = tb->xb + (size_t)h * hs;
+                const float* ph = P.part + (size_t)h * C * (hs + 2);
+                float M = -FLT_MAX, den = 0.0f;
+                for (int c = 0; c < C; c++) if (ph[(size_t)c * (hs + 2) + 1] > 0.0f && ph[(size_t)c * (hs + 2)] > M) M = ph[(size_t)c * (hs + 2)];
+                memset(xb, 0, hs * sizeof(float));
+                for (int c = 0; c < C; c++) {
+                    const float* pr = ph + (size_t)c * (hs + 2);
+                    if (pr[1] <= 0.0f) continue;
+                    float f = expf(pr[0] - M);
+                    den += f * pr[1];
+                    for (int i = 0; i < hs; i++) xb[i] += f * pr[2 + i];
+                }
+                const float inv = 1.0f / den;
+                const float* gt = s->gate + (size_t)h * hs;
+                for (int i = 0; i < hs; i++) xb[i] *= inv * (p->attn_gate ? 1.0f / (1.0f + expf(-gt[i])) : 1.0f);
+                quantize_vec(NB[tb->node].q + (size_t)h * hs, NB[tb->node].s + h * hs / GS, xb, hs);
+            }
+            node_barrier(tb);
+            PROF(tid, PH_WO);
+            while (grab_rows(WORK_PHASES * l + 3, dim, tb, &r0, &r1)) {
+                matmul_rows(s->xb2, nq, ns, w->wo + fi, q_dim, r0, r1);
+                for (int i = r0; i < r1; i++) x[i] = xin[i] + s->xb2[i];
+            }
+            barrier(tb);
+        } else {
+            const int li = hyb_lidx(p, l);
+            PROF(tid, PH_QKV);
+            while (grab_rows(WORK_PHASES * l + 0, p->lin_in, tb, &r0, &r1)) {
+                matmul_rows(s->lin, nq, ns, w->w_in + li, dim, r0, r1);
+                for (int r = r0; r < r1; r++) hyb_in_row(p, w, s->conv_state, li, r, s->lin + r);
+            }
+            barrier(tb);
+            PROF(tid, PH_ATT);
+            for (int it = tid; it < nitems; it += P.nth) {
+                int h = it / ((dv + HYB_ROWS - 1) / HYB_ROWS), c0 = (it % ((dv + HYB_ROWS - 1) / HYB_ROWS)) * HYB_ROWS;
+                hyb_delta(p, hyb_state(p, s, li, h, c0), s->lin, h, c0, s->lin_o);
+            }
+            barrier(tb);
+            PROF(tid, PH_MERGE);
+            // gated norm of every head (each node for itself), quantized into the node buffer
+            for (int h = tb->ltid; h < nv; h += tb->nthn) {
+                float* y = tb->xb;
+                hyb_gated_norm(p, w, li, s->lin_o + (size_t)h * dv, s->lin + p->conv_dim + (size_t)h * dv, y);
+                quantize_vec(NB[tb->node].q + (size_t)h * dv, NB[tb->node].s + h * dv / GS, y, dv);
+            }
+            node_barrier(tb);
+            PROF(tid, PH_WO);
+            while (grab_rows(WORK_PHASES * l + 3, dim, tb, &r0, &r1)) {
+                matmul_rows(s->xb2, nq, ns, w->w_out + li, vd, r0, r1);
+                for (int i = r0; i < r1; i++) x[i] = xin[i] + s->xb2[i];
+            }
+            barrier(tb);
+        }
+        PROF(tid, PH_FNORM);
+        node_norm_quant(tb, x, w->rms_ffn_weight + (size_t)l * dim, dim);
+        PROF(tid, PH_W13);
+        while (grab_rows(WORK_PHASES * l + 4, hidden_dim, tb, &r0, &r1)) {
+            matmul_rows(s->hb, nq, ns, w->w1 + l, dim, r0, r1);
+            matmul_rows(s->hb2, nq, ns, w->w3 + l, dim, r0, r1);
+            for (int i = r0; i < r1; i++) s->hb[i] = silu_f(s->hb[i]) * s->hb2[i];
+        }
+        barrier(tb);
+        PROF(tid, PH_QH);
+        node_quant(tb, s->hb, hidden_dim);
+        PROF(tid, PH_W2);
+        while (grab_rows(WORK_PHASES * l + 5, dim, tb, &r0, &r1)) {
+            matmul_rows(s->xb2, nq, ns, w->w2 + l, hidden_dim, r0, r1);
+            for (int i = r0; i < r1; i++) x[i] += s->xb2[i];
+        }
+        barrier(tb);
+    }
+    PROF(tid, PH_CLS);
+    node_norm_quant(tb, x, w->rms_final_weight, dim);
+    while (grab_rows(WORK_PHASES * p->n_layers, p->vocab_size, tb, &r0, &r1)) matmul_rows(s->logits, nq, ns, w->wcls, dim, r0, r1);
+    barrier(tb);
+    PROF(tid, PH_IDLE);
+}
+
 static void forward_thread(int tid) {
+    if (P.t->config.hybrid) { forward_hybrid_thread(tid); return; }
     Transformer* transformer = P.t;
     Config* p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
@@ -1846,8 +2178,9 @@ static void init_model_runtime(Transformer* t) {
     }
     t->part = calloc((size_t)p->n_heads * t->C * (head_size + 2), sizeof(float));
     t->rope_freq = malloc((head_size / 2) * sizeof(double));
+    const int rdim = p->rot_dim > 0 ? p->rot_dim : head_size; // partial RoPE: frequencies over the rotated dims
     for (int j = 0; j < head_size / 2; j++) {
-        double freq = 1.0 / pow(ROPE_THETA, (2.0 * j) / head_size);
+        double freq = j < rdim / 2 ? 1.0 / pow(ROPE_THETA, (2.0 * j) / rdim) : 0.0;
         if (ROPE_FACTOR > 0.0f) { // llama3 rope scaling (Llama 3.1 / 3.2)
             double low_wavelen = ROPE_ORIG_CTX / ROPE_LOW_FREQ;
             double high_wavelen = ROPE_ORIG_CTX / ROPE_HIGH_FREQ;
@@ -2009,6 +2342,13 @@ void free_pool(void) {
 
 float* forward(Transformer* transformer, int token, int pos) {
     use_model(transformer);
+    if (transformer->config.hybrid) { // the recurrent state can only advance, or restart at 0
+        if (pos != 0 && pos != transformer->state.next_pos) {
+            fprintf(stderr, "hybrid model: position %d out of order (state at %d)\n", pos, transformer->state.next_pos);
+            exit(EXIT_FAILURE);
+        }
+        transformer->state.next_pos = pos + 1;
+    }
     P.t = transformer;
     P.token = token;
     P.pos = pos;
@@ -2045,6 +2385,7 @@ typedef struct {
     float* rope_c;    // (B, head_size/2)
     float* rope_s;
     float* att;       // (nth, kv_mul, seq_len) per-thread attention scratch
+    float *gate, *lin, *lino; // hybrid: (B, q_dim) attention gates, (B, lin_in) fused inputs, (B, nv dv) recurrence outputs
     float* mpart;     // multi-token step: attention partials (token, head, context chunk, head_size + 2)
     size_t mpart_n;   // its capacity in floats
     float* logits_all; // when set: (B, vocab) logits of every position (speculative verification)
@@ -2088,6 +2429,7 @@ static struct {
  * collected on the batched path. They weight the rounding error when a model is quantized to Q4
  * (scripts/export_hf_q8.py --imatrix). Dense: att (L, dim), wo (L, q_dim), ffn (L, dim), w2
  * (L, hidden); MoE: ffn (L, E, dim) and w2 (L, E, moe_hidden) per expert, over the tokens routed to it. */
+static int IMX_WO_W = 0; // width of a wo row of the statistics (q_dim, or max(q_dim, nv dv) for hybrid models)
 static struct {
     int on;
     double *att, *wo, *ffn, *w2;
@@ -2235,7 +2577,222 @@ static void moe_batch(ThreadBuf* tb, int l, int B) {
     }
 }
 
+/* Batched prefill of a hybrid model: the matmuls see all B tokens at once; the conv runs per channel
+ * and the gated delta rule per state slice, each sequentially over the tokens of the block. */
+static void forward_hybrid_batch_thread(int tid) {
+    Transformer* transformer = P.t;
+    Config* p = &transformer->config;
+    TransformerWeights* w = &transformer->weights;
+    RunState* s = &transformer->state;
+    ThreadBuf* tb = &P.tb[tid];
+    const int nth = P.nth, B = BT.B, pos0 = BT.pos0;
+    const int dim = p->dim, kv_dim = p->kv_dim, q_dim = p->q_dim, hidden_dim = p->hidden_dim;
+    const int hs = p->head_dim, hs2 = hs / 2, n_heads = p->n_heads, kv_mul = n_heads / p->n_kv_heads;
+    const int rot = p->rot_dim > 0 ? p->rot_dim : hs;
+    const int nv = p->lin_nv, dv = p->lin_dv, vd = nv * dv, LI = p->lin_in, ipb = (dv + HYB_ROWS - 1) / HYB_ROWS, nitems = nv * ipb;
+    const int ngd = dim / GS, ngh = hidden_dim / GS, ngq = q_dim / GS, ngv = vd / GS;
+    const float att_scale = 1.0f / sqrtf((float)hs);
+    int8_t* XQ = BN[tb->node].xq;
+    float* XS = BN[tb->node].xs;
+    int r0, r1, b0, b1, n0, n1;
+    tok_range(B, tid, nth, &b0, &b1);
+    tok_range(B, tb->ltid, tb->nthn, &n0, &n1);
+    for (int b = b0; b < b1; b++) {
+        memcpy(BT.x + (size_t)b * dim, w->token_embedding_table + (size_t)BT.tok[b] * dim, dim * sizeof(float));
+        for (int j = 0; j < rot / 2; j++) {
+            double val = (double)(pos0 + b) * P.rope_freq[j];
+            BT.rope_c[b * hs2 + j] = (float)cos(val);
+            BT.rope_s[b * hs2 + j] = (float)sin(val);
+        }
+    }
+    if (pos0 == 0) { // new sequence: zero the states (same item partition as the recurrence)
+        const int nlin = p->n_layers - p->n_attn;
+        for (int li = 0; li < nlin; li++)
+            for (int it = tid; it < nitems; it += nth) {
+                int h = it / ipb, c0 = (it % ipb) * HYB_ROWS, rows = c0 + HYB_ROWS < dv ? HYB_ROWS : dv - c0;
+                memset(hyb_state(p, s, li, h, c0), 0, (size_t)rows * p->lin_dk * sizeof(float));
+            }
+        size_t cn = (size_t)nlin * p->conv_dim * (p->conv_k - 1);
+        memset(s->conv_state + cn * tid / nth, 0, (cn * (tid + 1) / nth - cn * tid / nth) * sizeof(float));
+    }
+    barrier(tb);
+
+    for (int l = 0; l < p->n_layers; l++) {
+        if (IMX.on) imx_dense(tb, IMX.att + (size_t)l * dim, BT.x, dim, B, dim, w->rms_att_weight + (size_t)l * dim);
+        for (int b = n0; b < n1; b++) {
+            rmsnorm(tb->xb, BT.x + (size_t)b * dim, w->rms_att_weight + (size_t)l * dim, dim);
+            quantize_vec(XQ + (size_t)b * dim, XS + (size_t)b * ngd, tb->xb, dim);
+        }
+        barrier(tb);
+        if (hyb_full(p, l)) {
+            const int fi = hyb_fidx(p, l);
+            const size_t loff = (size_t)fi * p->seq_len * kv_dim;
+            part_range_node(q_dim, tb, &r0, &r1);
+            if (r0 < r1) {
+                matmul_rows_batch(BT.q, q_dim, XQ, XS, B, w->wq + fi, dim, r0, r1);
+                matmul_rows_batch(BT.gate, q_dim, XQ, XS, B, w->wgate + fi, dim, r0, r1);
+            }
+            part_range_node(kv_dim, tb, &r0, &r1);
+            if (r0 < r1) {
+                matmul_rows_batch(BT.k, kv_dim, XQ, XS, B, w->wk + fi, dim, r0, r1);
+                matmul_rows_batch(BT.v, kv_dim, XQ, XS, B, w->wv + fi, dim, r0, r1);
+                for (int b = 0; b < B; b++) {
+                    float* vc = s->value_cache + loff + (size_t)(pos0 + b) * hs;
+                    for (int i = r0; i < r1; i++) vc[(size_t)(i / hs) * p->seq_len * hs + i % hs] = BT.v[(size_t)b * kv_dim + i];
+                }
+            }
+            barrier(tb);
+            for (int task = tid; task < B * (n_heads + p->n_kv_heads); task += nth) {
+                int b = task / (n_heads + p->n_kv_heads), h = task % (n_heads + p->n_kv_heads);
+                const float* rc = BT.rope_c + b * hs2;
+                const float* rs = BT.rope_s + b * hs2;
+                if (h < n_heads) {
+                    hyb_norm_rope(BT.q + (size_t)b * q_dim + (size_t)h * hs, w->q_norm + (size_t)fi * hs, hs, rot, rc, rs);
+                } else {
+                    int g = h - n_heads;
+                    float* kv = BT.k + (size_t)b * kv_dim + (size_t)g * hs;
+                    hyb_norm_rope(kv, w->k_norm + (size_t)fi * hs, hs, rot, rc, rs);
+                    memcpy(s->key_cache + loff + ((size_t)g * p->seq_len + pos0 + b) * hs, kv, hs * sizeof(float));
+                }
+            }
+            barrier(tb);
+            // causal attention, items (kv group of this node, token); gate applied to the output
+            float* att = BT.att + (size_t)tid * kv_mul * p->seq_len;
+            int g0, g1;
+            node_groups(p->n_kv_heads, tb->node, &g0, &g1);
+            for (int item = tb->ltid; item < (g1 - g0) * B; item += tb->nthn) {
+                int g = g0 + item % (g1 - g0), b = item / (g1 - g0);
+                int T = pos0 + b + 1;
+                const float* kb = s->key_cache + loff + (size_t)g * p->seq_len * hs;
+                const float* vb = s->value_cache + loff + (size_t)g * p->seq_len * hs;
+                const float* qb = BT.q + (size_t)b * q_dim + (size_t)g * kv_mul * hs;
+                float m[KV_MUL_MAX], sum[KV_MUL_MAX];
+                for (int r = 0; r < kv_mul; r++) m[r] = -FLT_MAX;
+                for (int t = 0; t < T; t++) {
+                    const float* k = kb + (size_t)t * hs;
+                    for (int r = 0; r < kv_mul; r++) {
+                        const float* q = qb + r * hs;
+                        float score = 0.0f;
+                        for (int i = 0; i < hs; i++) score += q[i] * k[i];
+                        score *= att_scale;
+                        att[(size_t)r * p->seq_len + t] = score;
+                        m[r] = score > m[r] ? score : m[r];
+                    }
+                }
+                for (int r = 0; r < kv_mul; r++) {
+                    float* ar = att + (size_t)r * p->seq_len;
+                    float sm = 0.0f;
+                    for (int t = 0; t < T; t++) { float ev = expf(ar[t] - m[r]); ar[t] = ev; sm += ev; }
+                    sum[r] = 1.0f / sm;
+                }
+                float* ob = BT.xb + (size_t)b * q_dim + (size_t)g * kv_mul * hs;
+                memset(ob, 0, kv_mul * hs * sizeof(float));
+                for (int t = 0; t < T; t++) {
+                    const float* v = vb + (size_t)t * hs;
+                    for (int r = 0; r < kv_mul; r++) {
+                        float a = att[(size_t)r * p->seq_len + t];
+                        float* o = ob + r * hs;
+                        for (int i = 0; i < hs; i++) o[i] += a * v[i];
+                    }
+                }
+                const float* gt = BT.gate + (size_t)b * q_dim + (size_t)g * kv_mul * hs;
+                for (int i = 0; i < kv_mul * hs; i++)
+                    ob[i] *= sum[i / hs] * (p->attn_gate ? 1.0f / (1.0f + expf(-gt[i])) : 1.0f);
+            }
+            barrier(tb);
+            if (IMX.on) imx_dense(tb, IMX.wo + (size_t)l * IMX_WO_W, BT.xb, q_dim, B, q_dim, NULL);
+            for (int b = n0; b < n1; b++) quantize_vec(XQ + (size_t)b * q_dim, XS + (size_t)b * ngq, BT.xb + (size_t)b * q_dim, q_dim);
+            barrier(tb);
+            part_range_node(dim, tb, &r0, &r1);
+            if (r0 < r1) {
+                matmul_rows_batch(BT.xb2, dim, XQ, XS, B, w->wo + fi, q_dim, r0, r1);
+                for (int b = 0; b < B; b++)
+                    for (int i = r0; i < r1; i++) BT.x[(size_t)b * dim + i] += BT.xb2[(size_t)b * dim + i];
+            }
+            barrier(tb);
+        } else {
+            const int li = hyb_lidx(p, l);
+            part_range_node(LI, tb, &r0, &r1);
+            if (r0 < r1) matmul_rows_batch(BT.lin, LI, XQ, XS, B, w->w_in + li, dim, r0, r1);
+            barrier(tb);
+            { // conv / activations: channels split among all threads, tokens in order
+                int c0, c1;
+                tok_range(LI, tid, nth, &c0, &c1);
+                for (int r = c0; r < c1; r++)
+                    for (int b = 0; b < B; b++) hyb_in_row(p, w, s->conv_state, li, r, BT.lin + (size_t)b * LI + r);
+            }
+            barrier(tb);
+            for (int it = tid; it < nitems; it += nth) {
+                int h = it / ipb, c0 = (it % ipb) * HYB_ROWS;
+                float* S = hyb_state(p, s, li, h, c0);
+                for (int b = 0; b < B; b++) hyb_delta(p, S, BT.lin + (size_t)b * LI, h, c0, BT.lino + (size_t)b * vd);
+            }
+            barrier(tb);
+            for (int task = tid; task < B * nv; task += nth) {
+                int b = task / nv, h = task % nv;
+                hyb_gated_norm(p, w, li, BT.lino + (size_t)b * vd + (size_t)h * dv, BT.lin + (size_t)b * LI + p->conv_dim + (size_t)h * dv,
+                               BT.xb + (size_t)b * vd + (size_t)h * dv);
+            }
+            barrier(tb);
+            if (IMX.on) imx_dense(tb, IMX.wo + (size_t)l * IMX_WO_W, BT.xb, vd, B, vd, NULL);
+            for (int b = n0; b < n1; b++) quantize_vec(XQ + (size_t)b * vd, XS + (size_t)b * ngv, BT.xb + (size_t)b * vd, vd);
+            barrier(tb);
+            part_range_node(dim, tb, &r0, &r1);
+            if (r0 < r1) {
+                matmul_rows_batch(BT.xb2, dim, XQ, XS, B, w->w_out + li, vd, r0, r1);
+                for (int b = 0; b < B; b++)
+                    for (int i = r0; i < r1; i++) BT.x[(size_t)b * dim + i] += BT.xb2[(size_t)b * dim + i];
+            }
+            barrier(tb);
+        }
+        if (IMX.on) imx_dense(tb, IMX.ffn + (size_t)l * dim, BT.x, dim, B, dim, w->rms_ffn_weight + (size_t)l * dim);
+        for (int b = n0; b < n1; b++) {
+            rmsnorm(tb->xb, BT.x + (size_t)b * dim, w->rms_ffn_weight + (size_t)l * dim, dim);
+            quantize_vec(XQ + (size_t)b * dim, XS + (size_t)b * ngd, tb->xb, dim);
+        }
+        barrier(tb);
+        part_range_node(hidden_dim, tb, &r0, &r1);
+        if (r0 < r1) {
+            matmul_rows_batch(BT.hb, hidden_dim, XQ, XS, B, w->w1 + l, dim, r0, r1);
+            matmul_rows_batch(BT.hb2, hidden_dim, XQ, XS, B, w->w3 + l, dim, r0, r1);
+            for (int b = 0; b < B; b++) {
+                float* h1 = BT.hb + (size_t)b * hidden_dim;
+                const float* h3 = BT.hb2 + (size_t)b * hidden_dim;
+                for (int i = r0; i < r1; i++) h1[i] = silu_f(h1[i]) * h3[i];
+            }
+        }
+        barrier(tb);
+        if (IMX.on) imx_dense(tb, IMX.w2 + (size_t)l * hidden_dim, BT.hb, hidden_dim, B, hidden_dim, NULL);
+        for (int b = n0; b < n1; b++) quantize_vec(XQ + (size_t)b * hidden_dim, XS + (size_t)b * ngh, BT.hb + (size_t)b * hidden_dim, hidden_dim);
+        barrier(tb);
+        part_range_node(dim, tb, &r0, &r1);
+        if (r0 < r1) {
+            matmul_rows_batch(BT.xb2, dim, XQ, XS, B, w->w2 + l, hidden_dim, r0, r1);
+            for (int b = 0; b < B; b++)
+                for (int i = r0; i < r1; i++) BT.x[(size_t)b * dim + i] += BT.xb2[(size_t)b * dim + i];
+        }
+        barrier(tb);
+    }
+    if (BT.logits_all) {
+        for (int b = n0; b < n1; b++) {
+            rmsnorm(tb->xb, BT.x + (size_t)b * dim, w->rms_final_weight, dim);
+            quantize_vec(XQ + (size_t)b * dim, XS + (size_t)b * ngd, tb->xb, dim);
+        }
+        barrier(tb);
+        part_range_node(p->vocab_size, tb, &r0, &r1);
+        matmul_rows_batch(BT.logits_all, p->vocab_size, XQ, XS, B, w->wcls, dim, r0, r1);
+        barrier(tb);
+        return;
+    }
+    rmsnorm(tb->xb, BT.x + (size_t)(B - 1) * dim, w->rms_final_weight, dim);
+    quantize_vec(tb->q, tb->s, tb->xb, dim);
+    part_range_node(p->vocab_size, tb, &r0, &r1);
+    matmul_rows(s->logits, tb->q, tb->s, w->wcls, dim, r0, r1);
+    barrier(tb);
+}
+
 static void forward_batch_thread(int tid) {
+    if (P.t->config.hybrid) { forward_hybrid_batch_thread(tid); return; }
     Transformer* transformer = P.t;
     Config* p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
@@ -2413,7 +2970,7 @@ static void forward_batch_thread(int tid) {
         }
         barrier(tb);
 
-        if (IMX.on) imx_dense(tb, IMX.wo + (size_t)l * q_dim, BT.xb, q_dim, B, q_dim, NULL);
+        if (IMX.on) imx_dense(tb, IMX.wo + (size_t)l * IMX_WO_W, BT.xb, q_dim, B, q_dim, NULL);
         // quantize the attention output, split over tokens
         for (int b = n0; b < n1; b++) {
             quantize_vec(XQ + (size_t)b * q_dim, XS + (size_t)b * ngq, BT.xb + (size_t)b * q_dim, q_dim);
@@ -2794,6 +3351,8 @@ static void init_batch(Transformer* t) {
     int qmax = p->dim > p->hidden_dim ? p->dim : p->hidden_dim;
     if (q_dim > qmax) qmax = q_dim;
     int wide = q_dim > p->dim ? q_dim : p->dim;
+    if (p->hybrid && p->lin_nv * p->lin_dv > wide) wide = p->lin_nv * p->lin_dv;
+    if (p->hybrid && p->lin_nv * p->lin_dv > qmax) qmax = p->lin_nv * p->lin_dv;
     size_t B = BATCH_MAX;
     BT.x = calloc(B * p->dim, sizeof(float));
     BT.xb = calloc(B * wide, sizeof(float));
@@ -2822,6 +3381,13 @@ static void init_batch(Transformer* t) {
     BT.rope_c = calloc(B * (head_size / 2), sizeof(float));
     BT.rope_s = calloc(B * (head_size / 2), sizeof(float));
     BT.att = calloc((size_t)P.nth * (p->n_heads / p->n_kv_heads) * p->seq_len, sizeof(float));
+    BT.gate = BT.lin = BT.lino = NULL;
+    if (p->hybrid) {
+        BT.gate = calloc(B * q_dim, sizeof(float));
+        BT.lin = calloc(B * p->lin_in, sizeof(float));
+        BT.lino = calloc(B * p->lin_nv * p->lin_dv, sizeof(float));
+        HYB_BATCH = 1;
+    }
     BT.mpart_n = (size_t)SPEC_MAX_TOK * p->n_heads * (P.nth > 1 ? P.nth : 1) * (head_size + 2);
     BT.mpart = calloc(BT.mpart_n, sizeof(float));
     if (p->n_experts > 0) {
@@ -2857,8 +3423,8 @@ float* forward_all(Transformer* transformer, const int* tokens, int n, int pos0)
     use_model(transformer);
     int V = transformer->config.vocab_size;
     if (!SPEC_LOGITS) SPEC_LOGITS = malloc((size_t)SPEC_MAX * V * sizeof(float));
-    if (n == 1) {
-        memcpy(SPEC_LOGITS, forward(transformer, tokens[0], pos0), V * sizeof(float));
+    if (n == 1 || transformer->config.hybrid) { // hybrid: no multi-token step (the state cannot roll back)
+        for (int i = 0; i < n; i++) memcpy(SPEC_LOGITS + (size_t)i * V, forward(transformer, tokens[i], pos0 + i), V * sizeof(float));
         return SPEC_LOGITS;
     }
     Config* p = &transformer->config;
@@ -2887,6 +3453,18 @@ float* forward_all(Transformer* transformer, const int* tokens, int n, int pos0)
 
 float* forward_batch(Transformer* transformer, const int* tokens, int n, int pos0) {
     use_model(transformer);
+    if (transformer->config.hybrid) {
+        if (!HYB_BATCH) { // token by token
+            float* l = NULL;
+            for (int i = 0; i < n; i++) l = forward(transformer, tokens[i], pos0 + i);
+            return l;
+        }
+        if (pos0 != 0 && pos0 != transformer->state.next_pos) {
+            fprintf(stderr, "hybrid model: position %d out of order (state at %d)\n", pos0, transformer->state.next_pos);
+            exit(EXIT_FAILURE);
+        }
+        transformer->state.next_pos = pos0; // advanced block by block below (a 1-token block goes through forward())
+    }
 
     float* logits = NULL;
     for (int done = 0; done < n;) {
@@ -2903,6 +3481,7 @@ float* forward_batch(Transformer* transformer, const int* tokens, int n, int pos
             forward_batch_thread(0);
             P.mode = 0;
             logits = transformer->state.logits;
+            transformer->state.next_pos = pos0 + done + B;
         }
         done += B;
     }
@@ -3056,6 +3635,7 @@ static int cp_is_letter(int c) {
   if (cp_is_space(c) || cp_is_number(c)) return 0;
   if (c < 0xC0) return c == 0xAA || c == 0xB5 || c == 0xBA; // Latin-1 punctuation/symbols
   if (c == 0xD7 || c == 0xF7) return 0;                       // multiplication / division signs
+  if (ARCH == ARCH_QWEN35 && c >= 0x300 && c <= 0x36F) return 1; // Qwen3.5 regex: [\p{L}\p{M}]+
   if (c >= 0x2B0 && c <= 0x36F) return c < 0x2C2 || (c >= 0x2C6 && c <= 0x2D1) || (c >= 0x2E0 && c <= 0x2E4); // modifiers, combining marks
   if (c >= 0x2000 && c <= 0x2BFF) return c == 0x2071 || c == 0x207F || (c >= 0x2090 && c <= 0x209C); // punctuation, symbols, arrows, math
   if (c >= 0x3000 && c <= 0x303F) return c == 0x3005 || c == 0x3006; // CJK punctuation
@@ -3535,6 +4115,8 @@ long time_in_ms() {
 // ----------------------------------------------------------------------------
 // generation loop
 
+static int is_end_token(int t);
+static void init_special_tokens(Tokenizer *tk);
 void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
   char *empty_prompt = "";
   if (prompt == NULL) {
@@ -3550,6 +4132,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     exit(EXIT_FAILURE);
   }
 
+  init_special_tokens(tokenizer);
   // start the main loop
   long start = 0;               // used to time our code, only initialized after first iteration
   int next;                     // will store the next token in the sequence
@@ -3572,7 +4155,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     pos++;
 
     // data-dependent terminating condition: the BOS (=1) token delimits sequences
-    if ((next == 128001 || next == 128009 || next == 151643 || next == 151645) && pos > num_prompt_tokens)
+    if (is_end_token(next) && pos > num_prompt_tokens)
       break;
     // print the token as string, decode it with the Tokenizer object
     char *piece = decode(tokenizer, token, next);
@@ -3704,10 +4287,25 @@ static Tools *g_tools = NULL; // set by -f tools.json
 // ChatML (Qwen2.5): <|im_start|>role\n ... <|im_end|>\n, tool calls inside <tool_call></tool_call>,
 //           tool output as <tool_response></tool_response> inside a user message.
 
-#define QWEN_ENDOFTEXT 151643
-#define QWEN_IM_END 151645
-#define QWEN_TOOL_CALL 151657
-#define QWEN_TOOL_CALL_END 151658
+// ChatML special token ids (Qwen2.5 / Qwen3 values; looked up in the vocabulary by init_special_tokens)
+static int QWEN_ENDOFTEXT = 151643, QWEN_IM_END = 151645, QWEN_TOOL_CALL = 151657, QWEN_TOOL_CALL_END = 151658;
+static int QWEN_THINK = -1, QWEN_THINK_END = -1;
+static int THINK = 0; // -r 1: Qwen3.5 / 3.8 reasoning (the reply starts inside <think>); 0: an empty think block
+static int find_special(Tokenizer *tk, const char *s) {
+  for (int i = SPECIAL_START; i < tk->vocab_size; i++)
+    if (tk->vocab[i] && !strcmp(tk->vocab[i], s)) return i;
+  return -1;
+}
+static void init_special_tokens(Tokenizer *tk) {
+  if (ARCH < ARCH_QWEN2) return;
+  int v;
+  if ((v = find_special(tk, "<|endoftext|>")) >= 0) QWEN_ENDOFTEXT = v;
+  if ((v = find_special(tk, "<|im_end|>")) >= 0) QWEN_IM_END = v;
+  if ((v = find_special(tk, "<tool_call>")) >= 0) QWEN_TOOL_CALL = v;
+  if ((v = find_special(tk, "</tool_call>")) >= 0) QWEN_TOOL_CALL_END = v;
+  QWEN_THINK = find_special(tk, "<think>");
+  QWEN_THINK_END = find_special(tk, "</think>");
+}
 
 static int is_end_token(int t) {
   if (ARCH >= ARCH_QWEN2) return t == QWEN_IM_END || t == QWEN_ENDOFTEXT;
@@ -3769,7 +4367,34 @@ static int push_tpl(Tokenizer *tk, const char *s, int *msg, int m) {
 static int build_system(Tokenizer *tk, const char *sys_text, int *msg, int m) {
   SBuf b = {0};
   sb_puts(&b, "");
-  if (ARCH >= ARCH_QWEN2) {
+  if (ARCH == ARCH_QWEN35) { // Qwen3.5 / 3.8 template (XML tool calls, optional reasoning instructions)
+    const char *reason = THINK ? "Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
+                                 "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and "
+                                 "clarity in the final answer." : "";
+    if (g_tools) {
+      sb_puts(&b, "<|im_start|>system\n");
+      if (reason[0]) { sb_puts(&b, reason); sb_puts(&b, "\n\n"); }
+      sb_puts(&b, "# Tools\n\nYou have access to the following functions:\n\n<tools>");
+      char *tp = tools_prompt(g_tools, -1, "\n", "");
+      sb_puts(&b, tp);
+      free(tp);
+      sb_puts(&b, "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+                  "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+                  "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n"
+                  "</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified "
+                  "format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+                  "- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in "
+                  "natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer "
+                  "the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>");
+      if (sys_text[0]) { sb_puts(&b, "\n\n"); sb_puts(&b, sys_text); }
+      sb_puts(&b, "<|im_end|>\n");
+    } else if (sys_text[0] || reason[0]) {
+      sb_puts(&b, "<|im_start|>system\n");
+      if (reason[0]) { sb_puts(&b, reason); if (sys_text[0]) sb_puts(&b, "\n\n"); }
+      sb_puts(&b, sys_text);
+      sb_puts(&b, "<|im_end|>\n");
+    }
+  } else if (ARCH >= ARCH_QWEN2) {
     if (ARCH == ARCH_QWEN3 && !sys_text[0] && !g_tools) { // Qwen3: no default system message
       free(b.buf);
       return m;
@@ -3824,6 +4449,7 @@ static int build_user(Tokenizer *tk, const char *prefix, const char *text, int *
     m = push_tpl(tk, "<|im_start|>user\n", msg, m);
     m = push_text(tk, text, msg, m);
     m = push_tpl(tk, "<|im_end|>\n<|im_start|>assistant\n", msg, m);
+    if (ARCH == ARCH_QWEN35) m = push_tpl(tk, THINK ? "<think>\n" : "<think>\n\n</think>\n\n", msg, m);
   } else {
     m = push_tpl(tk, "<|start_header_id|>user<|end_header_id|>\n\n", msg, m);
     m = push_text(tk, text, msg, m);
@@ -3842,6 +4468,7 @@ static int build_tool_results(Tokenizer *tk, const char *prefix, char **outs, in
       m = push_tpl(tk, "\n</tool_response>", msg, m);
     }
     m = push_tpl(tk, "<|im_end|>\n<|im_start|>assistant\n", msg, m);
+    if (ARCH == ARCH_QWEN35) m = push_tpl(tk, THINK ? "<think>\n" : "<think>\n\n</think>\n\n", msg, m);
   } else {
     for (int i = 0; i < n; i++) {
       m = push_tpl(tk, "<|start_header_id|>ipython<|end_header_id|>\n\n", msg, m);
@@ -3886,6 +4513,51 @@ static JNode *normalize_call(JNode *j) {
   p->key = strdup("parameters");
   n->next = p;
   json_free(j);
+  return out;
+}
+
+/* Qwen3.5 / 3.8 call body: <function=NAME>\n<parameter=P>\nVALUE\n</parameter>...</function>
+ * -> {"name": NAME, "parameters": {P: VALUE, ...}} (a VALUE that parses as a JSON number / object /
+ * array / literal keeps its type, anything else is a string). NULL if it is not a call. */
+static JNode *parse_xml_call(const char *s) {
+  const char *f = strstr(s, "<function=");
+  if (!f) return NULL;
+  f += 10;
+  const char *fe = strchr(f, '>');
+  if (!fe) return NULL;
+  JNode *out = calloc(1, sizeof(JNode));
+  out->type = J_OBJ;
+  JNode *n = calloc(1, sizeof(JNode));
+  n->type = J_STR; n->key = strdup("name"); n->str = strndup(f, fe - f);
+  out->child = n;
+  JNode *params = calloc(1, sizeof(JNode));
+  params->type = J_OBJ; params->key = strdup("parameters");
+  n->next = params;
+  JNode **tail = &params->child;
+  const char *p = fe + 1;
+  while ((p = strstr(p, "<parameter=")) != NULL) {
+    p += 11;
+    const char *pe = strchr(p, '>');
+    if (!pe) break;
+    const char *v = pe + 1, *ve = strstr(v, "</parameter>");
+    if (!ve) break;
+    if (*v == '\n') v++;
+    const char *vend = ve;
+    if (vend > v && vend[-1] == '\n') vend--;
+    char *val = strndup(v, vend - v);
+    JNode *j = NULL;
+    if (val[0] && strchr("-0123456789{[tfn", val[0])) {
+      const char *endp = NULL;
+      j = json_parse(val, &endp);
+      if (j && (j->type == J_STR || (endp && *endp))) { json_free(j); j = NULL; }
+    }
+    if (!j) { j = calloc(1, sizeof(JNode)); j->type = J_STR; j->str = strdup(val); }
+    free(val);
+    j->key = strndup(p, pe - p);
+    *tail = j;
+    tail = &j->next;
+    p = ve + 12;
+  }
   return out;
 }
 
@@ -3942,13 +4614,18 @@ static void reply_token(ReplyState *rs, Tokenizer *tk, int next) {
     buf->buf[0] = '\0';
   } else if (ARCH >= ARCH_QWEN2 && next == QWEN_TOOL_CALL_END) {
     if (rs->mode == 2 && rs->n_calls < MAX_CALLS_PER_REPLY) {
-      JNode *c = normalize_call(json_parse(buf->buf, NULL));
+      JNode *c = ARCH == ARCH_QWEN35 && strstr(buf->buf, "<function=") ? parse_xml_call(buf->buf) : normalize_call(json_parse(buf->buf, NULL));
       if (c) rs->calls[rs->n_calls++] = c;
       else { printf("<tool_call>%s</tool_call>", buf->buf); fflush(stdout); }
     }
     rs->mode = 1;
   } else if (ARCH < ARCH_QWEN2 && next == LLAMA3_PYTHON_TAG) {
     rs->mode = 2;
+  } else if (next >= 0 && next == QWEN_THINK) { // reasoning is shown dimmed
+    if (THINK) { printf("\033[2m"); fflush(stdout); }
+  } else if (next >= 0 && next == QWEN_THINK_END) {
+    if (THINK) { printf("\033[0m\n"); fflush(stdout); }
+    rs->mode = 0; // skip the blank lines before the answer
   } else {
     char *piece = decode(tk, rs->token, next);
     int ok = piece && piece[0] && !(piece[1] == '\0' && !(isprint((unsigned char)piece[0]) || isspace((unsigned char)piece[0])));
@@ -3988,6 +4665,7 @@ static void reply_token(ReplyState *rs, Tokenizer *tk, int next) {
 static int chat_reply(Transformer *tr, Tokenizer *tk, Sampler *sp, ChatHistory *h, float *logits, int *ended, int *gen,
                       JNode **calls) {
   ReplyState rs = {.mode = 0, .n_calls = 0, .token = -1, .calls = calls};
+  if (ARCH == ARCH_QWEN35 && THINK) { printf("\033[2m"); fflush(stdout); } // the prompt already opened <think>
   sb_puts(&rs.buf, "");
   const int V = tr->config.vocab_size;
   float *own = malloc((size_t)V * sizeof(float)); // logits we own (the shared buffers get overwritten)
@@ -4079,6 +4757,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
   char *text = malloc(BUF);
   int *msg = malloc((4 * BUF + 64) * sizeof(int));
   ChatHistory h = {.tok = malloc(ctx * sizeof(int)), .n = 0, .cap = ctx, .sys_len = 0, .turn = malloc(ctx * sizeof(int)), .n_turns = 0};
+  init_special_tokens(tokenizer);
   (void)steps;
   SBuf prefix = {0}; // template text owed before the next message (end of the previous reply)
   sb_puts(&prefix, "");
@@ -4201,7 +4880,9 @@ static void imatrix(Transformer* t, Tokenizer* tk, const char* text_path, const 
     encode(tk, txt, 0, 0, ids, &nt);
     const int L = p->n_layers, E = p->n_experts, H = E > 0 ? p->moe_hidden : p->hidden_dim, EE = E > 0 ? E : 1;
     IMX.att = calloc((size_t)L * p->dim, sizeof(double));
-    IMX.wo = calloc((size_t)L * p->q_dim, sizeof(double));
+    IMX_WO_W = p->q_dim;
+    if (p->hybrid && p->lin_nv * p->lin_dv > IMX_WO_W) IMX_WO_W = p->lin_nv * p->lin_dv;
+    IMX.wo = calloc((size_t)L * IMX_WO_W, sizeof(double));
     IMX.ffn = calloc((size_t)L * EE * p->dim, sizeof(double));
     IMX.w2 = calloc((size_t)L * EE * H, sizeof(double));
     IMX.nexp = calloc((size_t)L * EE, sizeof(long long));
@@ -4221,10 +4902,10 @@ static void imatrix(Transformer* t, Tokenizer* tk, const char* text_path, const 
     fprintf(stderr, " (%.1f s)\n", (time_in_ms() - t0) / 1000.0);
     FILE* o = fopen(out_path, "wb");
     if (!o) { fprintf(stderr, "cannot write %s\n", out_path); exit(EXIT_FAILURE); }
-    int hdr[7] = {0x31584D4E, L, p->dim, p->q_dim, H, E, E > 0 ? p->moe_hidden : 0};
+    int hdr[7] = {0x31584D4E, L, p->dim, IMX_WO_W, H, E, E > 0 ? p->moe_hidden : 0};
     fwrite(hdr, sizeof(int), 7, o);
     fwrite(&IMX.ntok, sizeof(long long), 1, o);
-    struct { double* a; size_t rows, n; } parts[4] = {{IMX.att, L, p->dim}, {IMX.wo, L, p->q_dim}, {IMX.ffn, (size_t)L * EE, p->dim}, {IMX.w2, (size_t)L * EE, H}};
+    struct { double* a; size_t rows, n; } parts[4] = {{IMX.att, L, p->dim}, {IMX.wo, L, IMX_WO_W}, {IMX.ffn, (size_t)L * EE, p->dim}, {IMX.w2, (size_t)L * EE, H}};
     for (int k = 0; k < 4; k++)
         for (size_t r = 0; r < parts[k].rows; r++) {
             double cnt = (E > 0 && k >= 2) ? (double)IMX.nexp[r] : (double)IMX.ntok;
@@ -4259,6 +4940,7 @@ void error_usage() {
   fprintf(stderr, "  -d <string> draft model (same tokenizer, smaller) for speculative decoding in chat\n");
   fprintf(stderr, "  -k <int>    max draft length of prompt-lookup speculative decoding in chat, default 8, 0 = off\n");
   fprintf(stderr, "  -N <int>    NUMA nodes to use, default 0 = all (weights are split between the nodes)\n");
+  fprintf(stderr, "  -r <int>    Qwen3.5 / 3.8: 1 = reasoning (thinking shown dimmed), default 0 = answer directly\n");
   exit(EXIT_FAILURE);
 }
 
@@ -4328,6 +5010,8 @@ int main(int argc, char *argv[]) {
       tools_path = argv[i + 1];
     } else if (argv[i][1] == 'o') {
       out_path = argv[i + 1];
+    } else if (argv[i][1] == 'r') {
+      THINK = atoi(argv[i + 1]);
     } else {
       error_usage();
     }
@@ -4361,6 +5045,10 @@ int main(int argc, char *argv[]) {
 #endif
   build_transformer(&transformer, checkpoint_path, ctx);
   init_pool(&transformer, nthreads);
+  if (transformer.config.hybrid && (SPEC_K > 0 || draft_path)) { // a recurrent state cannot drop rejected drafts
+    SPEC_K = 0;
+    draft_path = NULL;
+  }
   Transformer draft;
   if (draft_path) {
     build_transformer(&draft, draft_path, transformer.config.seq_len);

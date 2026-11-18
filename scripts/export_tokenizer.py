@@ -28,7 +28,7 @@ def main():
     model_dir, out_path = sys.argv[1], sys.argv[2]
     tj = json.load(open(os.path.join(model_dir, "tokenizer.json")))
     cfg = json.load(open(os.path.join(model_dir, "config.json")))
-    vocab_size = cfg["vocab_size"]
+    vocab_size = cfg.get("vocab_size") or cfg.get("text_config", {})["vocab_size"]
     bd = byte_decoder()
     toks = {}
     for s, i in tj["model"]["vocab"].items():

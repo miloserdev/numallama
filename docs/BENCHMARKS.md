@@ -61,6 +61,22 @@ Q4 vs Q8 on the same 43 tokens: top-1 agreement 93%, KL 0.018.
 
 Logits vs an fp32 numpy reference: top-1 97.7%, mean KL 0.0075.
 
+## Hybrid linear attention: Qwen3.8-27B (abliterated), dense
+
+64 layers: 48 Gated DeltaNet (16 k / 48 v heads x 128, conv 4) + 16 gated full attention (24 / 4 heads x 256,
+RoPE on 64 dims), hidden 17408, vocab 248k. Recurrent state ~150 MB, independent of the context.
+
+| | Q8 (28.6 GB) | Q4 (18.0 GB, imatrix) |
+|---|---|---|
+| decode, 1 socket | — | 10 tok/s |
+| decode, 2 sockets | 11.4 tok/s | **17.2 tok/s** |
+| prefill 512 tokens, 2 sockets | 195 tok/s | 172 tok/s |
+
+Q8 vs an fp32 numpy reference (tests/ref_qwen35.py, 26 tokens): top-1 100%, KL 0.0005; batched prefill
+last token KL 0.0012. Q4 vs Q8: top-1 96%, KL 0.006. Speculation is off for hybrid models (the recurrent
+state cannot drop rejected drafts); a dense 27B reads all weights per token, hence ~5x slower than the
+30B-A3B MoE, but it answers better.
+
 ## Synchronization rework (decode, 2 sockets)
 
 | Step | Qwen3-30B-A3B | Llama 3.2 3B Q8 | Llama 3.1 8B Q8 |
