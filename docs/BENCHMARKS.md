@@ -14,13 +14,13 @@ single socket under `numactl -N0 -m0 -t 96`; for 2 sockets the best of `--numa d
 
 | Model | llama.cpp 1 socket | numallama 1 socket | numallama 2 sockets | llama.cpp best 2-socket |
 |---|---|---|---|---|
-| Llama 3.2 3B Q8 | 36 / **512** | 46 / 489 | **64** / 490 | 4.6 / 249 |
-| Llama 3.2 3B Q4 (llama.cpp Q4_0) | 64 / **803** | 69 / 430 | **83** / 490 | 21 / 394 |
+| Llama 3.2 3B Q8 | 36 / **512** | 48 / 489 | **76** / 490 | 4.6 / 249 |
+| Llama 3.2 3B Q4 (llama.cpp Q4_0) | 64 / **803** | 70 / 430 | **103** / 490 | 21 / 394 |
 | Llama 3.2 3B Q4_K_M (llama.cpp) | 64 / 568 | — | — | — |
-| Llama 3.1 8B Q8 | 19 / **274** | 20 / 183 | **33** / 214 | 3.6 / 140 |
-| Llama 3.1 8B Q4 (llama.cpp Q4_K_M) | 29 / **246** | 32 / 181 | **46** / 223 | 0.8 / 132 |
+| Llama 3.1 8B Q8 | 19 / **274** | 21 / 183 | **39** / 214 | 3.6 / 140 |
+| Llama 3.1 8B Q4 (llama.cpp Q4_K_M) | 29 / **246** | 34 / 181 | **58** / 223 | 0.8 / 132 |
 
-(decode / prefill)
+(decode / prefill; numallama decode re-measured after the synchronization rework below, prefill before it)
 
 - llama.cpp does not scale to the second socket on this machine: its per-op barriers collapse as
   soon as the thread count exceeds the truly idle cores, and the weights are not split by node.
@@ -43,12 +43,28 @@ Quality, Llama 3.2 3B, mean KL divergence to full precision on the same 4 x 512-
 
 | | 1 socket | 2 sockets |
 |---|---|---|
-| decode | 36–43 tok/s | ~41 tok/s |
-| prefill (batched, grouped by expert) | — | 204 tok/s (token by token: 55) |
+| decode | 47 tok/s | **71 tok/s** |
+| prefill (batched, grouped by expert) | — | 202 tok/s (token by token: 65) |
 
-Logits vs an fp32 numpy reference: top-1 97.7%, mean KL 0.0075. Decode is barrier-bound
-(~10 synchronizations per layer x 48 layers): ~40% of the time is spent waiting; reducing the
-number of cross-socket synchronizations is the next step for MoE.
+Logits vs an fp32 numpy reference: top-1 97.7%, mean KL 0.0075.
+
+## Synchronization rework (decode, 2 sockets)
+
+| Step | Qwen3-30B-A3B | Llama 3.2 3B Q8 | Llama 3.1 8B Q8 |
+|---|---|---|---|
+| before | 55 | 67 | 35 |
+| barrier state in node-bound pages, hierarchical cross-node level, padded ThreadBuf | 69 | | |
+| q/k/v, qk-norm, attention with node barriers only; router replicated per node | 69 | | |
+| flag-tree barriers (no atomic RMW), two-level release | 70 | | |
+| prefetch of the next phase's first rows during barrier waits | **71** | **76** | **39** |
+
+Barrier latency (`RUNQ_BARBENCH=1`): node 2.0 -> 1.1 us, cross-socket 7.4 -> 1.7 us.
+Sampling (temperature + top-p over 152k tokens) moved onto the pool: 1.3 ms -> 0.09 ms per token.
+
+Tried and dropped: smaller work chunks / byte-capped chunks (shorter row runs stream worse),
+finer attention chunks (16 positions), Megatron-style column split of wo/w2 (two cross-socket
+barriers per layer instead of four: +1% on MoE, 0 on 8B, +10 GB and +5 s load).
+The remaining waiting (~30%) is load skew at ~12 barriers per layer, not barrier latency.
 
 ## Speculative decoding (Llama 3.1 8B Q8, 2 sockets, greedy)
 

@@ -13,9 +13,11 @@ Highlights:
 - **int8 (Q8) and 4-bit (Q4) weights** with NEON `sdot` kernels (single token, 4x4 batched).
 - **Multi-socket NUMA**: every weight matrix and the KV cache are split between the sockets
   (`mbind`), each socket's threads compute only its rows, per-node work counters and per-node
-  activation buffers keep cross-socket traffic minimal. 2 sockets give +45..63% decode speed.
-- **Persistent thread pool** with tree barriers, dynamic row distribution, futex sleep when idle,
-  automatic choice of idle CPUs per NUMA node.
+  activation buffers keep cross-socket traffic minimal; attention and the MoE router synchronize
+  within a socket only. 2 sockets give +50..85% decode speed.
+- **Persistent thread pool** with flag-tree barriers in node-local memory (~1 us within a socket,
+  ~2 us across), dynamic row distribution, prefetch of the next phase's rows while waiting,
+  futex sleep when idle, automatic choice of idle CPUs per NUMA node; sampling runs on the pool.
 - **Batched prompt prefill** (matrix x matrix) and a **multi-token decode step**.
 - **Speculative decoding**, exact (output distribution unchanged):
   prompt lookup (n-grams from the whole dialog) and an optional small **draft model** (`-d`).
@@ -102,6 +104,7 @@ python3 scripts/export_tokenizer.py /path/to/Qwen2.5-7B-Instruct qwen7b_tokenize
 
 After every reply the chat prints `[prompt N tok X tok/s | reply M tok Y tok/s | context a/b | draft accepted c/d]`
 to stderr. Thread placement: `RUNQ_PIN=1` keeps threads pinned, `RUNQ_PIN=0` disables placement.
+`RUNQ_BARBENCH=1` prints the latency of the node and cross-node barriers at start-up.
 
 For Russian (and other non-English text) with small models keep the temperature around 0.6–0.7.
 

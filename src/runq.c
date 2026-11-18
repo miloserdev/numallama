@@ -580,6 +580,8 @@ void softmax(float *x, int size) {
 // are computed redundantly by every thread into private buffers, which is
 // cheaper than an extra barrier for models of this size.
 
+#define MOE_MAX_ACTIVE 16
+struct BarGroup { _Alignas(64) atomic_int c; };
 typedef struct {
     _Alignas(128) float* xb; // (dim,) private normalized input / attention output (padded: no false sharing)
     int8_t* q;     // (max(dim, hidden_dim),) private quantized activations
@@ -588,7 +590,11 @@ typedef struct {
     float* rope_s; // (head_size/2,) sin for the current position
     int node;      // NUMA node index (0..NN-1) of this thread
     int ltid, nthn; // index within the node, threads of the node
-    int lsense_node; // node barrier local sense
+    int ep;          // barrier epoch of this thread (node-wide: every barrier of the node increments it)
+    long long phase; // work phase of the last grab (the first grab of a phase takes the static ticket ltid)
+    int npf;         // weight regions to prefetch while waiting at the next barrier
+    const char* pf[MOE_MAX_ACTIVE * 2];
+    int pflen[MOE_MAX_ACTIVE * 2];
 } ThreadBuf;
 
 typedef struct {
@@ -603,8 +609,7 @@ typedef struct {
     ThreadBuf* tb;
     float* part;        // (n_heads * C, head_size + 2) attention partials: max, sum, acc
     double* rope_freq;  // (head_size/2,)
-    _Alignas(64) atomic_int bar_count;   // cross-node level of the barrier tree (one arrival per node)
-    _Alignas(64) atomic_int bar_sense;
+    struct BarGroup xflag[8];            // cross-node level: epoch published by each node leader
     _Alignas(64) atomic_int go;
     _Alignas(64) atomic_int sleepers;   // workers blocked in futex_wait on `go`
     atomic_int quit;
@@ -620,11 +625,10 @@ static Pool P;
 // Guided schedule over [0, n): tickets 0..nbig-1 are big chunks, the last quarter of the range goes
 // in 4-row tickets, so the phase ends with short pieces instead of a long tail of one big chunk
 // (under full memory load a thread streams only ~2 GB/s, a 16-row chunk would take ~15 us).
-static inline int grab_ticket(atomic_int* ctr, int n, int nthn, int* b0, int* b1) {
+static inline int ticket_range(int t, int n, int nthn, int* b0, int* b1) {
     int chunk = (n / (nthn * 4) + 3) & ~3;
-    if (chunk < 16) chunk = 16;
+    if (chunk < 16) chunk = 16; // shorter row runs stream worse (prefetcher ramp-up per row)
     int nbig = (n - n / 4) / chunk;
-    int t = atomic_fetch_add_explicit(ctr, 1, memory_order_relaxed);
     int b, e;
     if (t < nbig) { b = t * chunk; e = b + chunk; }
     else { b = nbig * chunk + (t - nbig) * 4; e = b + 4; }
@@ -633,17 +637,55 @@ static inline int grab_ticket(atomic_int* ctr, int n, int nthn, int* b0, int* b1
     *b1 = e < n ? e : n;
     return 1;
 }
-static inline int grab_rows(int k, int d, const ThreadBuf* tb, int* r0, int* r1) {
+// The first ticket of every thread in a phase is static (ticket ltid), so its rows are known before
+// the phase starts and can be prefetched while the thread waits at the barrier (pf_first).
+static inline int grab_ticket(atomic_int* ctr, int n, ThreadBuf* tb, int k, int* b0, int* b1) {
+    long long key = ((long long)P.seq << 20) | k;
+    int t;
+    if (tb->phase != key) { tb->phase = key; t = tb->ltid; }
+    else t = tb->nthn + atomic_fetch_add_explicit(ctr, 1, memory_order_relaxed);
+    return ticket_range(t, n, tb->nthn, b0, b1);
+}
+static inline int grab_rows(int k, int d, ThreadBuf* tb, int* r0, int* r1) {
     int lo, hi;
     node_rows(d, tb->node, &lo, &hi);
-    if (!grab_ticket(&P.work[tb->node][P.seq & 1][k].v, hi - lo, tb->nthn, r0, r1)) return 0;
+    if (!grab_ticket(&P.work[tb->node][P.seq & 1][k].v, hi - lo, tb, k, r0, r1)) return 0;
     *r0 += lo;
     *r1 += lo;
     return 1;
 }
 // like grab_rows, over a node-local virtual range [0, n) (MoE: the node's halves of the selected experts)
-static inline int grab_virtual(int k, int n, const ThreadBuf* tb, int* r0, int* r1) {
-    return grab_ticket(&P.work[tb->node][P.seq & 1][k].v, n, tb->nthn, r0, r1);
+static inline int grab_virtual(int k, int n, ThreadBuf* tb, int* r0, int* r1) {
+    return grab_ticket(&P.work[tb->node][P.seq & 1][k].v, n, tb, k, r0, r1);
+}
+// queue rows [r0, r1) of w (cols columns) for prefetching during the next barrier wait
+static inline void pf_add(ThreadBuf* tb, const QuantizedTensor* w, int cols, int r0, int r1) {
+    if (tb->npf >= MOE_MAX_ACTIVE * 2 || r1 <= r0) return;
+    size_t bpr = w->bits == 4 ? cols / 2 : cols;
+    tb->pf[tb->npf] = (const char*)(w->q + (size_t)r0 * bpr);
+    tb->pflen[tb->npf] = (int)((r1 - r0) * bpr);
+    tb->npf++;
+}
+// the rows of this thread's static first ticket of a node-split d-row matrix (virtual: n rows from 0)
+static inline void pf_first(ThreadBuf* tb, const QuantizedTensor* w, int cols, int d, int virt) {
+    int lo = 0, hi = d, b0, b1;
+    if (!virt) node_rows(d, tb->node, &lo, &hi);
+    if (ticket_range(tb->ltid, hi - lo, tb->nthn, &b0, &b1)) pf_add(tb, w, cols, lo + b0, lo + b1);
+}
+// one step of the prefetch queue (called from the barrier spin loops): a few lines into L2
+static inline void pf_step(ThreadBuf* tb) {
+    if (tb->npf == 0) return;
+    int i = tb->npf - 1;
+    for (int j = 0; j < 4 && tb->pflen[i] > 0; j++) {
+#if defined(__aarch64__)
+        __asm__ __volatile__("prfm pldl2keep, [%0]" : : "r"(tb->pf[i]));
+#else
+        __builtin_prefetch(tb->pf[i], 0, 2);
+#endif
+        tb->pf[i] += 64;
+        tb->pflen[i] -= 64;
+    }
+    if (tb->pflen[i] <= 0) tb->npf--;
 }
 // rows [e*rows, (e+1)*rows) of a tensor as a tensor of its own (an expert of a MoE layer)
 static inline QuantizedTensor expert_view(const QuantizedTensor* t, int e, int rows, int cols) {
@@ -651,7 +693,6 @@ static inline QuantizedTensor expert_view(const QuantizedTensor* t, int e, int r
     QuantizedTensor v = {t->q + (size_t)e * rows * bpr, t->s + (size_t)e * rows * spr, t->bits};
     return v;
 }
-#define MOE_MAX_ACTIVE 16
 // MoE routing (Qwen3-MoE): softmax over the experts, top-k, optional renormalization
 static void moe_route(const float* logits, int E, int k, int renorm, int* sel, float* wt) {
     float m = logits[0], z = 0.0f;
@@ -687,11 +728,11 @@ static inline void head_norm_rope(float* v, const float* w, int hs, const float*
 #define WORK_PHASES 7 // per layer: q, k, v, wo, w1/w3 (or experts), w2, MoE router (+1 classifier)
 
 // ---------------------------------------------------------------------------- profiling (-DPROFILE)
-enum { PH_ROPE, PH_NORM, PH_QKV, PH_ATT, PH_MERGE, PH_WO, PH_FNORM, PH_W13, PH_QH, PH_W2, PH_CLS, PH_BARRIER, PH_IDLE, PH_N };
+enum { PH_ROPE, PH_NORM, PH_QKV, PH_ATT, PH_MERGE, PH_WO, PH_FNORM, PH_W13, PH_QH, PH_W2, PH_CLS, PH_BARRIER, PH_NBARRIER, PH_IDLE, PH_N };
 #ifdef PROFILE
 static const char* PH_NAME[PH_N] = {"rope/setup", "att rmsnorm+quant", "qkv matmul+rope", "attention", "att merge+quant",
                                     "wo matmul", "ffn rmsnorm+quant", "w1/w3 matmul+swiglu", "quant hidden", "w2 matmul",
-                                    "final norm+classifier", "barrier wait", "idle (outside forward)"};
+                                    "final norm+classifier", "barrier wait", "node barrier wait", "idle (outside forward)"};
 #endif
 #ifdef PROFILE
 static inline uint64_t prof_ticks(void) { uint64_t v; __asm__ __volatile__("isb; mrs %0, cntvct_el0" : "=r"(v)); return v; }
@@ -755,7 +796,7 @@ static void barrier(ThreadBuf* tb) {
  * each group arrives at the node counter, the last one of the node either releases the node
  * (node barrier) or first meets the representatives of the other nodes (global barrier). All
  * spinning happens on a node-local line; only NN threads touch the cross-socket counter. */
-#define BAR_GROUP 8
+#define BAR_GROUP 16
 static void node_arrive_release(ThreadBuf* tb, int global);
 static void barrier_impl(ThreadBuf* tb) {
     if (P.nth == 1) return;
@@ -766,7 +807,6 @@ static void barrier_impl(ThreadBuf* tb) {
  * once per NUMA node by all threads of that node, each doing a slice, into a node-local buffer.
  * Every cache line of the shared fp32 activations crosses the socket link once per node instead
  * of once per thread, and nobody repeats the whole rmsnorm/quantization. */
-struct BarGroup { _Alignas(64) atomic_int c; };
 typedef struct {
     int8_t* q;     // quantized input vector (max(dim, hidden_dim))
     float* s;      // its scales
@@ -775,10 +815,11 @@ typedef struct {
     float* router;       // MoE router logits computed by the node (every node routes on its own)
 } NodeBuf;
 struct NodeSync {
-    _Alignas(64) atomic_int top;   // arrivals of the node's groups
-    _Alignas(64) atomic_int sense; // release flag the node's threads spin on
-    _Alignas(64) int xs;           // sense of the cross-node level (touched by the node's representative only)
-    _Alignas(64) struct BarGroup grp[64];
+    _Alignas(64) atomic_int rel;     // release epoch the node's threads spin on
+    _Alignas(64) int xep;            // cross-node epoch (node leader only)
+    struct BarGroup arr[512];        // per-thread arrival epochs (one line each)
+    struct BarGroup garr[64];        // per-group arrival epochs
+    struct BarGroup grel[64];        // per-group release epochs (set by the group leader)
 };
 static NodeBuf NB[MAX_NODES];
 static int P_qmax = 0; // longest quantized node vector (NB slot size)
@@ -786,33 +827,56 @@ static int P_max_layers = 0; // most layers of any loaded model (work counter re
 #define SPEC_MAX_TOK 16 // tokens per multi-token decode step (speculative verification)
 static void quantize_vec(int8_t* q, float* s, const float* x, int n);
 
+/* Flag tree, no atomic read-modify-write: a thread publishes its epoch in its own cache line; the
+ * fixed leader of each group of BAR_GROUP polls its members, the node leader (ltid 0) polls the group
+ * leaders, meets the other node leaders through one flag line each (global barrier) and releases the
+ * node with one store. Polling reads in parallel instead of serializing RMWs on a shared line. */
 static void node_arrive_release(ThreadBuf* tb, int global) {
     struct NodeSync* sy = NB[tb->node].sy;
-    const int g = tb->ltid / BAR_GROUP, ngroups = (tb->nthn + BAR_GROUP - 1) / BAR_GROUP;
-    const int gsize = (g == ngroups - 1) ? tb->nthn - g * BAR_GROUP : BAR_GROUP;
-    int sense = (tb->lsense_node ^= 1);
-    if (atomic_fetch_add_explicit(&sy->grp[g].c, 1, memory_order_acq_rel) == gsize - 1) {
-        atomic_store_explicit(&sy->grp[g].c, 0, memory_order_relaxed);
-        if (atomic_fetch_add_explicit(&sy->top, 1, memory_order_acq_rel) == ngroups - 1) {
-            atomic_store_explicit(&sy->top, 0, memory_order_relaxed);
-            if (global) { // the node's representative meets the other nodes
-                int xs = (sy->xs ^= 1);
-                if (atomic_fetch_add_explicit(&P.bar_count, 1, memory_order_acq_rel) == NN - 1) {
-                    atomic_store_explicit(&P.bar_count, 0, memory_order_relaxed);
-                    atomic_store_explicit(&P.bar_sense, xs, memory_order_release);
-                } else {
-                    while (atomic_load_explicit(&P.bar_sense, memory_order_acquire) != xs) { cpu_relax(); }
-                }
+    const int lt = tb->ltid, e = ++tb->ep;
+    pf_step(tb);
+    if (lt % BAR_GROUP != 0) {
+        atomic_store_explicit(&sy->arr[lt].c, e, memory_order_release);
+    } else {
+        const int end = lt + BAR_GROUP < tb->nthn ? lt + BAR_GROUP : tb->nthn;
+        for (int j = lt + 1; j < end; j++)
+            while (atomic_load_explicit(&sy->arr[j].c, memory_order_acquire) != e) { pf_step(tb); cpu_relax(); }
+        if (lt != 0) {
+            atomic_store_explicit(&sy->garr[lt / BAR_GROUP].c, e, memory_order_release);
+            while (atomic_load_explicit(&sy->rel, memory_order_acquire) != e) { pf_step(tb); cpu_relax(); }
+            atomic_store_explicit(&sy->grel[lt / BAR_GROUP].c, e, memory_order_release);
+            tb->npf = 0;
+            return;
+        } else {
+            const int ng = (tb->nthn + BAR_GROUP - 1) / BAR_GROUP;
+            for (int g = 1; g < ng; g++)
+                while (atomic_load_explicit(&sy->garr[g].c, memory_order_acquire) != e) { pf_step(tb); cpu_relax(); }
+            if (global) {
+                int xe = ++sy->xep;
+                atomic_store_explicit(&P.xflag[tb->node].c, xe, memory_order_release);
+                for (int k = 0; k < NN; k++)
+                    if (k != tb->node)
+                        while (atomic_load_explicit(&P.xflag[k].c, memory_order_acquire) - xe < 0) { pf_step(tb); cpu_relax(); }
             }
-            atomic_store_explicit(&sy->sense, sense, memory_order_release);
+            atomic_store_explicit(&sy->rel, e, memory_order_release);
+            atomic_store_explicit(&sy->grel[0].c, e, memory_order_release);
+            tb->npf = 0;
             return;
         }
     }
-    while (atomic_load_explicit(&sy->sense, memory_order_acquire) != sense) { cpu_relax(); }
+    while (atomic_load_explicit(&sy->grel[lt / BAR_GROUP].c, memory_order_acquire) != e) { pf_step(tb); cpu_relax(); }
+    tb->npf = 0;
 }
 static void node_barrier(ThreadBuf* tb) {
     if (tb->nthn == 1) return;
+#ifdef PROFILE
+    int tid = (int)(tb - P.tb), saved = PROF_T[tid].cur;
+    PROF(tid, PH_NBARRIER);
     node_arrive_release(tb, 0);
+    PROF(tid, saved);
+#else
+    node_arrive_release(tb, 0);
+#endif
 }
 
 // groups [g0, g1) of an n-vector handled by this thread inside its node
@@ -850,7 +914,6 @@ static void node_quant(ThreadBuf* tb, const float* v, int n) {
     if (g1 > g0) quantize_vec(nb->q + (size_t)g0 * GS, nb->s + g0, v + (size_t)g0 * GS, (g1 - g0) * GS);
     node_barrier(tb);
 }
-
 // multi-token versions: B vectors of length n at X + b*n -> node buffer (token b at q + b*n, s + b*n/GS)
 static void node_norm_quant_multi(ThreadBuf* tb, const float* X, const float* weight, int n, int B) {
     NodeBuf* nb = &NB[tb->node];
@@ -1153,6 +1216,7 @@ static void forward_thread(int tid) {
 
         PROF(tid, PH_NORM);
         // attention rmsnorm + quantize (cooperative, per node)
+        if (l == 0) pf_first(tb, w->wq, dim, q_dim, 0); // later layers: queued at the previous layer's last barrier
         node_norm_quant(tb, xin, w->rms_att_weight + l * dim, dim);
 
         PROF(tid, PH_QKV);
@@ -1290,6 +1354,7 @@ static void forward_thread(int tid) {
                         memcpy(NB[k].s + P_qmax / GS + h * head_size / GS, hsc, head_size / GS * sizeof(float));
                     }
         }
+        pf_first(tb, w->wo + l, q_dim, dim, 0);
         if (hl && NN > 1) barrier(tb); else node_barrier(tb);
 
         PROF(tid, PH_WO);
@@ -1298,6 +1363,8 @@ static void forward_thread(int tid) {
             matmul_rows(s->xb2, nq + P_qmax, ns + P_qmax / GS, w->wo + l, q_dim, r0, r1);
             for (int i = r0; i < r1; i++) { x[i] = xin[i] + s->xb2[i]; }
         }
+        if (p->n_experts > 0) pf_first(tb, w->wg_node[tb->node] + l, dim, p->n_experts, 1);
+        else { pf_first(tb, w->w1 + l, dim, hidden_dim, 0); pf_first(tb, w->w3 + l, dim, hidden_dim, 0); }
         barrier(tb);
 
         PROF(tid, PH_FNORM);
@@ -1334,6 +1401,15 @@ static void forward_thread(int tid) {
                     v = vend;
                 }
             }
+            { // w2 rows of this thread's first ticket, for all selected experts
+                int lo2, hi2, b0, b1;
+                node_rows(dim, tb->node, &lo2, &hi2);
+                if (ticket_range(tb->ltid, hi2 - lo2, tb->nthn, &b0, &b1))
+                    for (int j = 0; j < A; j++) {
+                        QuantizedTensor e2 = expert_view(w->w2 + l, sel[j], dim, mh);
+                        pf_add(tb, &e2, mh, lo2 + b0, lo2 + b1);
+                    }
+            }
             barrier(tb);
             PROF(tid, PH_QH);
             node_quant(tb, s->hb, A * mh);
@@ -1356,6 +1432,7 @@ static void forward_thread(int tid) {
                     s->hb[i] = val * s->hb2[i];
                 }
             }
+            pf_first(tb, w->w2 + l, hidden_dim, dim, 0);
             barrier(tb);
 
             PROF(tid, PH_QH);
@@ -1367,6 +1444,8 @@ static void forward_thread(int tid) {
                 for (int i = r0; i < r1; i++) { x[i] += s->xb2[i]; }
             }
         }
+        if (l + 1 < p->n_layers) pf_first(tb, w->wq + l + 1, dim, q_dim, 0);
+        else pf_first(tb, w->wcls, dim, p->vocab_size, 0);
         barrier(tb);
     }
 
@@ -1559,6 +1638,7 @@ static double now_us(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, 
 static void barrier_bench_thread(int tid) {
     ThreadBuf* tb = &P.tb[tid];
     const int R = 20000;
+    for (int i = 0; i < 2000; i++) barrier(tb); // warm-up
     double t0 = now_us();
     for (int i = 0; i < R; i++) barrier(tb);
     double t1 = now_us();
@@ -1696,7 +1776,7 @@ void init_pool(Transformer* t, int nth) {
         memset(NB[k].q, 0, qb);
         memset(NB[k].s, 0, sb);
         memset(NB[k].ss, 0, ssb);
-        if ((nthn + BAR_GROUP - 1) / BAR_GROUP > 64) { fprintf(stderr, "too many threads per node\n"); exit(EXIT_FAILURE); }
+        if (nthn > 512) { fprintf(stderr, "too many threads per node\n"); exit(EXIT_FAILURE); }
         size_t syb = (sizeof(struct NodeSync) + 4095) & ~(size_t)4095;
         NB[k].sy = aligned_alloc(4096, syb);
 #if defined(__linux__)
@@ -1709,8 +1789,7 @@ void init_pool(Transformer* t, int nth) {
 #endif
         memset(NB[k].router, 0, 4096 * sizeof(float));
     }
-    atomic_store(&P.bar_count, 0);
-    atomic_store(&P.bar_sense, 0);
+    for (int k = 0; k < 8; k++) atomic_store(&P.xflag[k].c, 0);
     atomic_store(&P.go, 0);
     atomic_store(&P.sleepers, 0);
     atomic_store(&P.quit, 0);
