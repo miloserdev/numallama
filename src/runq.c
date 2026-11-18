@@ -148,6 +148,8 @@ typedef struct {
   float *lin_S;       // (n_lin, nv, dv, dk) recurrent states (row c of head h = column c of S)
   float *conv_state;  // (n_lin, conv_dim, K - 1) last inputs of the causal convolutions
   int next_pos;       // hybrid: the position the recurrent state is at (it can only advance)
+  float *snap_S, *snap_conv; // hybrid: a saved copy of the recurrent / conv states ...
+  int snap_pos;              // ... at this position (-1: none), e.g. right after the system prompt
   float *key_cache;   // (layer, seq_len, dim)
   float *value_cache; // (layer, seq_len, dim)
 } RunState;
@@ -195,6 +197,8 @@ void malloc_run_state(RunState *s, Config *p) {
   s->value_cache = calloc((size_t)p->n_attn * p->seq_len * kv_dim, sizeof(float));
   s->gate = s->lin = s->lin_o = s->lin_S = s->conv_state = NULL;
   s->next_pos = 0;
+  s->snap_S = s->snap_conv = NULL;
+  s->snap_pos = -1;
   if (p->hybrid) {
     int nlin = p->n_layers - p->n_attn;
     s->gate = calloc(p->q_dim, sizeof(float));
@@ -228,6 +232,7 @@ void free_run_state(RunState *s) {
   free(s->key_cache);
   free(s->value_cache);
   free(s->gate); free(s->lin); free(s->lin_o); free(s->lin_S); free(s->conv_state);
+  free(s->snap_S); free(s->snap_conv);
 }
 
 // ----------------------------------------------------------------------------
@@ -4229,8 +4234,37 @@ typedef struct {
 } ChatHistory;
 
 // push tokens through the model, appending them to the history; returns the last logits
+/* Hybrid models: the recurrent state cannot be rewound, so the chat saves it right after the system
+ * prompt and restores it when old turns are dropped (the KV cache of the prefix stays valid). */
+static size_t hyb_state_floats(const Config *p) { return (size_t)(p->n_layers - p->n_attn) * p->lin_nv * p->lin_dv * p->lin_dk; }
+static size_t hyb_conv_floats(const Config *p) { return (size_t)(p->n_layers - p->n_attn) * p->conv_dim * (p->conv_k - 1); }
+static void hybrid_snapshot(Transformer *t) {
+  RunState *s = &t->state;
+  if (!t->config.hybrid) return;
+  if (!s->snap_S) {
+    s->snap_S = malloc(hyb_state_floats(&t->config) * sizeof(float));
+    s->snap_conv = malloc(hyb_conv_floats(&t->config) * sizeof(float));
+  }
+  memcpy(s->snap_S, s->lin_S, hyb_state_floats(&t->config) * sizeof(float));
+  memcpy(s->snap_conv, s->conv_state, hyb_conv_floats(&t->config) * sizeof(float));
+  s->snap_pos = s->next_pos;
+}
+static int hybrid_restore(Transformer *t, int pos) { // 1 if the state now stands at pos
+  RunState *s = &t->state;
+  if (!t->config.hybrid) return 1;
+  if (s->snap_pos != pos) return 0;
+  memcpy(s->lin_S, s->snap_S, hyb_state_floats(&t->config) * sizeof(float));
+  memcpy(s->conv_state, s->snap_conv, hyb_conv_floats(&t->config) * sizeof(float));
+  s->next_pos = pos;
+  return 1;
+}
+
 static float *chat_feed(Transformer *t, ChatHistory *h, const int *toks, int n) {
-  if (n <= 0) return NULL;
+  if (h->n + n > h->cap) { // never past the window (history buffer and KV cache are sized for it)
+    fprintf(stderr, "[context window full: %d tokens not processed]\n", h->n + n - h->cap);
+    n = h->cap - h->n;
+  }
+  if (n <= 0) return t->state.logits;
   float *logits = forward_batch(t, toks, n, h->n);
   memcpy(h->tok + h->n, toks, n * sizeof(int));
   h->n += n;
@@ -4238,22 +4272,25 @@ static float *chat_feed(Transformer *t, ChatHistory *h, const int *toks, int n) 
 }
 
 // make room for `need` more tokens by dropping the oldest turns, then re-prefill
-static void chat_make_room(Transformer *t, ChatHistory *h, int need) {
+// keep_current: never drop the last (current) turn, e.g. while tool outputs are being added to it
+static int chat_make_room(Transformer *t, ChatHistory *h, int need, int keep_current) { // 1 if `need` tokens fit now
   if (h->n + need <= h->cap) {
-    return;
+    return 1;
   }
   // keep the system prefix; drop whole turns from the front until we fit, keeping at least
   // half the window free for the new turn and the reply
   int target = h->cap / 2 < h->cap - need ? h->cap / 2 : h->cap - need;
   int drop_to = -1;
-  for (int i = 0; i < h->n_turns; i++) {
+  const int last = keep_current && h->n_turns > 0 ? h->n_turns - 1 : h->n_turns;
+  for (int i = 0; i < last; i++) {
     int keep = h->sys_len + (h->n - h->turn[i]);
     if (keep <= target) {
       drop_to = i;
       break;
     }
   }
-  int start = drop_to >= 0 ? h->turn[drop_to] : h->n; // first token to keep after the prefix
+  int start = drop_to >= 0 ? h->turn[drop_to] : (last < h->n_turns ? h->turn[last] : h->n); // first token kept after the prefix
+  if (start <= h->sys_len) return h->n + need <= h->cap; // nothing to drop
   int kept = h->n - start;
   int dropped = start - h->sys_len;
   memmove(h->tok + h->sys_len, h->tok + start, kept * sizeof(int));
@@ -4270,13 +4307,20 @@ static void chat_make_room(Transformer *t, ChatHistory *h, int need) {
   h->n = h->sys_len; // the KV cache for the system prefix is still valid
   if (DRAFT_POS > h->sys_len) DRAFT_POS = h->sys_len;
   long t0 = time_in_ms();
+  if (!hybrid_restore(t, h->sys_len)) { // no saved state: re-process the system prompt too (from 0)
+    int *all = malloc(((size_t)h->sys_len + kept + 1) * sizeof(int));
+    memcpy(all, h->tok, h->sys_len * sizeof(int));
+    memcpy(all + h->sys_len, replay, kept * sizeof(int));
+    h->n = 0;
+    chat_feed(t, h, all, h->sys_len + kept);
+    free(all);
+    kept = 0;
+  }
   chat_feed(t, h, replay, kept);
   fprintf(stderr, "[context full: dropped %d old tokens, re-processed %d in %.1fs]\n", dropped, kept,
           (time_in_ms() - t0) / 1000.0);
   free(replay);
-  if (h->n + need > h->cap) {
-    fprintf(stderr, "[message is too long for the context window (%d tokens)]\n", h->cap);
-  }
+  return h->n + need <= h->cap;
 }
 
 static Tools *g_tools = NULL; // set by -f tools.json
@@ -4618,7 +4662,7 @@ static void reply_token(ReplyState *rs, Tokenizer *tk, int next) {
       if (c) rs->calls[rs->n_calls++] = c;
       else { printf("<tool_call>%s</tool_call>", buf->buf); fflush(stdout); }
     }
-    rs->mode = 1;
+    rs->mode = 0; // skip the whitespace between calls
   } else if (ARCH < ARCH_QWEN2 && next == LLAMA3_PYTHON_TAG) {
     rs->mode = 2;
   } else if (next >= 0 && next == QWEN_THINK) { // reasoning is shown dimmed
@@ -4779,6 +4823,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
   long ts = time_in_ms();
   chat_feed(transformer, &h, msg, m);
   h.sys_len = h.n;
+  hybrid_snapshot(transformer); // hybrid models: the state after the system prompt, for context trimming
   fprintf(stderr, "[system prompt: %d tokens, %.1fs]\n", m, (time_in_ms() - ts) / 1000.0);
 
   for (int first = 1;; first = 0) {
@@ -4799,7 +4844,8 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
       continue;
     }
     int reserve = ctx / 8 < 512 ? ctx / 8 : 512;
-    chat_make_room(transformer, &h, m + reserve);
+    if (!chat_make_room(transformer, &h, m + reserve, 0))
+      fprintf(stderr, "[message is too long for the context window (%d tokens)]\n", ctx);
     if (turn_off > 0) chat_feed(transformer, &h, msg, turn_off);
     h.turn[h.n_turns++] = h.n;
     long t0 = time_in_ms();
@@ -4821,11 +4867,16 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
       if (!ended) sb_puts(&prefix, end_text());
       sb_puts(&prefix, after_end());
       if (n_calls == 0) break;
+      if (round > MAX_ROUNDS) { // it ignored the limit: end the turn here
+        for (int i = 0; i < n_calls; i++) json_free(calls[i]);
+        fprintf(stderr, "[tool-call limit reached]\n");
+        break;
+      }
       // run the tools and hand their output back
       char *outs[MAX_CALLS_PER_REPLY];
       for (int i = 0; i < n_calls; i++) {
         char *shown = NULL;
-        outs[i] = round < MAX_ROUNDS ? tools_run(g_tools, calls[i], &shown, 1) : strdup("Error: too many function calls for one message.");
+        outs[i] = round < MAX_ROUNDS ? tools_run(g_tools, calls[i], &shown, 1) : strdup("Error: the limit of function calls for this message is reached. Do not call functions again: answer the user now with what you already know.");
         SBuf args = {0};
         JNode *params = json_get(calls[i], "parameters");
         if (params) json_write(&args, params, -1, 0);
@@ -4836,11 +4887,31 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
         json_free(calls[i]);
       }
       printf("\n");
-      m = build_tool_results(tokenizer, prefix.buf, outs, n_calls, msg, 0);
+      // the outputs must fit the window: drop old turns, then halve the longest outputs
+      int fits = 0, cut = 0;
+      for (int attempt = 0; attempt < 24; attempt++) {
+        m = build_tool_results(tokenizer, prefix.buf, outs, n_calls, msg, 0);
+        if (chat_make_room(transformer, &h, m + reserve, 1)) { fits = 1; break; }
+        int lg = 0;
+        for (int i = 1; i < n_calls; i++) if (strlen(outs[i]) > strlen(outs[lg])) lg = i;
+        size_t len = strlen(outs[lg]);
+        if (len < 64) break;
+        const char *note = "\n[... output truncated to fit the context window]";
+        char *o = malloc(len / 2 + strlen(note) + 1);
+        memcpy(o, outs[lg], len / 2);
+        strcpy(o + len / 2, note);
+        free(outs[lg]);
+        outs[lg] = o;
+        cut = 1;
+      }
+      for (int i = 0; i < n_calls; i++) free(outs[i]);
+      if (cut && fits) fprintf(stderr, "[tool output shortened to fit the context window]\n");
+      if (!fits) { // keep the owed prefix for the next turn and stop calling tools
+        fprintf(stderr, "[tool output does not fit the context window (%d tokens)]\n", ctx);
+        break;
+      }
       prefix.len = 0;
       prefix.buf[0] = '\0';
-      for (int i = 0; i < n_calls; i++) free(outs[i]);
-      chat_make_room(transformer, &h, m + reserve);
       long p0 = time_in_ms();
       logits = chat_feed(transformer, &h, msg, m);
       prompt_ms += time_in_ms() - p0;
