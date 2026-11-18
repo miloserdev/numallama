@@ -96,7 +96,7 @@ python3 scripts/export_tokenizer.py /path/to/Qwen2.5-7B-Instruct qwen7b_tokenize
 | `-T <n>` | threads (default 0 = all idle CPUs of the used NUMA nodes, at most 96 per node) |
 | `-N <n>` | NUMA nodes to use (default 0 = all); weights are split between them |
 | `-c <n>` | context window (KV cache size), default 8192 |
-| `-k <n>` | max prompt-lookup draft length, default 8, `0` = off (not yet for MoE / Qwen3 models) |
+| `-k <n>` | max prompt-lookup draft length, default 8, `0` = off (adaptive for MoE models) |
 | `-d <file>` | draft model for speculative decoding |
 | `-f <file>` | tools file, enables tool calling in chat |
 | `-t`, `-p`, `-s` | temperature, top-p, seed |

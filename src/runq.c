@@ -813,6 +813,8 @@ typedef struct {
     float* ss;     // per-thread partial sums of squares (one per cache line)
     struct NodeSync* sy; // barrier state of the node, in a page bound to the node
     float* router;       // MoE router logits computed by the node (every node routes on its own)
+    int8_t* gq;          // MoE multi-token step: quantized ffn input of every (expert, token) pair
+    float* gs;
 } NodeBuf;
 struct NodeSync {
     _Alignas(64) atomic_int rel;     // release epoch the node's threads spin on
@@ -1738,7 +1740,7 @@ void init_pool(Transformer* t, int nth) {
     if (p->q_dim > qmax) qmax = p->q_dim;
     if (p->n_experts > 0 && p->n_active * p->moe_hidden > qmax) qmax = p->n_active * p->moe_hidden;
     P_qmax = qmax;
-    if (p->n_experts > 4096) { fprintf(stderr, "at most 4096 experts are supported\n"); exit(EXIT_FAILURE); }
+    if (p->n_experts > 256 || (p->n_experts > 0 && SPEC_MAX_TOK * p->n_experts > 4096)) { fprintf(stderr, "at most 256 experts are supported\n"); exit(EXIT_FAILURE); }
     if (p->n_active > MOE_MAX_ACTIVE) { fprintf(stderr, "at most %d active experts are supported\n", MOE_MAX_ACTIVE); exit(EXIT_FAILURE); }
     P.tb = aligned_alloc(128, nth * sizeof(ThreadBuf));
     memset(P.tb, 0, nth * sizeof(ThreadBuf));
@@ -1788,6 +1790,17 @@ void init_pool(Transformer* t, int nth) {
         if (NN > 1) bind_range(NB[k].router, 4096 * sizeof(float), NODE_ID[k]);
 #endif
         memset(NB[k].router, 0, 4096 * sizeof(float));
+        if (p->n_experts > 0) {
+            size_t gb = ((size_t)SPEC_MAX_TOK * p->n_active * p->dim + 4095) & ~(size_t)4095;
+            size_t gsb = ((size_t)SPEC_MAX_TOK * p->n_active * (p->dim / GS) * sizeof(float) + 4095) & ~(size_t)4095;
+            NB[k].gq = aligned_alloc(4096, gb);
+            NB[k].gs = aligned_alloc(4096, gsb);
+#if defined(__linux__)
+            if (NN > 1) { bind_range(NB[k].gq, gb, NODE_ID[k]); bind_range(NB[k].gs, gsb, NODE_ID[k]); }
+#endif
+            memset(NB[k].gq, 0, gb);
+            memset(NB[k].gs, 0, gsb);
+        }
     }
     for (int k = 0; k < 8; k++) atomic_store(&P.xflag[k].c, 0);
     atomic_store(&P.go, 0);
@@ -1873,6 +1886,8 @@ typedef struct {
     float* rope_c;    // (B, head_size/2)
     float* rope_s;
     float* att;       // (nth, kv_mul, seq_len) per-thread attention scratch
+    float* mpart;     // multi-token step: attention partials (token, head, context chunk, head_size + 2)
+    size_t mpart_n;   // its capacity in floats
     float* logits_all; // when set: (B, vocab) logits of every position (speculative verification)
     // MoE prefill (sized for BATCH_MAX tokens x n_active slots)
     float* router;     // (B, n_experts)
@@ -2237,12 +2252,12 @@ static void forward_multi_thread(int tid) {
     RunState* s = &transformer->state;
     ThreadBuf* tb = &P.tb[tid];
     const int B = BT.B, pos0 = BT.pos0;
-    const int dim = p->dim;
-    const int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    const int dim = p->dim, q_dim = p->q_dim, kv_dim = p->kv_dim;
     const int kv_mul = p->n_heads / p->n_kv_heads;
     const int hidden_dim = p->hidden_dim;
-    const int head_size = dim / p->n_heads;
+    const int head_size = p->head_dim, n_heads = p->n_heads;
     const int hs2 = head_size / 2;
+    const int qkn = p->qk_norm;
     const float att_scale = 1.0f / sqrtf((float)head_size);
     const int8_t* nq = NB[tb->node].q;
     const float* ns = NB[tb->node].s;
@@ -2259,14 +2274,14 @@ static void forward_multi_thread(int tid) {
 
         node_norm_quant_multi(tb, X, w->rms_att_weight + l * dim, dim, B);
 
-        while (grab_rows(WORK_PHASES * l + 0, dim, tb, &r0, &r1)) {
-            matmul_rows_batch(BT.q, dim, nq, ns, B, w->wq + l, dim, r0, r1);
+        while (grab_rows(WORK_PHASES * l + 0, q_dim, tb, &r0, &r1)) {
+            matmul_rows_batch(BT.q, q_dim, nq, ns, B, w->wq + l, dim, r0, r1);
             for (int b = 0; b < B; b++) {
-                float* q = BT.q + (size_t)b * dim;
+                float* q = BT.q + (size_t)b * q_dim;
                 const float* rc = BT.rope_c + b * hs2;
                 const float* rs = BT.rope_s + b * hs2;
-                if (w->bq) for (int i = r0; i < r1; i++) q[i] += w->bq[(size_t)l * dim + i];
-                for (int i = r0; i < r1; i += 2) {
+                if (w->bq) for (int i = r0; i < r1; i++) q[i] += w->bq[(size_t)l * q_dim + i];
+                if (!qkn) for (int i = r0; i < r1; i += 2) {
                     int j = (i % head_size) / 2;
                     float v0 = q[i], v1 = q[i + 1];
                     q[i] = v0 * rc[j] - v1 * rs[j];
@@ -2282,6 +2297,7 @@ static void forward_multi_thread(int tid) {
                 const float* rs = BT.rope_s + b * hs2;
                 float* kc = s->key_cache + loff + (size_t)(pos0 + b) * head_size;
                 if (w->bk) for (int i = r0; i < r1; i++) k[i] += w->bk[(size_t)l * kv_dim + i];
+                if (qkn) continue; // per-head norm + RoPE below, then into the cache
                 for (int i = r0; i < r1; i += 2) {
                     int j = (i % head_size) / 2;
                     float v0 = k[i], v1 = k[i + 1];
@@ -2301,84 +2317,209 @@ static void forward_multi_thread(int tid) {
             }
         }
         barrier(tb);
+        if (qkn) { // per-head q/k RMSNorm + RoPE of every token, k into the cache
+            const int per = n_heads + p->n_kv_heads;
+            for (int task = tid; task < B * per; task += P.nth) {
+                int b = task / per, h = task % per;
+                const float* rc = BT.rope_c + b * hs2;
+                const float* rs = BT.rope_s + b * hs2;
+                if (h < n_heads) {
+                    head_norm_rope(BT.q + (size_t)b * q_dim + (size_t)h * head_size, w->q_norm + (size_t)l * head_size, head_size, rc, rs);
+                } else {
+                    int g = h - n_heads;
+                    float* kv = BT.k + (size_t)b * kv_dim + (size_t)g * head_size;
+                    head_norm_rope(kv, w->k_norm + (size_t)l * head_size, head_size, rc, rs);
+                    memcpy(s->key_cache + loff + (size_t)g * p->seq_len * head_size + (size_t)(pos0 + b) * head_size, kv, head_size * sizeof(float));
+                }
+            }
+            barrier(tb);
+        }
 
-        // causal attention, items = (kv group of this node, token); output straight into BT.xb
+        // causal attention: items = (kv group of this node, chunk of the context, subset of the tokens),
+        // each handling the kv_mul heads of the group, so every K/V chunk is read once; online-softmax
+        // partials are merged per (token, head) by the node afterwards
         float* att = BT.att + (size_t)tid * kv_mul * p->seq_len;
         int g0, g1;
         node_groups(p->n_kv_heads, tb->node, &g0, &g1);
-        for (int item = tb->ltid; item < (g1 - g0) * B; item += tb->nthn) {
-            int g = g0 + item % (g1 - g0), b = item / (g1 - g0);
-            int T = pos0 + b + 1;
+        const int Tt = pos0 + B; // positions seen by the last token
+        int C = Tt / 32 < 1 ? 1 : Tt / 32;
+        int cmax = tb->nthn / (g1 - g0 > 0 ? g1 - g0 : 1);
+        if (C > cmax) C = cmax > 0 ? cmax : 1;
+        while (C > 1 && (size_t)B * n_heads * C * (head_size + 2) > BT.mpart_n) C--;
+        const int hp = head_size + 2;
+        int TS = 1; // short context: also split the tokens so that every thread of the node gets an item
+        while (TS < B && (g1 - g0) * C * TS * 2 <= tb->nthn) TS *= 2;
+        if (TS > B) TS = B;
+        for (int item = tb->ltid; item < (g1 - g0) * C * TS; item += tb->nthn) {
+            int g = g0 + item / (C * TS), c = (item / TS) % C, ts = item % TS;
+            int t0 = (int)((long)Tt * c / C), t1 = (int)((long)Tt * (c + 1) / C);
             const float* kb = s->key_cache + loff + (size_t)g * p->seq_len * head_size;
             const float* vb = s->value_cache + loff + (size_t)g * p->seq_len * head_size;
-            const float* qb = BT.q + (size_t)b * dim + (size_t)g * kv_mul * head_size;
-            float m[KV_MUL_MAX], sum[KV_MUL_MAX];
-            for (int r = 0; r < kv_mul; r++) m[r] = -FLT_MAX;
-            for (int t = 0; t < T; t++) {
-                const float* k = kb + (size_t)t * head_size;
+            for (int b = B * ts / TS; b < B * (ts + 1) / TS; b++) {
+                int te = pos0 + b + 1 < t1 ? pos0 + b + 1 : t1; // causal end for token b
                 for (int r = 0; r < kv_mul; r++) {
-                    const float* q = qb + r * head_size;
-                    float score = 0.0f;
-                    for (int i = 0; i < head_size; i++) score += q[i] * k[i];
-                    score *= att_scale;
-                    att[(size_t)r * p->seq_len + t] = score;
-                    m[r] = score > m[r] ? score : m[r];
+                    int h = g * kv_mul + r;
+                    float* pr = BT.mpart + (((size_t)b * n_heads + h) * C + c) * hp;
+                    if (te <= t0) { pr[1] = 0.0f; continue; }
+                    const float* q = BT.q + (size_t)b * q_dim + (size_t)h * head_size;
+                    float* ar = att + (size_t)r * p->seq_len;
+                    float m = -FLT_MAX;
+                    for (int t = t0; t < te; t++) {
+                        const float* k = kb + (size_t)t * head_size;
+                        float score = 0.0f;
+                        for (int i = 0; i < head_size; i++) score += q[i] * k[i];
+                        score *= att_scale;
+                        ar[t - t0] = score;
+                        m = score > m ? score : m;
+                    }
+                    float sm = 0.0f;
+                    float* o = pr + 2;
+                    memset(o, 0, head_size * sizeof(float));
+                    for (int t = t0; t < te; t++) {
+                        float e = expf(ar[t - t0] - m);
+                        sm += e;
+                        const float* v = vb + (size_t)t * head_size;
+                        for (int i = 0; i < head_size; i++) o[i] += e * v[i];
+                    }
+                    pr[0] = m;
+                    pr[1] = sm;
                 }
             }
-            for (int r = 0; r < kv_mul; r++) {
-                float* ar = att + (size_t)r * p->seq_len;
-                float sm = 0.0f;
-                for (int t = 0; t < T; t++) { float e = expf(ar[t] - m[r]); ar[t] = e; sm += e; }
-                sum[r] = 1.0f / sm;
-            }
-            float* ob = BT.xb + (size_t)b * dim + (size_t)g * kv_mul * head_size;
-            memset(ob, 0, kv_mul * head_size * sizeof(float));
-            for (int t = 0; t < T; t++) {
-                const float* v = vb + (size_t)t * head_size;
-                for (int r = 0; r < kv_mul; r++) {
-                    float a = att[(size_t)r * p->seq_len + t];
-                    float* o = ob + r * head_size;
-                    for (int i = 0; i < head_size; i++) o[i] += a * v[i];
+        }
+        node_barrier(tb);
+        { // merge: (token, head of this node) pairs split among the node's threads
+            const int h0 = g0 * kv_mul, nh = (g1 - g0) * kv_mul;
+            for (int it = tb->ltid; it < B * nh; it += tb->nthn) {
+                int b = it / nh, h = h0 + it % nh;
+                const float* ph = BT.mpart + ((size_t)b * n_heads + h) * C * hp;
+                float M = -FLT_MAX, den = 0.0f;
+                for (int c = 0; c < C; c++) if (ph[(size_t)c * hp + 1] > 0.0f && ph[(size_t)c * hp] > M) M = ph[(size_t)c * hp];
+                float* ob = BT.xb + (size_t)b * q_dim + (size_t)h * head_size;
+                memset(ob, 0, head_size * sizeof(float));
+                for (int c = 0; c < C; c++) {
+                    const float* pr = ph + (size_t)c * hp;
+                    if (pr[1] <= 0.0f) continue;
+                    float f = expf(pr[0] - M);
+                    den += f * pr[1];
+                    for (int i = 0; i < head_size; i++) ob[i] += f * pr[2 + i];
                 }
-            }
-            for (int r = 0; r < kv_mul; r++) {
-                float* o = ob + r * head_size;
-                for (int i = 0; i < head_size; i++) o[i] *= sum[r];
+                float inv = 1.0f / den;
+                for (int i = 0; i < head_size; i++) ob[i] *= inv;
             }
         }
         barrier(tb);
-        node_quant_multi(tb, BT.xb, dim, B);
+        node_quant_multi(tb, BT.xb, q_dim, B);
 
         while (grab_rows(WORK_PHASES * l + 3, dim, tb, &r0, &r1)) {
-            matmul_rows_batch(BT.xb2, dim, nq, ns, B, w->wo + l, dim, r0, r1);
+            matmul_rows_batch(BT.xb2, dim, nq, ns, B, w->wo + l, q_dim, r0, r1);
             for (int b = 0; b < B; b++)
                 for (int i = r0; i < r1; i++) X[(size_t)b * dim + i] += BT.xb2[(size_t)b * dim + i];
         }
         barrier(tb);
 
         node_norm_quant_multi(tb, X, w->rms_ffn_weight + l * dim, dim, B);
-        while (grab_rows(WORK_PHASES * l + 4, hidden_dim, tb, &r0, &r1)) {
-            matmul_rows_batch(BT.hb, hidden_dim, nq, ns, B, w->w1 + l, dim, r0, r1);
-            matmul_rows_batch(BT.hb2, hidden_dim, nq, ns, B, w->w3 + l, dim, r0, r1);
+        if (p->n_experts > 0) {
+            /* MoE: every node computes the router logits of all tokens; every thread then derives the
+             * same union of selected experts (ascending id) with the (token, weight) pairs of each.
+             * Each expert's rows are read once and applied to all its tokens (4x4 kernel). */
+            const int E = p->n_experts, A = p->n_active, mh = p->moe_hidden;
+            NodeBuf* nb = &NB[tb->node];
+            float* rl = nb->router; // (B, E)
+            while (grab_virtual(WORK_PHASES * l + 6, E, tb, &r0, &r1))
+                matmul_rows_batch(rl, E, nq, ns, B, w->wg_node[tb->node] + l, dim, r0, r1);
+            node_barrier(tb);
+            int sel[SPEC_MAX_TOK * MOE_MAX_ACTIVE], cnt[257] = {0};
+            float wt[SPEC_MAX_TOK * MOE_MAX_ACTIVE];
             for (int b = 0; b < B; b++) {
-                float* h1 = BT.hb + (size_t)b * hidden_dim;
-                const float* h3 = BT.hb2 + (size_t)b * hidden_dim;
-                for (int i = r0; i < r1; i++) {
-                    float val = h1[i];
-                    val *= (1.0f / (1.0f + expf(-val)));
-                    h1[i] = val * h3[i];
+                moe_route(rl + (size_t)b * E, E, A, p->norm_topk, sel + b * A, wt + b * A);
+                for (int j = 0; j < A; j++) cnt[sel[b * A + j]]++;
+            }
+            int ue[SPEC_MAX_TOK * MOE_MAX_ACTIVE], up0[SPEC_MAX_TOK * MOE_MAX_ACTIVE + 1], U = 0;
+            int ptok[SPEC_MAX_TOK * MOE_MAX_ACTIVE];
+            float pw[SPEC_MAX_TOK * MOE_MAX_ACTIVE];
+            up0[0] = 0;
+            for (int e = 0; e < E; e++) if (cnt[e]) { ue[U] = e; up0[U + 1] = up0[U] + cnt[e]; cnt[e] = U++; }
+            int fill[SPEC_MAX_TOK * MOE_MAX_ACTIVE] = {0};
+            for (int b = 0; b < B; b++) // token order inside every expert: ascending b
+                for (int j = 0; j < A; j++) {
+                    int u = cnt[sel[b * A + j]], pi = up0[u] + fill[u]++;
+                    ptok[pi] = b;
+                    pw[pi] = wt[b * A + j];
+                }
+            const int NP = up0[U];
+            // gather the quantized ffn input of every pair into the node's pair buffer
+            const int ngd = dim / GS;
+            for (int pi = tb->ltid; pi < NP; pi += tb->nthn) {
+                memcpy(nb->gq + (size_t)pi * dim, nq + (size_t)ptok[pi] * dim, dim);
+                memcpy(nb->gs + (size_t)pi * ngd, ns + (size_t)ptok[pi] * ngd, ngd * sizeof(float));
+            }
+            node_barrier(tb);
+            int lo, hi;
+            node_rows(mh, tb->node, &lo, &hi);
+            const int half = hi - lo;
+            while (grab_virtual(WORK_PHASES * l + 4, U * half, tb, &r0, &r1)) {
+                for (int v = r0; v < r1;) {
+                    int u = v / half, vend = (u + 1) * half < r1 ? (u + 1) * half : r1;
+                    int a0 = lo + (v - u * half), a1 = lo + (vend - u * half);
+                    int p0 = up0[u], np = up0[u + 1] - p0;
+                    QuantizedTensor e1 = expert_view(w->w1 + l, ue[u], mh, dim), e3 = expert_view(w->w3 + l, ue[u], mh, dim);
+                    matmul_rows_batch(BT.gh + (size_t)p0 * mh, mh, nb->gq + (size_t)p0 * dim, nb->gs + (size_t)p0 * ngd, np, &e1, dim, a0, a1);
+                    matmul_rows_batch(BT.gh3 + (size_t)p0 * mh, mh, nb->gq + (size_t)p0 * dim, nb->gs + (size_t)p0 * ngd, np, &e3, dim, a0, a1);
+                    for (int pi = p0; pi < p0 + np; pi++) {
+                        float* h1 = BT.gh + (size_t)pi * mh;
+                        const float* h3 = BT.gh3 + (size_t)pi * mh;
+                        for (int i = a0; i < a1; i++) {
+                            float val = h1[i];
+                            val *= (1.0f / (1.0f + expf(-val)));
+                            h1[i] = val * h3[i] * pw[pi];
+                        }
+                    }
+                    v = vend;
                 }
             }
-        }
-        barrier(tb);
+            barrier(tb);
+            node_quant_multi(tb, BT.gh, mh, NP); // pair pi at nq + pi * mh
+            while (grab_rows(WORK_PHASES * l + 5, dim, tb, &r0, &r1)) {
+                for (int u = 0; u < U; u++) {
+                    int p0 = up0[u], np = up0[u + 1] - p0;
+                    QuantizedTensor e2 = expert_view(w->w2 + l, ue[u], dim, mh);
+                    matmul_rows_batch(BT.gout + (size_t)p0 * dim, dim, nq + (size_t)p0 * mh, ns + (size_t)p0 * (mh / GS), np, &e2, mh, r0, r1);
+                }
+                for (int b = 0; b < B; b++) { // add the experts of token b in rank order (as the decode path)
+                    float* x = X + (size_t)b * dim;
+                    for (int j = 0; j < A; j++) {
+                        int u = cnt[sel[b * A + j]], pi = up0[u];
+                        while (ptok[pi] != b) pi++;
+                        const float* o = BT.gout + (size_t)pi * dim;
+                        for (int i = r0; i < r1; i++) x[i] += o[i];
+                    }
+                }
+            }
+            barrier(tb);
+        } else {
+            while (grab_rows(WORK_PHASES * l + 4, hidden_dim, tb, &r0, &r1)) {
+                matmul_rows_batch(BT.hb, hidden_dim, nq, ns, B, w->w1 + l, dim, r0, r1);
+                matmul_rows_batch(BT.hb2, hidden_dim, nq, ns, B, w->w3 + l, dim, r0, r1);
+                for (int b = 0; b < B; b++) {
+                    float* h1 = BT.hb + (size_t)b * hidden_dim;
+                    const float* h3 = BT.hb2 + (size_t)b * hidden_dim;
+                    for (int i = r0; i < r1; i++) {
+                        float val = h1[i];
+                        val *= (1.0f / (1.0f + expf(-val)));
+                        h1[i] = val * h3[i];
+                    }
+                }
+            }
+            barrier(tb);
 
-        node_quant_multi(tb, BT.hb, hidden_dim, B);
-        while (grab_rows(WORK_PHASES * l + 5, dim, tb, &r0, &r1)) {
-            matmul_rows_batch(BT.xb2, dim, nq, ns, B, w->w2 + l, hidden_dim, r0, r1);
-            for (int b = 0; b < B; b++)
-                for (int i = r0; i < r1; i++) X[(size_t)b * dim + i] += BT.xb2[(size_t)b * dim + i];
+            node_quant_multi(tb, BT.hb, hidden_dim, B);
+            while (grab_rows(WORK_PHASES * l + 5, dim, tb, &r0, &r1)) {
+                matmul_rows_batch(BT.xb2, dim, nq, ns, B, w->w2 + l, hidden_dim, r0, r1);
+                for (int b = 0; b < B; b++)
+                    for (int i = r0; i < r1; i++) X[(size_t)b * dim + i] += BT.xb2[(size_t)b * dim + i];
+            }
+            barrier(tb);
         }
-        barrier(tb);
     }
 
     node_norm_quant_multi(tb, X, w->rms_final_weight, dim, B);
@@ -2408,6 +2549,8 @@ static void init_batch(Transformer* t) {
     BT.rope_c = calloc(B * (head_size / 2), sizeof(float));
     BT.rope_s = calloc(B * (head_size / 2), sizeof(float));
     BT.att = calloc((size_t)P.nth * (p->n_heads / p->n_kv_heads) * p->seq_len, sizeof(float));
+    BT.mpart_n = (size_t)SPEC_MAX_TOK * p->n_heads * (P.nth > 1 ? P.nth : 1) * (head_size + 2);
+    BT.mpart = calloc(BT.mpart_n, sizeof(float));
     if (p->n_experts > 0) {
         size_t S = B * p->n_active, E = p->n_experts, mh = p->moe_hidden;
         BT.router = calloc(B * E, sizeof(float));
@@ -2433,18 +2576,17 @@ static void init_batch(Transformer* t) {
  * logits of every position as an (n, vocab) array (row i = distribution after token i). */
 #define SPEC_MAX SPEC_MAX_TOK
 // the batched / multi-token paths support dense models with q_dim == dim and no qk-norm
-static int needs_token_path(const Config* p) { return p->n_experts > 0 || p->qk_norm || p->q_dim != p->dim; }
 static float* SPEC_LOGITS = NULL;
 float* forward_all(Transformer* transformer, const int* tokens, int n, int pos0) {
     use_model(transformer);
     int V = transformer->config.vocab_size;
     if (!SPEC_LOGITS) SPEC_LOGITS = malloc((size_t)SPEC_MAX * V * sizeof(float));
-    if (n == 1 || needs_token_path(&transformer->config)) {
-        for (int i = 0; i < n; i++) memcpy(SPEC_LOGITS + (size_t)i * V, forward(transformer, tokens[i], pos0 + i), V * sizeof(float));
+    if (n == 1) {
+        memcpy(SPEC_LOGITS, forward(transformer, tokens[0], pos0), V * sizeof(float));
         return SPEC_LOGITS;
     }
     Config* p = &transformer->config;
-    int dim = p->dim, hs2 = p->dim / p->n_heads / 2;
+    int dim = p->dim, hs2 = p->head_dim / 2;
     P.t = transformer;
     BT.B = n;
     BT.pos0 = pos0;
@@ -3575,6 +3717,9 @@ static int chat_reply(Transformer *tr, Tokenizer *tk, Sampler *sp, ChatHistory *
   float *own = malloc((size_t)V * sizeof(float)); // logits we own (the shared buffers get overwritten)
   memcpy(own, logits, (size_t)V * sizeof(float));
   int pending = -1; // a token already sampled (after a rejected draft) but not yet fed
+  const int moe = tr->config.n_experts > 0;
+  int spec_len = moe && SPEC_K > 4 ? 4 : SPEC_K; // current prompt-lookup draft length (adaptive for MoE)
+  int spec_cool = 0, spec_wait = 0; // MoE: after rejected drafts, skip lookups for a growing number of tokens
   *ended = 0;
   for (;;) {
     int next = pending >= 0 ? pending : sample(sp, own);
@@ -3597,9 +3742,10 @@ static int chat_reply(Transformer *tr, Tokenizer *tk, Sampler *sp, ChatHistory *
     seq[0] = next;
     int from_model = 0;
     int room = h->cap - h->n - 1;
-    if (SPEC_K > 0) {
+    if (SPEC_K > 0 && spec_wait > 0) spec_wait--;
+    else if (SPEC_K > 0) {
       h->tok[h->n] = next; // temporarily, for the lookup
-      int kmax = SPEC_K < room ? SPEC_K : room;
+      int kmax = spec_len < room ? spec_len : room;
       if (kmax > SPEC_MAX - 1) kmax = SPEC_MAX - 1;
       k = kmax > 0 ? ngram_draft(h->tok, h->n + 1, seq + 1, kmax) : 0;
     }
@@ -3629,6 +3775,12 @@ static int chat_reply(Transformer *tr, Tokenizer *tk, Sampler *sp, ChatHistory *
       (*gen)++;
     }
     SPEC_ACCEPTED += acc;
+    if (!from_model && moe) { // MoE: a verification step costs ~1.4x (2 tokens) .. 2.5x (8): adapt the draft length
+      if (acc == k) spec_len = spec_len * 2 < SPEC_K ? spec_len * 2 : SPEC_K;
+      else spec_len = acc + 1 > 2 ? acc + 1 : 2;
+      if (acc == 0) { spec_cool = spec_cool ? (spec_cool * 2 < 32 ? spec_cool * 2 : 32) : 2; spec_wait = spec_cool; }
+      else spec_cool = 0;
+    }
     h->n = base + 1 + acc; // positions after this hold rejected drafts: they get overwritten
     if (from_model) DRAFT_POS = base + 1 + (acc < k - 1 ? acc : k - 1); // draft cache: next, accepted drafts
     if (stop) break;
@@ -3876,11 +4028,6 @@ int main(int argc, char *argv[]) {
 #endif
   build_transformer(&transformer, checkpoint_path, ctx);
   init_pool(&transformer, nthreads);
-  if (needs_token_path(&transformer.config) && (SPEC_K > 0 || draft_path)) {
-    // no multi-token path for this model yet: speculation would only cost time
-    SPEC_K = 0;
-    draft_path = NULL;
-  }
   Transformer draft;
   if (draft_path) {
     build_transformer(&draft, draft_path, transformer.config.seq_len);

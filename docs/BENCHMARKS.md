@@ -66,6 +66,19 @@ finer attention chunks (16 positions), Megatron-style column split of wo/w2 (two
 barriers per layer instead of four: +1% on MoE, 0 on 8B, +10 GB and +5 s load).
 The remaining waiting (~30%) is load skew at ~12 barriers per layer, not barrier latency.
 
+## Speculative decoding, Qwen3-30B-A3B (MoE), 2 sockets, greedy, prompt lookup (`-k 8`)
+
+| Task | plain | speculative | drafts accepted |
+|---|---|---|---|
+| fix typos in a Russian paragraph | 70 | **144–152** | 104/117 |
+| print a file read with `cat` (context 1.6k) | 48–51 | **100** | 454/581 |
+| free-form story | 68 | 67 | 15/75 |
+
+A MoE verification step costs more than a dense one (each token brings its own experts): B=2 1.2–1.4x,
+B=4 1.8–1.9x, B=8 2.5–3.3x of a single step. The draft length adapts (doubling on full acceptance,
+shrinking to the accepted length), and after a fully rejected draft the lookup pauses for 2, 4, ... 32
+tokens, so free text loses almost nothing.
+
 ## Speculative decoding (Llama 3.1 8B Q8, 2 sockets, greedy)
 
 | Task | plain | prompt lookup (`-k 8`) | + draft Llama 3.2 1B (`-d`) |
@@ -75,7 +88,8 @@ The remaining waiting (~30%) is load skew at ~12 barriers per layer, not barrier
 | free-form story | 31.1 | 31.9 | **46.5** |
 
 Cost of one multi-token step relative to a single-token step (8B, 2 sockets):
-B=2: 1.03x, B=4: 1.04x, B=8: 1.11x, B=16: 1.37x.
+B=2: 1.03x, B=4: 1.04x, B=8: 1.11x, B=16: 1.37x. The multi-token attention splits the context into
+chunks (online-softmax merge): at 1.6k context, 3B, B=2 costs 1.05x instead of 2.8x.
 
 ## Profile (Llama 3.2 3B Q8, 1 socket, 96 threads)
 
