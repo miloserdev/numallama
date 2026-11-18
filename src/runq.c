@@ -110,6 +110,7 @@ typedef struct {
   float *bq, *bk, *bv;     // (layer, q_dim) / (layer, kv_dim) qkv biases (Qwen2), or NULL
   float *q_norm, *k_norm;  // (layer, head_dim) per-head RMSNorm weights (Qwen3), or NULL
   QuantizedTensor *wg;     // MoE router (layer, n_experts, dim), or NULL; w1/w3 are then (layer, n_experts * moe_hidden, dim)
+  QuantizedTensor *wg_node[8]; // per NUMA node: a node-local copy of the router (every node routes on its own)
                            // and w2 (layer, n_experts * dim, moe_hidden): expert e owns a contiguous block of rows
   // (optional) classifier weights for the logits, on the last layer
   QuantizedTensor *wcls;
@@ -461,6 +462,26 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weigh
   }
   fclose(file);
   dequantize(weights->q_tokens, weights->token_embedding_table, config->vocab_size * config->dim);
+  for (int k = 0; k < NN; k++) weights->wg_node[k] = weights->wg;
+#if defined(__linux__)
+  if (NN > 1 && config->n_experts > 0) { // the router is small (n_experts x dim): replicate it on every node
+    size_t qb = (size_t)config->n_experts * config->dim, sb = qb / GS * sizeof(float);
+    size_t per = ((qb + sb) + 4095) & ~(size_t)4095;
+    for (int k = 0; k < NN; k++) {
+      QuantizedTensor *c = malloc(config->n_layers * sizeof(QuantizedTensor));
+      char *mem = aligned_alloc(4096, per * config->n_layers);
+      bind_range(mem, per * config->n_layers, NODE_ID[k]);
+      for (int l = 0; l < config->n_layers; l++) {
+        c[l].q = (int8_t *)(mem + per * l);
+        c[l].s = (float *)(mem + per * l + qb);
+        c[l].bits = 8;
+        memcpy(c[l].q, weights->wg[l].q, qb);
+        memcpy(c[l].s, weights->wg[l].s, sb);
+      }
+      weights->wg_node[k] = c;
+    }
+  }
+#endif
 }
 
 void build_transformer(Transformer *t, char *checkpoint_path, int ctx) {
@@ -560,12 +581,11 @@ void softmax(float *x, int size) {
 // cheaper than an extra barrier for models of this size.
 
 typedef struct {
-    float* xb;     // (dim,) private normalized input / attention output
+    _Alignas(128) float* xb; // (dim,) private normalized input / attention output (padded: no false sharing)
     int8_t* q;     // (max(dim, hidden_dim),) private quantized activations
     float* s;      // scale factors for q
     float* rope_c; // (head_size/2,) cos for the current position
     float* rope_s; // (head_size/2,) sin for the current position
-    int lsense;    // barrier local sense
     int node;      // NUMA node index (0..NN-1) of this thread
     int ltid, nthn; // index within the node, threads of the node
     int lsense_node; // node barrier local sense
@@ -583,9 +603,8 @@ typedef struct {
     ThreadBuf* tb;
     float* part;        // (n_heads * C, head_size + 2) attention partials: max, sum, acc
     double* rope_freq;  // (head_size/2,)
-    _Alignas(64) atomic_int bar_count;   // top level of the barrier tree (one arrival per group)
+    _Alignas(64) atomic_int bar_count;   // cross-node level of the barrier tree (one arrival per node)
     _Alignas(64) atomic_int bar_sense;
-    struct BarGroup { _Alignas(64) atomic_int c; }* bar_group; // first level: groups of BAR_GROUP threads
     _Alignas(64) atomic_int go;
     _Alignas(64) atomic_int sleepers;   // workers blocked in futex_wait on `go`
     atomic_int quit;
@@ -598,27 +617,33 @@ static Pool P;
  * instead of making everybody wait at the next barrier. */
 // phase k of a token, d-row matrix: the threads of a node take blocks of that node's rows only
 // (the counters of a node live in that node's memory: a remote atomic per block was a bottleneck)
+// Guided schedule over [0, n): tickets 0..nbig-1 are big chunks, the last quarter of the range goes
+// in 4-row tickets, so the phase ends with short pieces instead of a long tail of one big chunk
+// (under full memory load a thread streams only ~2 GB/s, a 16-row chunk would take ~15 us).
+static inline int grab_ticket(atomic_int* ctr, int n, int nthn, int* b0, int* b1) {
+    int chunk = (n / (nthn * 4) + 3) & ~3;
+    if (chunk < 16) chunk = 16;
+    int nbig = (n - n / 4) / chunk;
+    int t = atomic_fetch_add_explicit(ctr, 1, memory_order_relaxed);
+    int b, e;
+    if (t < nbig) { b = t * chunk; e = b + chunk; }
+    else { b = nbig * chunk + (t - nbig) * 4; e = b + 4; }
+    if (b >= n) return 0;
+    *b0 = b;
+    *b1 = e < n ? e : n;
+    return 1;
+}
 static inline int grab_rows(int k, int d, const ThreadBuf* tb, int* r0, int* r1) {
     int lo, hi;
     node_rows(d, tb->node, &lo, &hi);
-    int n = hi - lo;
-    int chunk = (n / (tb->nthn * 4) + 3) & ~3;
-    if (chunk < 16) chunk = 16;
-    int b = atomic_fetch_add_explicit(&P.work[tb->node][P.seq & 1][k].v, chunk, memory_order_relaxed);
-    if (b >= n) return 0;
-    *r0 = lo + b;
-    *r1 = lo + (b + chunk < n ? b + chunk : n);
+    if (!grab_ticket(&P.work[tb->node][P.seq & 1][k].v, hi - lo, tb->nthn, r0, r1)) return 0;
+    *r0 += lo;
+    *r1 += lo;
     return 1;
 }
 // like grab_rows, over a node-local virtual range [0, n) (MoE: the node's halves of the selected experts)
 static inline int grab_virtual(int k, int n, const ThreadBuf* tb, int* r0, int* r1) {
-    int chunk = (n / (tb->nthn * 4) + 15) & ~15;
-    if (chunk < 16) chunk = 16;
-    int b = atomic_fetch_add_explicit(&P.work[tb->node][P.seq & 1][k].v, chunk, memory_order_relaxed);
-    if (b >= n) return 0;
-    *r0 = b;
-    *r1 = b + chunk < n ? b + chunk : n;
-    return 1;
+    return grab_ticket(&P.work[tb->node][P.seq & 1][k].v, n, tb->nthn, r0, r1);
 }
 // rows [e*rows, (e+1)*rows) of a tensor as a tensor of its own (an expert of a MoE layer)
 static inline QuantizedTensor expert_view(const QuantizedTensor* t, int e, int rows, int cols) {
@@ -726,60 +751,68 @@ static void barrier(ThreadBuf* tb) {
     barrier_impl(tb);
 #endif
 }
-/* Two-level barrier: threads arrive at the counter of their group of BAR_GROUP, the last one of
- * each group arrives at the top counter, the very last releases everybody through one sense flag.
- * 96 threads: ~2.3 us instead of ~8.7 us for a single counter (fewer serialized atomics on one line). */
+/* Barriers are trees: threads arrive at the counter of their group of BAR_GROUP, the last one of
+ * each group arrives at the node counter, the last one of the node either releases the node
+ * (node barrier) or first meets the representatives of the other nodes (global barrier). All
+ * spinning happens on a node-local line; only NN threads touch the cross-socket counter. */
 #define BAR_GROUP 8
+static void node_arrive_release(ThreadBuf* tb, int global);
 static void barrier_impl(ThreadBuf* tb) {
-    const int nth = P.nth;
-    if (nth == 1) return;
-    const int tid = (int)(tb - P.tb);
-    const int g = tid / BAR_GROUP, ngroups = (nth + BAR_GROUP - 1) / BAR_GROUP;
-    const int gsize = (g == ngroups - 1) ? nth - g * BAR_GROUP : BAR_GROUP;
-    int sense = (tb->lsense ^= 1);
-    if (atomic_fetch_add_explicit(&P.bar_group[g].c, 1, memory_order_acq_rel) == gsize - 1) {
-        atomic_store_explicit(&P.bar_group[g].c, 0, memory_order_relaxed);
-        if (atomic_fetch_add_explicit(&P.bar_count, 1, memory_order_acq_rel) == ngroups - 1) {
-            atomic_store_explicit(&P.bar_count, 0, memory_order_relaxed);
-            atomic_store_explicit(&P.bar_sense, sense, memory_order_release);
-            return;
-        }
-    }
-    while (atomic_load_explicit(&P.bar_sense, memory_order_acquire) != sense) { cpu_relax(); }
+    if (P.nth == 1) return;
+    node_arrive_release(tb, NN > 1);
 }
 
 /* Per-node cooperation. The input vector of every matmul (normalized + quantized) is produced
  * once per NUMA node by all threads of that node, each doing a slice, into a node-local buffer.
  * Every cache line of the shared fp32 activations crosses the socket link once per node instead
  * of once per thread, and nobody repeats the whole rmsnorm/quantization. */
+struct BarGroup { _Alignas(64) atomic_int c; };
 typedef struct {
     int8_t* q;     // quantized input vector (max(dim, hidden_dim))
     float* s;      // its scales
     float* ss;     // per-thread partial sums of squares (one per cache line)
-    struct BarGroup* grp;
-    _Alignas(64) atomic_int top;
-    _Alignas(64) atomic_int sense;
+    struct NodeSync* sy; // barrier state of the node, in a page bound to the node
+    float* router;       // MoE router logits computed by the node (every node routes on its own)
 } NodeBuf;
+struct NodeSync {
+    _Alignas(64) atomic_int top;   // arrivals of the node's groups
+    _Alignas(64) atomic_int sense; // release flag the node's threads spin on
+    _Alignas(64) int xs;           // sense of the cross-node level (touched by the node's representative only)
+    _Alignas(64) struct BarGroup grp[64];
+};
 static NodeBuf NB[MAX_NODES];
+static int P_qmax = 0; // longest quantized node vector (NB slot size)
 static int P_max_layers = 0; // most layers of any loaded model (work counter reset range)
 #define SPEC_MAX_TOK 16 // tokens per multi-token decode step (speculative verification)
 static void quantize_vec(int8_t* q, float* s, const float* x, int n);
 
-static void node_barrier(ThreadBuf* tb) {
-    if (tb->nthn == 1) return;
-    NodeBuf* nb = &NB[tb->node];
+static void node_arrive_release(ThreadBuf* tb, int global) {
+    struct NodeSync* sy = NB[tb->node].sy;
     const int g = tb->ltid / BAR_GROUP, ngroups = (tb->nthn + BAR_GROUP - 1) / BAR_GROUP;
     const int gsize = (g == ngroups - 1) ? tb->nthn - g * BAR_GROUP : BAR_GROUP;
     int sense = (tb->lsense_node ^= 1);
-    if (atomic_fetch_add_explicit(&nb->grp[g].c, 1, memory_order_acq_rel) == gsize - 1) {
-        atomic_store_explicit(&nb->grp[g].c, 0, memory_order_relaxed);
-        if (atomic_fetch_add_explicit(&nb->top, 1, memory_order_acq_rel) == ngroups - 1) {
-            atomic_store_explicit(&nb->top, 0, memory_order_relaxed);
-            atomic_store_explicit(&nb->sense, sense, memory_order_release);
+    if (atomic_fetch_add_explicit(&sy->grp[g].c, 1, memory_order_acq_rel) == gsize - 1) {
+        atomic_store_explicit(&sy->grp[g].c, 0, memory_order_relaxed);
+        if (atomic_fetch_add_explicit(&sy->top, 1, memory_order_acq_rel) == ngroups - 1) {
+            atomic_store_explicit(&sy->top, 0, memory_order_relaxed);
+            if (global) { // the node's representative meets the other nodes
+                int xs = (sy->xs ^= 1);
+                if (atomic_fetch_add_explicit(&P.bar_count, 1, memory_order_acq_rel) == NN - 1) {
+                    atomic_store_explicit(&P.bar_count, 0, memory_order_relaxed);
+                    atomic_store_explicit(&P.bar_sense, xs, memory_order_release);
+                } else {
+                    while (atomic_load_explicit(&P.bar_sense, memory_order_acquire) != xs) { cpu_relax(); }
+                }
+            }
+            atomic_store_explicit(&sy->sense, sense, memory_order_release);
             return;
         }
     }
-    while (atomic_load_explicit(&nb->sense, memory_order_acquire) != sense) { cpu_relax(); }
+    while (atomic_load_explicit(&sy->sense, memory_order_acquire) != sense) { cpu_relax(); }
+}
+static void node_barrier(ThreadBuf* tb) {
+    if (tb->nthn == 1) return;
+    node_arrive_release(tb, 0);
 }
 
 // groups [g0, g1) of an n-vector handled by this thread inside its node
@@ -1086,6 +1119,18 @@ static void forward_thread(int tid) {
     int r0, r1;
     const int8_t* nq = NB[tb->node].q; // the node's quantized matmul input
     const float* ns = NB[tb->node].s;
+    // head locality: the q/k/v rows a node computes are exactly the heads of its kv groups (true when the
+    // node split falls on kv group boundaries), so q/k/v, qk-norm and attention only need node barriers
+    int g0, g1, hl = 1;
+    for (int k = 0; k < NN; k++) {
+        int a, b, lo, hi;
+        node_groups(p->n_kv_heads, k, &a, &b);
+        node_rows(q_dim, k, &lo, &hi);
+        if (lo != a * kv_mul * head_size || hi != b * kv_mul * head_size) hl = 0;
+        node_rows(kv_dim, k, &lo, &hi);
+        if (lo != a * head_size || hi != b * head_size) hl = 0;
+    }
+    node_groups(p->n_kv_heads, tb->node, &g0, &g1);
 
     if (tb->ltid == 0) { // node-local reset of the counter set of the next token (unused now)
         struct WorkCounter* wc = P.work[tb->node][(P.seq + 1) & 1];
@@ -1138,26 +1183,27 @@ static void forward_thread(int tid) {
             if (w->bv) for (int i = r0; i < r1; i++) s->v[i] += w->bv[(size_t)l * kv_dim + i];
             for (int i = r0; i < r1; i++) { vc[(size_t)(i / head_size) * p->seq_len * head_size + i % head_size] = s->v[i]; }
         }
-        barrier(tb);
+        if (hl) node_barrier(tb); else barrier(tb);
         if (qkn) { // per-head q/k RMSNorm + RoPE (needs whole heads), k into the cache
-            for (int task = tid; task < n_heads + p->n_kv_heads; task += P.nth) {
-                if (task < n_heads) {
-                    head_norm_rope(s->q + (size_t)task * head_size, w->q_norm + (size_t)l * head_size, head_size, tb->rope_c, tb->rope_s);
+            // heads of the node's kv groups: q heads [g0*kv_mul, g1*kv_mul), k heads [g0, g1)
+            int t0 = hl ? g0 * kv_mul : 0, tq = hl ? (g1 - g0) * kv_mul : n_heads, tk = hl ? g1 - g0 : p->n_kv_heads;
+            int me = hl ? tb->ltid : tid, nme = hl ? tb->nthn : P.nth;
+            for (int task = me; task < tq + tk; task += nme) {
+                if (task < tq) {
+                    head_norm_rope(s->q + (size_t)(t0 + task) * head_size, w->q_norm + (size_t)l * head_size, head_size, tb->rope_c, tb->rope_s);
                 } else {
-                    int g = task - n_heads;
+                    int g = (hl ? g0 : 0) + task - tq;
                     float* kv = s->k + (size_t)g * head_size;
                     head_norm_rope(kv, w->k_norm + (size_t)l * head_size, head_size, tb->rope_c, tb->rope_s);
                     memcpy(kc + (size_t)g * p->seq_len * head_size, kv, head_size * sizeof(float));
                 }
             }
-            barrier(tb);
+            if (hl) node_barrier(tb); else barrier(tb);
         }
 
         PROF(tid, PH_ATT);
         // attention: work items are (kv head group, chunk of the context); the kv_mul query heads
         // sharing a kv head are processed together so K and V are read once. Merged with online softmax.
-        int g0, g1;
-        node_groups(p->n_kv_heads, tb->node, &g0, &g1);
         // few kv heads (GQA): also split the query heads of a group into HS subsets so that
         // every thread of the node gets an item; K/V are then read once per subset
         int HS = 1;
@@ -1205,12 +1251,14 @@ static void forward_thread(int tid) {
                 pr[1] = sum[r];
             }
         }
-        barrier(tb);
+        if (hl) node_barrier(tb); else barrier(tb);
 
         PROF(tid, PH_MERGE);
         // merge the partials of this thread's slice of heads and quantize them into the node buffer
-        // (head_size is a multiple of GS, so a head is a whole number of quantization groups)
-        int h0 = (int)((long)n_heads * tb->ltid / tb->nthn), h1 = (int)((long)n_heads * (tb->ltid + 1) / tb->nthn);
+        // (head_size is a multiple of GS, so a head is a whole number of quantization groups).
+        // Head-local: a node merges only its own heads and writes them into the buffers of all nodes.
+        int hb0 = hl ? g0 * kv_mul : 0, nhm = hl ? (g1 - g0) * kv_mul : n_heads;
+        int h0 = hb0 + (int)((long)nhm * tb->ltid / tb->nthn), h1 = hb0 + (int)((long)nhm * (tb->ltid + 1) / tb->nthn);
         for (int h = h0; h < h1; h++) {
             float* xb = tb->xb + h * head_size;
             const float* ph = P.part + (size_t)h * C * (head_size + 2);
@@ -1230,14 +1278,24 @@ static void forward_thread(int tid) {
             }
             float inv = 1.0f / den;
             for (int i = 0; i < head_size; i++) { xb[i] *= inv; }
-            quantize_vec(NB[tb->node].q + (size_t)h * head_size, NB[tb->node].s + h * head_size / GS, xb, head_size);
+            // into the second slot of the node buffers: the other node may still be reading the first
+            // (its q/k/v input) when this node writes its heads there
+            int8_t* hq = NB[tb->node].q + P_qmax + (size_t)h * head_size;
+            float* hsc = NB[tb->node].s + P_qmax / GS + h * head_size / GS;
+            quantize_vec(hq, hsc, xb, head_size);
+            if (hl)
+                for (int k = 0; k < NN; k++)
+                    if (k != tb->node) {
+                        memcpy(NB[k].q + P_qmax + (size_t)h * head_size, hq, head_size);
+                        memcpy(NB[k].s + P_qmax / GS + h * head_size / GS, hsc, head_size / GS * sizeof(float));
+                    }
         }
-        node_barrier(tb);
+        if (hl && NN > 1) barrier(tb); else node_barrier(tb);
 
         PROF(tid, PH_WO);
         // output projection + residual
         while (grab_rows(WORK_PHASES * l + 3, dim, tb, &r0, &r1)) {
-            matmul_rows(s->xb2, nq, ns, w->wo + l, q_dim, r0, r1);
+            matmul_rows(s->xb2, nq + P_qmax, ns + P_qmax / GS, w->wo + l, q_dim, r0, r1);
             for (int i = r0; i < r1; i++) { x[i] = xin[i] + s->xb2[i]; }
         }
         barrier(tb);
@@ -1249,11 +1307,13 @@ static void forward_thread(int tid) {
         PROF(tid, PH_W13);
         if (p->n_experts > 0) { // ---- MoE FFN
             const int E = p->n_experts, A = p->n_active, mh = p->moe_hidden;
-            while (grab_rows(WORK_PHASES * l + 6, E, tb, &r0, &r1)) matmul_rows(s->router, nq, ns, w->wg + l, dim, r0, r1);
-            barrier(tb);
+            // every node computes all router logits from its own copy of the router (node barrier only)
+            float* rl = NB[tb->node].router;
+            while (grab_virtual(WORK_PHASES * l + 6, E, tb, &r0, &r1)) matmul_rows(rl, nq, ns, w->wg_node[tb->node] + l, dim, r0, r1);
+            node_barrier(tb);
             int sel[MOE_MAX_ACTIVE];
             float wt[MOE_MAX_ACTIVE];
-            moe_route(s->router, E, A, p->norm_topk, sel, wt); // same result in every thread
+            moe_route(rl, E, A, p->norm_topk, sel, wt); // same result in every thread
             int lo, hi;
             node_rows(mh, tb->node, &lo, &hi);
             const int half = hi - lo;
@@ -1493,6 +1553,20 @@ static inline void wake_workers(void) {
     if (atomic_load(&P.sleepers) > 0) syscall(SYS_futex, &P.go, FUTEX_WAKE_PRIVATE, INT32_MAX, NULL, NULL, 0);
 }
 
+static void sample_thread(int tid);
+// RUNQ_BARBENCH=1: measure the synchronization primitives alone (us per barrier)
+static double now_us(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e6 + ts.tv_nsec * 1e-3; }
+static void barrier_bench_thread(int tid) {
+    ThreadBuf* tb = &P.tb[tid];
+    const int R = 20000;
+    double t0 = now_us();
+    for (int i = 0; i < R; i++) barrier(tb);
+    double t1 = now_us();
+    for (int i = 0; i < R; i++) node_barrier(tb);
+    barrier(tb);
+    double t2 = now_us();
+    if (tid == 0) fprintf(stderr, "[barrier bench] %d threads: global %.2f us, node %.2f us\n", P.nth, (t1 - t0) / R, (t2 - t1) / R);
+}
 static void* pool_worker(void* arg) {
     int tid = (int)(intptr_t)arg;
     pin_thread(tid);
@@ -1500,7 +1574,9 @@ static void* pool_worker(void* arg) {
     for (;;) {
         seen = wait_for_work(seen);
         if (atomic_load_explicit(&P.quit, memory_order_acquire)) break;
-        if (P.mode == 1) forward_batch_thread(tid);
+        if (P.mode == 4) sample_thread(tid);
+        else if (P.mode == 3) barrier_bench_thread(tid);
+        else if (P.mode == 1) forward_batch_thread(tid);
         else if (P.mode == 2) forward_multi_thread(tid);
         else forward_thread(tid);
     }
@@ -1581,8 +1657,11 @@ void init_pool(Transformer* t, int nth) {
     int qmax = p->dim > p->hidden_dim ? p->dim : p->hidden_dim;
     if (p->q_dim > qmax) qmax = p->q_dim;
     if (p->n_experts > 0 && p->n_active * p->moe_hidden > qmax) qmax = p->n_active * p->moe_hidden;
+    P_qmax = qmax;
+    if (p->n_experts > 4096) { fprintf(stderr, "at most 4096 experts are supported\n"); exit(EXIT_FAILURE); }
     if (p->n_active > MOE_MAX_ACTIVE) { fprintf(stderr, "at most %d active experts are supported\n", MOE_MAX_ACTIVE); exit(EXIT_FAILURE); }
-    P.tb = calloc(nth, sizeof(ThreadBuf));
+    P.tb = aligned_alloc(128, nth * sizeof(ThreadBuf));
+    memset(P.tb, 0, nth * sizeof(ThreadBuf));
     for (int i = 0; i < nth; i++) {
         P.tb[i].xb = calloc(p->q_dim > p->dim ? p->q_dim : p->dim, sizeof(float));
         P.tb[i].q = calloc(qmax, sizeof(int8_t));
@@ -1617,15 +1696,21 @@ void init_pool(Transformer* t, int nth) {
         memset(NB[k].q, 0, qb);
         memset(NB[k].s, 0, sb);
         memset(NB[k].ss, 0, ssb);
-        NB[k].grp = aligned_alloc(64, (size_t)((nthn + BAR_GROUP - 1) / BAR_GROUP) * sizeof(*NB[k].grp));
-        for (int g = 0; g < (nthn + BAR_GROUP - 1) / BAR_GROUP; g++) atomic_store(&NB[k].grp[g].c, 0);
-        atomic_store(&NB[k].top, 0);
-        atomic_store(&NB[k].sense, 0);
+        if ((nthn + BAR_GROUP - 1) / BAR_GROUP > 64) { fprintf(stderr, "too many threads per node\n"); exit(EXIT_FAILURE); }
+        size_t syb = (sizeof(struct NodeSync) + 4095) & ~(size_t)4095;
+        NB[k].sy = aligned_alloc(4096, syb);
+#if defined(__linux__)
+        if (NN > 1) bind_range(NB[k].sy, syb, NODE_ID[k]);
+#endif
+        memset(NB[k].sy, 0, syb);
+        NB[k].router = aligned_alloc(4096, 4096 * sizeof(float));
+#if defined(__linux__)
+        if (NN > 1) bind_range(NB[k].router, 4096 * sizeof(float), NODE_ID[k]);
+#endif
+        memset(NB[k].router, 0, 4096 * sizeof(float));
     }
     atomic_store(&P.bar_count, 0);
     atomic_store(&P.bar_sense, 0);
-    P.bar_group = aligned_alloc(64, (size_t)((nth + BAR_GROUP - 1) / BAR_GROUP) * sizeof(*P.bar_group));
-    for (int g = 0; g < (nth + BAR_GROUP - 1) / BAR_GROUP; g++) atomic_store(&P.bar_group[g].c, 0);
     atomic_store(&P.go, 0);
     atomic_store(&P.sleepers, 0);
     atomic_store(&P.quit, 0);
@@ -1650,6 +1735,12 @@ void init_pool(Transformer* t, int nth) {
             fprintf(stderr, "pthread_create failed\n");
             exit(EXIT_FAILURE);
         }
+    }
+    if (getenv("RUNQ_BARBENCH")) {
+        P.mode = 3;
+        wake_workers();
+        barrier_bench_thread(0);
+        P.mode = 0;
     }
 }
 
@@ -2731,9 +2822,123 @@ float random_f32(unsigned long long *state) { // random float32 in [0,1)
   return (random_u32(state) >> 8) / 16777216.0f;
 }
 
+/* Parallel sampling on the thread pool (the vocabulary is 128-152k entries: a serial softmax +
+ * nucleus scan cost ~1.3 ms per token, more than 5% of a 30B-A3B decode step). Every thread takes a
+ * static slice of the logits: (1) its max and sum of exp((l - max) / T) (or its argmax), barrier,
+ * (2) the global max M and normalizer Z (online-softmax merge), and the slice's nucleus candidates
+ * l >= M + T * ln(cutoff * Z), i.e. probability >= (1 - topp) / (n - 1) exactly as in sample_topp.
+ * Thread 0 then sorts the few candidates. Same distribution as the serial code. */
+static struct {
+  const float *l;
+  int n;
+  float T, lnc; // temperature (0: argmax), ln of the nucleus cutoff probability
+  float *m, *z; // per-thread max / partial normalizer (stride 16: one cache line per thread)
+  int *arg, *cnt;
+  int *cand;    // candidate indices, thread t writes from the start of its slice
+  float M, Z;
+} SP;
+static void sample_thread(int tid) {
+  ThreadBuf *tb = &P.tb[tid];
+  const int n = SP.n, nth = P.nth;
+  const int i0 = (int)((long)n * tid / nth), i1 = (int)((long)n * (tid + 1) / nth);
+  const float *l = SP.l;
+  float m = -FLT_MAX;
+  int am = i0;
+  for (int i = i0; i < i1; i++) if (l[i] > m) { m = l[i]; am = i; }
+  SP.m[tid * 16] = m;
+  SP.arg[tid * 16] = am;
+  if (SP.T > 0.0f) {
+    const float it = 1.0f / SP.T;
+    float z = 0.0f;
+    for (int i = i0; i < i1; i++) z += expf((l[i] - m) * it);
+    SP.z[tid * 16] = z;
+  }
+  barrier(tb);
+  if (SP.T <= 0.0f) return;
+  float M = -FLT_MAX, Z = 0.0f;
+  for (int t = 0; t < nth; t++) M = SP.m[t * 16] > M ? SP.m[t * 16] : M;
+  for (int t = 0; t < nth; t++) Z += SP.z[t * 16] * expf((SP.m[t * 16] - M) / SP.T);
+  const float thr = M + SP.T * (SP.lnc + logf(Z));
+  int c = 0;
+  for (int i = i0; i < i1; i++) if (l[i] >= thr) SP.cand[i0 + c++] = i;
+  SP.cnt[tid * 16] = c;
+  if (tid == 0) { SP.M = M; SP.Z = Z; }
+  barrier(tb);
+}
+// builds the sorted nucleus of logits / T (0 < topp < 1) in pi; returns its size (all candidates),
+// sets *last (last index inside the nucleus) and *cum (its probability mass)
+static int par_nucleus(Sampler *sp, const float *logits, ProbIndex *pi, int *last, float *cum) {
+  int n = sp->vocab_size;
+  if (!SP.m) {
+    SP.m = aligned_alloc(64, (size_t)P.nth * 16 * sizeof(float));
+    SP.z = aligned_alloc(64, (size_t)P.nth * 16 * sizeof(float));
+    SP.arg = aligned_alloc(64, (size_t)P.nth * 16 * sizeof(int));
+    SP.cnt = aligned_alloc(64, (size_t)P.nth * 16 * sizeof(int));
+  }
+  static int cand_n = 0;
+  if (cand_n < n) { free(SP.cand); SP.cand = malloc((size_t)n * sizeof(int)); cand_n = n; }
+  SP.l = logits; SP.n = n; SP.T = sp->temperature;
+  SP.lnc = logf((1.0f - sp->topp) / (n - 1));
+  P.mode = 4;
+  wake_workers();
+  sample_thread(0);
+  P.mode = 0;
+  int n0 = 0;
+  const float iz = 1.0f / SP.Z;
+  for (int t = 0; t < P.nth; t++) {
+    int i0 = (int)((long)n * t / P.nth);
+    for (int c = 0; c < SP.cnt[t * 16]; c++) {
+      int i = SP.cand[i0 + c];
+      pi[n0].index = i;
+      pi[n0].prob = expf((logits[i] - SP.M) / SP.T) * iz;
+      n0++;
+    }
+  }
+  qsort(pi, n0, sizeof(ProbIndex), compare);
+  float cp = 0.0f;
+  int li = n0 - 1;
+  for (int i = 0; i < n0; i++) {
+    cp += pi[i].prob;
+    if (cp > sp->topp) { li = i; break; }
+  }
+  *last = li;
+  *cum = cp;
+  return n0;
+}
+static int par_argmax(const float *logits, int n) {
+  if (!SP.m) {
+    SP.m = aligned_alloc(64, (size_t)P.nth * 16 * sizeof(float));
+    SP.z = aligned_alloc(64, (size_t)P.nth * 16 * sizeof(float));
+    SP.arg = aligned_alloc(64, (size_t)P.nth * 16 * sizeof(int));
+    SP.cnt = aligned_alloc(64, (size_t)P.nth * 16 * sizeof(int));
+  }
+  SP.l = logits; SP.n = n; SP.T = 0.0f;
+  P.mode = 4;
+  wake_workers();
+  sample_thread(0);
+  P.mode = 0;
+  int best = SP.arg[0];
+  float bm = SP.m[0];
+  for (int t = 1; t < P.nth; t++) if (SP.m[t * 16] > bm) { bm = SP.m[t * 16]; best = SP.arg[t * 16]; } // first max, like sample_argmax
+  return best;
+}
+static inline int pool_ready(void) { return P.nth > 1 && P.tb != NULL; }
+
 int sample(Sampler *sampler, float *logits) {
   // sample the token given the logits and some hyperparameters
   int next;
+  if (sampler->temperature == 0.0f && pool_ready()) return par_argmax(logits, sampler->vocab_size);
+  if (sampler->temperature > 0.0f && sampler->topp > 0 && sampler->topp < 1 && pool_ready()) {
+    int last;
+    float cum;
+    par_nucleus(sampler, logits, sampler->probindex, &last, &cum);
+    float r = random_f32(&sampler->rng_state) * cum, cdf = 0.0f;
+    for (int i = 0; i <= last; i++) {
+      cdf += sampler->probindex[i].prob;
+      if (r < cdf) return sampler->probindex[i].index;
+    }
+    return sampler->probindex[last].index; // in case of rounding errors
+  }
   if (sampler->temperature == 0.0f) {
     // greedy argmax sampling: take the token with the highest probability
     next = sample_argmax(logits, sampler->vocab_size);
@@ -2762,18 +2967,22 @@ int sample(Sampler *sampler, float *logits) {
  * probability p(d) under the sampler's distribution (temperature + top-p), otherwise a sample from
  * that distribution with d removed. The output is distributed exactly like sample(). Greedy: argmax. */
 int sample_draft(Sampler *sampler, float *logits, int d) {
-  if (sampler->temperature == 0.0f) return sample_argmax(logits, sampler->vocab_size);
+  if (sampler->temperature == 0.0f) return pool_ready() ? par_argmax(logits, sampler->vocab_size) : sample_argmax(logits, sampler->vocab_size);
   int n = sampler->vocab_size;
-  for (int q = 0; q < n; q++) logits[q] /= sampler->temperature;
-  softmax(logits, n);
   ProbIndex *pi = sampler->probindex;
   int n0 = 0, last;
   float cum = 0.0f;
-  if (sampler->topp <= 0 || sampler->topp >= 1) {
+  if (sampler->topp > 0 && sampler->topp < 1 && pool_ready()) {
+    par_nucleus(sampler, logits, pi, &last, &cum);
+  } else if (sampler->topp <= 0 || sampler->topp >= 1) {
+    for (int q = 0; q < n; q++) logits[q] /= sampler->temperature;
+    softmax(logits, n);
     for (int i = 0; i < n; i++) { pi[n0].index = i; pi[n0].prob = logits[i]; n0++; }
     last = n0 - 1;
     cum = 1.0f;
   } else {
+    for (int q = 0; q < n; q++) logits[q] /= sampler->temperature;
+    softmax(logits, n);
     const float cutoff = (1.0f - sampler->topp) / (n - 1);
     for (int i = 0; i < n; i++)
       if (logits[i] >= cutoff) { pi[n0].index = i; pi[n0].prob = logits[i]; n0++; }
