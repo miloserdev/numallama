@@ -83,7 +83,7 @@ One socket only: `-N 1` (or run under `numactl`). Fewer threads: `-T <n>`. Longe
 | `scripts/export_hf_q8.py` | Hugging Face safetensors → `.bin` (Q8 / Q4, optional SmoothQuant, numpy only) |
 | `scripts/export_tokenizer.py` | `tokenizer.json` → `tokenizer.bin` |
 | `scripts/calibrate.py` | fp32 numpy activation statistics (max \|x\| for `--smooth`) |
-| `data/calibration.txt` | calibration text for `-m imatrix` (English, Russian, code) |
+| `data/calibration.txt` | calibration text for `-m imatrix` (English, Russian, Chinese, code) |
 | `config/tools.json` | tools offered to the model in chat mode |
 | `data/tokenizer.bin` | Llama 3 tokenizer |
 | `tests/` | fp32 numpy reference, tokenizer reference, engine consistency checks |
@@ -128,6 +128,13 @@ python3 scripts/calibrate.py /path/to/Qwen2.5-7B-Instruct calib.txt qwen7b.npz
 python3 scripts/export_hf_q8.py /path/to/Qwen2.5-7B-Instruct qwen7b_q80.bin --imatrix qwen7b.npz --smooth 0.5
 python3 scripts/export_tokenizer.py /path/to/Qwen2.5-7B-Instruct qwen7b_tokenizer.bin
 ```
+
+**Calibration text.** `-m imatrix` only measures which input channels of each layer carry the most
+signal; Q4 rounding then keeps the error small on those channels. It does not train the model or
+change the language it answers in. `data/calibration.txt` (~19k tokens) mixes English, Russian,
+Chinese and code (C, Python, shell), so a Q4 model keeps its quality in all three languages. If you
+mostly use another language or domain, append your own text (a few thousand tokens per language is
+enough) or pass a different file with `-i`.
 
 `calib.txt` is any natural text of a few thousand words (a mix of the languages you use). Collect
 `-m imatrix` statistics on a model exported without `--smooth`. Q4 files of the old symmetric format
