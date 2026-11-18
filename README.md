@@ -131,8 +131,9 @@ python3 scripts/export_tokenizer.py /path/to/Qwen2.5-7B-Instruct qwen7b_tokenize
 
 **Calibration text.** `-m imatrix` only measures which input channels of each layer carry the most
 signal; Q4 rounding then keeps the error small on those channels. It does not train the model or
-change the language it answers in. `data/calibration.txt` (~19k tokens) mixes English, Russian,
-Chinese and code (C, Python, shell), so a Q4 model keeps its quality in all three languages. If you
+change the language it answers in. `data/calibration.txt` (~23k tokens) is about one third English,
+one third Russian, and the rest Chinese and code (C, Python, shell), so a Q4 model keeps its quality
+in all three languages. If you
 mostly use another language or domain, append your own text (a few thousand tokens per language is
 enough) or pass a different file with `-i`.
 
