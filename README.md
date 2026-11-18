@@ -35,6 +35,45 @@ Highlights:
 See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for measurements, including a comparison with llama.cpp.
 The binary is still called `runq` (the name of the upstream int8 runtime).
 
+## Quick start
+
+Requirements: Linux, gcc or clang, Python 3 with numpy (only for converting models), and RAM for the
+model file plus a few GB. Tuned and tested on AArch64 with dotprod (Ampere Altra / Neoverse N1); other
+CPUs build with portable C fallbacks, which are not tuned or regularly tested.
+
+```bash
+# 1. build
+make                                   # -> ./runq
+
+# 2. get a model from Hugging Face (safetensors) and convert it once
+pip install numpy huggingface_hub
+hf download Qwen/Qwen3-30B-A3B-Instruct-2507 --local-dir hf/qwen3-30b
+python3 scripts/export_hf_q8.py   hf/qwen3-30b qwen3_30b_q80.bin       # int8 weights (~32 GB)
+python3 scripts/export_tokenizer.py hf/qwen3-30b qwen3_tokenizer.bin    # not needed for Llama 3 (built in)
+
+# 3. optional, 4-bit: importance statistics from the int8 model, then a Q4 export (~19 GB, faster)
+./runq qwen3_30b_q80.bin -z qwen3_tokenizer.bin -m imatrix -i data/calibration.txt -o qwen3_30b.imx
+python3 scripts/export_hf_q8.py hf/qwen3-30b qwen3_30b_q4.bin --q4 --imatrix qwen3_30b.imx
+
+# 4. chat (type a message, `exit` to quit); -f gives the model sandboxed ls/cat/grep/find
+./runq qwen3_30b_q4.bin -z qwen3_tokenizer.bin -m chat -f config/tools.json -t 0.6
+```
+
+At start the chat asks for an optional system prompt (Enter skips it). After every reply it prints the
+prompt / generation speed and how much of the context window is used. The tools see only the directory
+set by `"root"` in `config/tools.json` (by default the repository); commands run without a shell.
+
+Which model (decode speed on 2 x Altra Max, both sockets):
+
+| Model | File | Speed | Notes |
+|---|---|---|---|
+| Llama 3.2 3B Instruct, Q8 | 3.4 GB | 76 tok/s | small and fast, built-in tokenizer |
+| Qwen3-30B-A3B-Instruct-2507, Q4 | 19 GB | 91 tok/s | mixture of experts: fast and good, recommended for chat |
+| Qwen3.8-27B, Q4 | 18 GB | 17 tok/s | dense, the strongest answers; `-r 1` enables reasoning |
+| Llama 3.1 8B Instruct, Q8 / Q4 | 8.5 / 5.5 GB | 39 / 59 tok/s | |
+
+One socket only: `-N 1` (or run under `numactl`). Fewer threads: `-T <n>`. Longer context: `-c <tokens>`.
+
 ## Layout
 
 | Path | Contents |
@@ -147,4 +186,9 @@ tests/check_draft main.bin draft.bin
 
 ## License
 
-MIT (see `LICENSE`), as the upstream projects.
+The code is MIT licensed (see `LICENSE`), as the upstream projects
+[llama2.c](https://github.com/karpathy/llama2.c) and [llama3.c](https://github.com/jameswdelancey/llama3.c).
+
+`data/tokenizer.bin` is converted from the Meta Llama 3 tokenizer and is subject to the
+[Llama 3 Community License](https://www.llama.com/llama3/license/), not to the MIT license.
+Model weights are not part of this repository; converted models keep the licenses of their originals.

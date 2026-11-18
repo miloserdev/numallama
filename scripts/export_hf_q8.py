@@ -2,7 +2,7 @@
 Export a Hugging Face Llama 3.x checkpoint (model.safetensors + config.json) to the
 llama3.c int8 (version 2) format, using only numpy (no torch / safetensors needed).
 
-    python3 export_hf_q8.py /ai/models/Llama-3.2-1B-Instruct llama32_1b_instruct_q80.bin
+    python3 export_hf_q8.py /path/to/Llama-3.2-1B-Instruct llama32_1b_instruct_q80.bin
 
 Header extension (inside the 256-byte v2 header, after group_size, all little-endian):
     float rope_theta, float rope_factor, float low_freq_factor, float high_freq_factor,

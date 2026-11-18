@@ -1992,7 +1992,7 @@ static cpu_set_t P_node_mask[MAX_NODES]; // released threads may move only insid
 /* Choose CPUs on one or more NUMA nodes (most idle first). nth <= 0: automatic thread count
  * (idle CPUs of each node minus a few, at most 96 per node). Sets NN, NODE_ID, NODE_T0, P_cpus.
  * Returns the number of threads. */
-static int choose_cpus(int nth) {
+__attribute__((unused)) static int choose_cpus(int nth) {
     const char* mode = getenv("RUNQ_PIN");
     if (mode && !strcmp(mode, "0")) { NN = 1; return nth > 0 ? nth : 1; }
     cpu_set_t allowed;
@@ -4939,7 +4939,7 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
  * write the importance statistics: "NMX1", int L, dim, q_dim, hidden, E, moe_hidden, long long ntok,
  * then float32 means: att (L,dim), wo (L,q_dim), ffn (L,[E,]dim), w2 (L,[E,]hidden or moe_hidden),
  * and for MoE the int64 token counts (L,E). Collect on a model exported without --smooth. */
-static void imatrix(Transformer* t, Tokenizer* tk, const char* text_path, const char* out_path) {
+__attribute__((unused)) static void imatrix(Transformer* t, Tokenizer* tk, const char* text_path, const char* out_path) {
     Config* p = &t->config;
     FILE* f = fopen(text_path, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", text_path); exit(EXIT_FAILURE); }

@@ -4,7 +4,7 @@ static int amax(float* l, int V) { int a = 0; for (int i = 1; i < V; i++) if (l[
 int main(int argc, char** argv) {
     int nth = choose_cpus(0);
     Transformer t; build_transformer(&t, argv[1], 2048); init_pool(&t, nth);
-    Transformer d; build_transformer(&d, argv[2], 2048); init_model_runtime(&d); use_model(&t);
+    static Transformer d; build_transformer(&d, argv[2], 2048); init_model_runtime(&d); use_model(&t);
     int V = t.config.vocab_size;
     int hist[2048], n = 0; for (int i = 0; i < 43; i++) hist[n++] = (i == 0) ? 128000 : 1000 + i * 37;
     // reference: pure greedy with single-token forward

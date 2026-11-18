@@ -266,7 +266,7 @@ typedef struct {
   int max_output;
 } Tools;
 
-static int tools_load(Tools *t, const char *path) {
+__attribute__((unused)) static int tools_load(Tools *t, const char *path) {
   memset(t, 0, sizeof(*t));
   FILE *f = fopen(path, "rb");
   if (!f) { fprintf(stderr, "cannot open %s\n", path); return 0; }

@@ -4,7 +4,7 @@ llama3.c tokenizer.bin format:  int max_token_length, then for every id: float s
 The score is the BPE rank (== token id for these tiktoken-style vocabularies); ids missing from the
 vocabulary (padding up to vocab_size) get unique placeholder strings.
 
-    python3 export_tokenizer.py /ai/models/Qwen2.5-3B-Instruct qwen25_tokenizer.bin
+    python3 export_tokenizer.py /path/to/Qwen2.5-3B-Instruct qwen25_tokenizer.bin
 """
 import json
 import os
