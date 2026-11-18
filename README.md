@@ -27,6 +27,9 @@ Highlights:
 - **Batched prompt prefill** (matrix x matrix) and a **multi-token decode step**.
 - **Speculative decoding**, exact (output distribution unchanged):
   prompt lookup (n-grams from the whole dialog) and an optional small **draft model** (`-d`).
+- **OpenAI-compatible server** (`-m server`): `/v1/chat/completions` with streaming, tool calls and
+  reasoning, KV-cache reuse of the shared prefix between requests. Works with the official OpenAI
+  clients and anything built on them.
 - **Chat** with the native templates (Llama 3, ChatML), context trimming, and **tool calling**
   (`config/tools.json`: sandboxed `ls`/`cat`/`grep`/`find` via fork/execvp, no shell).
 - Correct **tiktoken-style tokenizer** (Llama 3 / Qwen2 pre-tokenizer regex + byte-level BPE).
@@ -74,12 +77,44 @@ Which model (decode speed on 2 x Altra Max, both sockets):
 
 One socket only: `-N 1` (or run under `numactl`). Fewer threads: `-T <n>`. Longer context: `-c <tokens>`.
 
+### API server
+
+```bash
+./runq qwen3_30b_q4.bin -z qwen3_tokenizer.bin -m server -P 8080 -c 32768 -t 0.7
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
+r = client.chat.completions.create(model="any", messages=[{"role": "user", "content": "Hi!"}])
+print(r.choices[0].message.content)
+```
+
+| Endpoint | Supported |
+|---|---|
+| `POST /v1/chat/completions` | `messages` (system / developer / user / assistant / tool), `stream` (SSE) with `stream_options.include_usage`, `tools` + `tool_calls` (also streamed), `tool_choice: "none"`, `temperature`, `top_p`, `seed`, `max_tokens` / `max_completion_tokens`, `stop`; Qwen3.5 / 3.8 reasoning with `reasoning_effort` or `chat_template_kwargs.enable_thinking` (returned as `reasoning_content`) |
+| `GET /v1/models` | the loaded model (named after the file) |
+| `GET /health` | `{"status": "ok"}` |
+
+- Listens on `127.0.0.1` by default; `-H 0.0.0.0` exposes it on the network, `-A <key>` then requires
+  `Authorization: Bearer <key>`. There is no TLS: put it behind a reverse proxy for public access.
+- **One request at a time.** A request already uses every core, so concurrent requests wait in the
+  queue and are served in turn; there is no batching of several users.
+- The KV cache is kept between requests: a conversation that grows turn by turn only processes the
+  new messages (`usage.prompt_tokens_details.cached_tokens`). Hybrid models (Qwen3.5 / 3.8) can
+  only resume from the end of the previous prompt.
+- The client runs the tools; the `-f` sandbox is used only by the CLI chat.
+- Not supported: `/v1/completions`, `/v1/embeddings`, images and audio, `n` > 1, `logprobs`,
+  `response_format` (JSON mode), forcing a call with `tool_choice: "required"`.
+- `tests/server_test.py` checks all of this with the official `openai` Python client.
+
 ## Layout
 
 | Path | Contents |
 |---|---|
 | `src/runq.c` | the engine: model loading, NUMA placement, thread pool, kernels, forward passes, tokenizer, sampler, chat |
 | `src/tools.h` | tool calling: minimal JSON parser, `tools.json` loading, sandboxed command execution |
+| `src/server.h` | OpenAI-compatible HTTP server (`-m server`) |
 | `scripts/export_hf_q8.py` | Hugging Face safetensors → `.bin` (Q8 / Q4, optional SmoothQuant, numpy only) |
 | `scripts/export_tokenizer.py` | `tokenizer.json` → `tokenizer.bin` |
 | `scripts/calibrate.py` | fp32 numpy activation statistics (max \|x\| for `--smooth`) |
@@ -163,6 +198,7 @@ are refused: re-export them.
 | `-N <n>` | NUMA nodes to use (default 0 = all); weights are split between them |
 | `-c <n>` | context window (KV cache size), default 8192 |
 | `-k <n>` | max prompt-lookup draft length, default 8, `0` = off (adaptive for MoE models; off for hybrid models: a recurrent state cannot drop rejected drafts) |
+| `-m server`, `-H`, `-P`, `-A` | OpenAI-compatible API server, listen address (default 127.0.0.1), port (default 8080), API key |
 | `-r <0\|1>` | Qwen3.5 / 3.8: `1` = reasoning (thinking shown dimmed), default `0` = answer directly |
 | `-o <file>` | output of `-m imatrix` (importance statistics for `--q4 --imatrix`) |
 | `-d <file>` | draft model for speculative decoding |
@@ -190,6 +226,8 @@ TOKJSON=/path/to/tokenizer.json python3 tests/tok_ref.py < corpus.txt > p.txt &&
 tests/check_batch model.bin 64 300
 tests/check_multi model.bin
 tests/check_draft main.bin draft.bin
+# OpenAI-compatible server, with the official client (pip install openai)
+./runq model.bin -m server -P 18080 & python3 tests/server_test.py http://127.0.0.1:18080/v1
 ```
 
 ## License

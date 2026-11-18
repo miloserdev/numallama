@@ -8,11 +8,11 @@ TESTS   = tests/dump_logits tests/encode tests/check_batch tests/check_multi tes
 
 all: runq
 
-runq: src/runq.c src/tools.h
+runq: src/runq.c src/tools.h src/server.h
 	$(CC) $(CFLAGS) -o $@ src/runq.c $(LDLIBS)
 
 # per-phase timing report at exit (ms per token per phase, per NUMA node)
-prof: src/runq.c src/tools.h
+prof: src/runq.c src/tools.h src/server.h
 	$(CC) $(CFLAGS) -DPROFILE -o runq_prof src/runq.c $(LDLIBS)
 
 tests: $(TESTS)

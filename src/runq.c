@@ -4646,8 +4646,28 @@ typedef struct {   // streaming state of one assistant message
   int mode;        // Llama: 0 undecided, 1 streaming text, 2 buffering a call; ChatML: 0/1 text, 2 inside <tool_call>
   int n_calls;
   int token;       // previous token (for decode)
+  int think;       // inside <think> ... </think>
   JNode **calls;
 } ReplyState;
+
+/* Where the reply text goes: the CLI prints it, the HTTP server (src/server.h) collects and streams
+ * it. The server also limits the reply length and can stop it (stop string, client gone). */
+typedef struct {
+  void (*text)(void *ctx, const char *s, int reasoning);
+  void *ctx;
+  int max_gen; // > 0: stop after this many generated tokens
+  int stop;    // set by text(): end the reply now
+} ReplySink;
+static ReplySink *g_sink = NULL; // NULL: print to stdout
+static void out_text(const char *s, int reasoning) {
+  if (g_sink) { g_sink->text(g_sink->ctx, s, reasoning); return; }
+  printf("%s", s);
+  fflush(stdout);
+}
+static void out_ctl(const char *s) { // terminal-only decoration
+  if (!g_sink) { printf("%s", s); fflush(stdout); }
+}
+static int sink_done(int gen) { return g_sink && (g_sink->stop || (g_sink->max_gen > 0 && gen >= g_sink->max_gen)); }
 
 // handle one generated (non-end) token: print it or collect it into a tool call
 static void reply_token(ReplyState *rs, Tokenizer *tk, int next) {
@@ -4660,19 +4680,22 @@ static void reply_token(ReplyState *rs, Tokenizer *tk, int next) {
     if (rs->mode == 2 && rs->n_calls < MAX_CALLS_PER_REPLY) {
       JNode *c = ARCH == ARCH_QWEN35 && strstr(buf->buf, "<function=") ? parse_xml_call(buf->buf) : normalize_call(json_parse(buf->buf, NULL));
       if (c) rs->calls[rs->n_calls++] = c;
-      else { printf("<tool_call>%s</tool_call>", buf->buf); fflush(stdout); }
+      else { out_text("<tool_call>", 0); out_text(buf->buf, 0); out_text("</tool_call>", 0); }
     }
     rs->mode = 0; // skip the whitespace between calls
   } else if (ARCH < ARCH_QWEN2 && next == LLAMA3_PYTHON_TAG) {
     rs->mode = 2;
   } else if (next >= 0 && next == QWEN_THINK) { // reasoning is shown dimmed
-    if (THINK) { printf("\033[2m"); fflush(stdout); }
+    rs->think = 1;
+    if (THINK) out_ctl("\033[2m");
   } else if (next >= 0 && next == QWEN_THINK_END) {
-    if (THINK) { printf("\033[0m\n"); fflush(stdout); }
+    rs->think = 0;
+    if (THINK) out_ctl("\033[0m\n");
     rs->mode = 0; // skip the blank lines before the answer
   } else {
     char *piece = decode(tk, rs->token, next);
-    int ok = piece && piece[0] && !(piece[1] == '\0' && !(isprint((unsigned char)piece[0]) || isspace((unsigned char)piece[0])));
+    // drop lone control bytes; bytes >= 0x80 are parts of multi-byte UTF-8 characters and must stay
+    int ok = piece && piece[0] && !(piece[1] == '\0' && (unsigned char)piece[0] < 0x20 && !isspace((unsigned char)piece[0]));
     if (ok) {
       if (rs->mode == 2) {
         sb_puts(buf, piece);
@@ -4680,11 +4703,10 @@ static void reply_token(ReplyState *rs, Tokenizer *tk, int next) {
         if (rs->mode == 0) { // skip leading whitespace of the message
           const char *p = piece;
           while (*p && isspace((unsigned char)*p)) p++;
-          if (*p) { rs->mode = 1; printf("%s", p); }
+          if (*p) { rs->mode = 1; out_text(p, rs->think); }
         } else {
-          printf("%s", piece);
+          out_text(piece, rs->think);
         }
-        fflush(stdout);
       } else { // Llama, undecided
         sb_puts(buf, piece);
         const char *p = buf->buf;
@@ -4693,8 +4715,7 @@ static void reply_token(ReplyState *rs, Tokenizer *tk, int next) {
           rs->mode = 2;
         } else if (*p) {
           rs->mode = 1;
-          printf("%s", p);
-          fflush(stdout);
+          out_text(p, 0);
         }
       }
     }
@@ -4709,7 +4730,7 @@ static void reply_token(ReplyState *rs, Tokenizer *tk, int next) {
 static int chat_reply(Transformer *tr, Tokenizer *tk, Sampler *sp, ChatHistory *h, float *logits, int *ended, int *gen,
                       JNode **calls) {
   ReplyState rs = {.mode = 0, .n_calls = 0, .token = -1, .calls = calls};
-  if (ARCH == ARCH_QWEN35 && THINK) { printf("\033[2m"); fflush(stdout); } // the prompt already opened <think>
+  if (ARCH == ARCH_QWEN35 && THINK) { out_ctl("\033[2m"); rs.think = 1; } // the prompt already opened <think>
   sb_puts(&rs.buf, "");
   const int V = tr->config.vocab_size;
   float *own = malloc((size_t)V * sizeof(float)); // logits we own (the shared buffers get overwritten)
@@ -4731,6 +4752,7 @@ static int chat_reply(Transformer *tr, Tokenizer *tk, Sampler *sp, ChatHistory *
     }
     reply_token(&rs, tk, next);
     (*gen)++;
+    if (sink_done(*gen)) break; // server: length limit, stop string or client gone
     if (h->n >= h->cap) {
       fprintf(stderr, "\n[context window full, reply truncated]");
       break;
@@ -4771,6 +4793,7 @@ static int chat_reply(Transformer *tr, Tokenizer *tk, Sampler *sp, ChatHistory *
       if (is_end_token(y)) { *ended = 1; stop = 1; break; } // the end token is already in the cache
       reply_token(&rs, tk, y);
       (*gen)++;
+      if (sink_done(*gen)) { stop = 1; break; }
     }
     SPEC_ACCEPTED += acc;
     if (!from_model && moe) { // MoE: a verification step costs ~1.4x (2 tokens) .. 2.5x (8): adapt the draft length
@@ -4787,7 +4810,7 @@ static int chat_reply(Transformer *tr, Tokenizer *tk, Sampler *sp, ChatHistory *
   if (ARCH < ARCH_QWEN2 && rs.mode == 2) {
     JNode *c = normalize_call(json_parse(rs.buf.buf, NULL));
     if (c) calls[rs.n_calls++] = c;
-    else printf("%s", rs.buf.buf); // looked like JSON but is not a call: show it as text
+    else out_text(rs.buf.buf, 0); // looked like JSON but is not a call: show it as text
   }
   free(rs.buf.buf);
   free(own);
@@ -4992,6 +5015,8 @@ __attribute__((unused)) static void imatrix(Transformer* t, Tokenizer* tk, const
 
 #ifndef TESTING
 
+#include "server.h"
+
 void error_usage() {
   fprintf(stderr, "Usage:   run <checkpoint> [options]\n");
   fprintf(stderr, "Example: run model.bin -n 4096 -i \"Once upon a time\"\n");
@@ -5002,7 +5027,11 @@ void error_usage() {
   fprintf(stderr, "  -n <int>    number of steps to run for, default 4096. 0 = max_seq_len\n");
   fprintf(stderr, "  -i <string> input prompt\n");
   fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
-  fprintf(stderr, "  -m <string> mode: generate|chat|imatrix, default: generate\n");
+  fprintf(stderr, "  -m <string> mode: generate|chat|server|imatrix, default: generate\n");
+  fprintf(stderr, "              server: OpenAI-compatible API (/v1/chat/completions, /v1/models)\n");
+  fprintf(stderr, "  -H <string> server: address to listen on, default 127.0.0.1 (0.0.0.0 = all interfaces)\n");
+  fprintf(stderr, "  -P <int>    server: port, default 8080\n");
+  fprintf(stderr, "  -A <string> server: API key the clients must send (Authorization: Bearer ...)\n");
   fprintf(stderr, "              imatrix: -i <text file> -o <out.imx> collects Q4 importance statistics\n");
   fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
   fprintf(stderr, "  -T <int>    number of threads, default 0 = auto (placed on the most idle CPUs; RUNQ_PIN=1 keeps them pinned, RUNQ_PIN=0 disables placement)\n");
@@ -5083,6 +5112,12 @@ int main(int argc, char *argv[]) {
       out_path = argv[i + 1];
     } else if (argv[i][1] == 'r') {
       THINK = atoi(argv[i + 1]);
+    } else if (argv[i][1] == 'H') {
+      SRV_HOST = argv[i + 1];
+    } else if (argv[i][1] == 'P') {
+      SRV_PORT = atoi(argv[i + 1]);
+    } else if (argv[i][1] == 'A') {
+      SRV_KEY = argv[i + 1];
     } else {
       error_usage();
     }
@@ -5155,6 +5190,13 @@ int main(int argc, char *argv[]) {
     generate(&transformer, &tokenizer, &sampler, prompt, steps);
   } else if (strcmp(mode, "chat") == 0) {
     chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
+  } else if (strcmp(mode, "server") == 0) {
+    const char *base = strrchr(checkpoint_path, '/');
+    base = base ? base + 1 : checkpoint_path;
+    char *name = strdup(base), *dot = strrchr(name, '.');
+    if (dot && !strcmp(dot, ".bin")) *dot = '\0';
+    SRV_MODEL = name;
+    server(&transformer, &tokenizer, &sampler);
   } else if (strcmp(mode, "imatrix") == 0) {
     if (!prompt || !out_path) error_usage();
     imatrix(&transformer, &tokenizer, prompt, out_path);
