@@ -11,13 +11,14 @@ Header extension (inside the 256-byte v2 header, after group_size, all little-en
     int special_start (first special token id), int bos_id, int eos_id
     int q4_mask: bit k set = matrix kind k (0 wq, 1 wk, 2 wv, 3 wo, 4 w1, 5 w2, 6 w3) is stored as Q4
     int head_dim, n_experts, n_active, moe_hidden, qk_norm, norm_topk   (Qwen3 / Qwen3-MoE; 0 = n/a)
+    int q4_format: 1 = asymmetric groups of 32 with fp16 scale + min (0 / absent: the old symmetric Q4)
 fp32 section: attention norms, ffn norms, final norm, [qkv biases], [q_norm (L, head_dim), k_norm (L, head_dim)]
 MoE layers: router wg (L, n_experts, dim) in Q8 after wo; w1/w3 (L, n_experts * moe_hidden, dim) and
 w2 (L, n_experts * dim, moe_hidden), every expert a contiguous block of rows.
 If qkv_bias, the fp32 section continues after the final norm with bq (L, dim), bk (L, kv_dim), bv (L, kv_dim).
-Q8 tensors: int8 values, then fp32 scales per `gs` values. Q4 tensors: groups of 32 values packed in
-16 bytes (byte k = value k in the low nibble, value k+16 in the high nibble, stored as q+8), then fp32
-scales per 32 values. Embedding / classifier are always Q8.
+Q8 tensors: int8 values, then fp32 scales per `gs` values. Q4 tensors (q4_format 1): groups of 32
+values u in 0..15 packed in 16 bytes (byte k = u[k] in the low nibble, u[k+16] in the high nibble), then
+per group [s, m] as two fp16 (value = s * u + m). Embedding / classifier are always Q8.
 
     python3 export_hf_q8.py <hf dir> <out.bin> [gs] [--q4 [kinds]]   kinds e.g. wq,wk,wo,w1,w3 (default all)
 Supported: LlamaForCausalLM (Llama 3.x), Qwen2ForCausalLM (Qwen2.5), Qwen3ForCausalLM, Qwen3MoeForCausalLM.
@@ -78,42 +79,58 @@ KINDS = ["wq", "wk", "wv", "wo", "w1", "w2", "w3"]
 
 
 def quantize_q4(w, gs=32, imp=None):
-    """symmetric 4-bit per group of 32. The scale is searched to minimize the squared error,
-    weighted by the importance of each input channel (mean x^2 on calibration text) if given,
-    and then refined by weighted least squares for the chosen integers."""
+    """asymmetric 4-bit per group of 32: value = s * u + m, u in 0..15, s and m in fp16.
+    For every group, candidate grids are tried (scale (15 + d) / (max - min), d in -1..1 step 0.1)
+    and for each the integers are fixed and (s, m) solved by weighted least squares; the best fit
+    wins. Weights: importance of the input channel (mean x^2 on calibration text) if given,
+    otherwise |w| + rms(group) (larger weights matter more, as in llama.cpp's k-quants).
+    Returns packed nibbles (byte k = u[k] | u[k+16] << 4) and per group [s, m] as fp16 pairs."""
     rows, cols = w.reshape(-1, w.shape[-1]).shape
     g = w.astype(np.float32).reshape(-1, gs)
     if imp is None:
-        wt = np.ones_like(g)
-    else:
-        wt = np.broadcast_to(np.asarray(imp, np.float32).reshape(1, cols // gs, gs), (rows, cols // gs, gs)).reshape(-1, gs)
-        wt = wt + 1e-8 * wt.mean()
-    amax_idx = np.abs(g).argmax(axis=1)
-    vmax = g[np.arange(len(g)), amax_idx]                 # signed value with the largest magnitude
-    vmax = np.where(np.abs(vmax) > 1e-30, vmax, 0.0).astype(np.float32)
+        wt = np.abs(g) + np.sqrt((g * g).mean(axis=1, keepdims=True))
+    else:   # (cols,) or, for stacked MoE experts, (n_experts, cols): one row per block of rows
+        imp = np.asarray(imp, np.float32).reshape(-1, cols)
+        imp = imp / max(float(imp.mean()), 1e-30)
+        per = rows // imp.shape[0]
+        wt = np.repeat(imp, per, axis=0).reshape(rows, cols // gs, gs).reshape(-1, gs)
+        wt = wt * (np.abs(g) + np.sqrt((g * g).mean(axis=1, keepdims=True)))
+    wt = wt + 1e-12
+    gmin, gmax = g.min(axis=1), g.max(axis=1)
+    rng = np.maximum(gmax - gmin, 1e-30)
+    sw = wt.sum(axis=1)
+    sx = (wt * g).sum(axis=1)
     best_err = np.full(len(g), np.inf, np.float32)
-    best_d = np.zeros(len(g), np.float32)
-    for f in np.linspace(-8.0, -5.5, 21):                 # d = vmax / f, f = -8 maps the extreme to -8 exactly
-        d = vmax / f
-        inv = np.where(d != 0, 1.0 / np.where(d != 0, d, 1.0), 0.0)
-        q = np.clip(np.round(g * inv[:, None]), -8, 7)
-        # least-squares refinement of d for these integers
-        num = (wt * g * q).sum(axis=1)
-        den = (wt * q * q).sum(axis=1)
-        d2 = np.where(den > 0, num / np.where(den > 0, den, 1.0), d)
-        d2 = np.where(np.abs(d2) > 1e-30, d2, 0.0)
-        for dd in (d, d2):
-            inv2 = np.where(dd != 0, 1.0 / np.where(dd != 0, dd, 1.0), 0.0)
-            q2 = np.clip(np.round(g * inv2[:, None]), -8, 7)
-            err = (wt * (q2 * dd[:, None] - g) ** 2).sum(axis=1)
-            better = err < best_err
-            best_err[better] = err[better]
-            best_d[better] = dd[better]
-    inv = np.where(best_d != 0, 1.0 / np.where(best_d != 0, best_d, 1.0), 0.0)
-    q = (np.clip(np.round(g * inv[:, None]), -8, 7) + 8).astype(np.uint8)   # 0..15
-    packed = (q[:, :16] | (q[:, 16:] << 4)).astype(np.uint8)
-    err = np.abs((q.astype(np.float32) - 8) * best_d[:, None] - g).max()
-    return packed, best_d.astype(np.float32), err
+    best_s = rng / 15.0
+    best_m = gmin.copy()
+    for d in np.arange(-1.0, 1.0001, 0.1):
+        iscale = (15.0 + d) / rng
+        u = np.clip(np.round((g - gmin[:, None]) * iscale[:, None]), 0, 15)
+        sl = (wt * u).sum(axis=1)
+        sll = (wt * u * u).sum(axis=1)
+        slx = (wt * u * g).sum(axis=1)
+        D = sw * sll - sl * sl
+        ok = D > 1e-30
+        Ds = np.where(ok, D, 1.0)
+        s_ = np.where(ok, (sw * slx - sl * sx) / Ds, rng / 15.0)
+        m_ = np.where(ok, (sll * sx - sl * slx) / Ds, gmin)
+        # the integers for the fitted (s, m), then the error
+        inv = np.where(np.abs(s_) > 1e-30, 1.0 / np.where(np.abs(s_) > 1e-30, s_, 1.0), 0.0)
+        u2 = np.clip(np.round((g - m_[:, None]) * inv[:, None]), 0, 15)
+        err = (wt * (u2 * s_[:, None] + m_[:, None] - g) ** 2).sum(axis=1)
+        better = err < best_err
+        best_err[better] = err[better]
+        best_s[better] = s_[better]
+        best_m[better] = m_[better]
+    s16 = best_s.astype(np.float16)
+    m16 = best_m.astype(np.float16)
+    sf, mf = s16.astype(np.float32), m16.astype(np.float32)   # integers for the stored (fp16) values
+    inv = np.where(np.abs(sf) > 1e-30, 1.0 / np.where(np.abs(sf) > 1e-30, sf, 1.0), 0.0)
+    u = np.clip(np.round((g - mf[:, None]) * inv[:, None]), 0, 15).astype(np.uint8)
+    packed = (u[:, :16] | (u[:, 16:] << 4)).astype(np.uint8)
+    err = np.abs(u.astype(np.float32) * sf[:, None] + mf[:, None] - g).max()
+    sm = np.stack([s16, m16], axis=1)   # (groups, 2) fp16
+    return packed, sm, err
 
 
 INPUT_OF = {"wq": "att_in", "wk": "att_in", "wv": "att_in", "wo": "wo_in", "w1": "ffn_in", "w3": "ffn_in", "w2": "w2_in"}
@@ -121,9 +138,43 @@ _JOB = {}
 
 
 def load_imatrix(path):
-    """per-layer input-channel importance (mean x^2 on calibration text), from calibrate.py"""
-    z = np.load(path)
-    return {k: z[k] for k in z.files}
+    """per-layer input-channel importance (mean x^2 on calibration text): a .imx file written by
+    `runq <q8 model> -m imatrix -i data/calibration.txt -o stats.imx`, or an .npz from calibrate.py.
+    MoE: ffn_in / w2_in are (n_experts, channels), one row per expert; experts that saw no
+    calibration token get the mean over the other experts of the layer."""
+    if not path.endswith(".imx"):
+        z = np.load(path)
+        return {k: z[k] for k in z.files}
+    raw = open(path, "rb").read()
+    magic, L, dim, q_dim, H, E, mh = struct.unpack_from("<7i", raw, 0)
+    assert magic == 0x31584D4E, "not an imatrix file"
+    off = 7 * 4 + 8
+    EE = max(E, 1)
+    def take(n):
+        nonlocal off
+        a = np.frombuffer(raw, np.float32, n, off).copy()
+        off += 4 * n
+        return a
+    att = take(L * dim).reshape(L, dim)
+    wo = take(L * q_dim).reshape(L, q_dim)
+    ffn = take(L * EE * dim).reshape(L, EE, dim)
+    w2 = take(L * EE * H).reshape(L, EE, H)
+    out = {}
+    for l in range(L):
+        out[f"att_in.{l}.sq"] = att[l]
+        out[f"wo_in.{l}.sq"] = wo[l]
+        if E > 0:
+            cnt = np.frombuffer(raw, np.int64, L * E, off).reshape(L, E)[l]
+            for a in (ffn, w2):
+                seen = cnt > 0
+                if seen.any() and not seen.all():
+                    a[l][~seen] = a[l][seen].mean(axis=0)
+            out[f"ffn_in.{l}.sq"] = ffn[l]
+            out[f"w2_in.{l}.sq"] = w2[l]
+        else:
+            out[f"ffn_in.{l}.sq"] = ffn[l, 0]
+            out[f"w2_in.{l}.sq"] = w2[l, 0]
+    return out
 
 
 def _quant_job(key):
@@ -156,7 +207,7 @@ def main():
             q4_kinds = args[i + 1].split(",")
             del args[i:i + 2]
         else:
-            q4_kinds = list(KINDS)
+            q4_kinds = [k for k in KINDS if k != "wv"]   # wv (small, sensitive) stays Q8
             del args[i]
     for k in q4_kinds:
         assert k in KINDS, f"unknown matrix kind {k}"
@@ -218,6 +269,7 @@ def main():
     out.write(struct.pack("<ifiiii", arch, float(cfg.get("rms_norm_eps", 1e-5)), qkv_bias, special_start, bos, eos))
     out.write(struct.pack("<i", q4_mask))
     out.write(struct.pack("<6i", head_dim, n_experts, n_active, moe_hidden, qk_norm, int(bool(cfg.get("norm_topk_prob", False)))))
+    out.write(struct.pack("<i", 1))   # q4_format
     out.write(b"\0" * (256 - out.tell()))
 
     p = "model.layers.{}."
@@ -326,7 +378,8 @@ def main():
         keys += [("wg", l) for l in range(L)]
     keys += [(kind, l) for kind in KINDS[4:] for l in range(L)]
     import multiprocessing as mp
-    with mp.get_context("fork").Pool(min(len(keys), os.cpu_count() or 1, 64)) as pool:
+    procs = int(os.environ.get("EXPORT_PROCS", "64"))   # Q4 of stacked MoE experts: ~10 GB per process
+    with mp.get_context("fork").Pool(min(len(keys), os.cpu_count() or 1, procs)) as pool:
         for blob, err in pool.imap(_quant_job, keys, chunksize=1):
             out.write(blob)
             maxerr = max(maxerr, err)

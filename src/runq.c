@@ -361,7 +361,7 @@ static void place_weights(TransformerWeights *w, Config *p) {
 }
 #endif
 
-/* Q8 weight layout. After loading, every int8 matrix is repacked in place into blocks of 4 rows:
+/* Weight layout (Q4: see matmul_rows_q4). After loading, every int8 matrix is repacked in place into blocks of 4 rows:
  * per block and quantization group, GS/4 chunks of 16 bytes [row0 k..k+3 | row1 | row2 | row3],
  * and the scales of a block as [group][4 rows]. One `sdot` by lane (4 weight rows x 4 activations)
  * then yields the 4 rows in the 4 lanes, with no horizontal reductions; the batched kernel reuses
@@ -370,6 +370,28 @@ static void place_weights(TransformerWeights *w, Config *p) {
 typedef struct { QuantizedTensor *t; int rows, cols; } PackJob;
 static void *pack_job(void *arg) {
   PackJob *j = arg;
+  if (j->t->bits == 4) { // Q4: chunk j of a group = bytes 4j..4j+3 of the 4 rows; scales [s0..s3 m0..m3]
+    const int n = j->cols, ng = n / 32, bpr = n / 2;
+    uint8_t *tq = malloc((size_t)4 * bpr);
+    uint16_t *ts = malloc((size_t)4 * ng * 2 * sizeof(uint16_t));
+    for (int b = 0; b < j->rows / 4; b++) {
+      uint8_t *q = (uint8_t *)j->t->q + (size_t)b * 4 * bpr;
+      uint16_t *sc = (uint16_t *)(j->t->s + (size_t)b * 4 * ng);
+      memcpy(tq, q, (size_t)4 * bpr);
+      memcpy(ts, sc, (size_t)4 * ng * 2 * sizeof(uint16_t));
+      for (int g = 0; g < ng; g++) {
+        for (int c = 0; c < 4; c++)
+          for (int r = 0; r < 4; r++) memcpy(q + (size_t)g * 64 + c * 16 + r * 4, tq + (size_t)r * bpr + g * 16 + c * 4, 4);
+        for (int r = 0; r < 4; r++) {
+          sc[g * 8 + r] = ts[((size_t)r * ng + g) * 2];         // s
+          sc[g * 8 + 4 + r] = ts[((size_t)r * ng + g) * 2 + 1]; // m
+        }
+      }
+    }
+    free(tq);
+    free(ts);
+    return NULL;
+  }
   const int n = j->cols, ng = n / GS;
   int8_t *tq = malloc((size_t)4 * n);
   float *ts = malloc((size_t)4 * ng * sizeof(float));
@@ -403,7 +425,6 @@ static void pack_q8(TransformerWeights *w, Config *p) {
   int m = 0;
   for (size_t k = 0; k < sizeof(list) / sizeof(list[0]); k++)
     for (int l = 0; l < list[k].n; l++) {
-      if (list[k].t[l].bits != 8) continue;
       if (list[k].rows % 4 || list[k].cols % GS) { fprintf(stderr, "Q8 matrix %d x %d: rows must be a multiple of 4\n", list[k].rows, list[k].cols); exit(EXIT_FAILURE); }
       jobs[m++] = (PackJob){list[k].t + l, list[k].rows, list[k].cols};
     }
@@ -485,6 +506,12 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weigh
   if (fread(&q4mask, sizeof(int), 1, file) == 1) Q4_MASK = q4mask;
   int ext2[6] = {0}; // head_dim, n_experts, n_active, moe_hidden, qk_norm, norm_topk
   if (fread(ext2, sizeof(ext2), 1, file) != 1) memset(ext2, 0, sizeof(ext2));
+  int q4_format = 0;
+  if (fread(&q4_format, sizeof(int), 1, file) != 1) q4_format = 0;
+  if (Q4_MASK && q4_format != 1) {
+    fprintf(stderr, "%s: old symmetric Q4 format, please re-export it with scripts/export_hf_q8.py --q4\n", checkpoint);
+    exit(EXIT_FAILURE);
+  }
   config->head_dim = ext2[0] > 0 ? ext2[0] : config->dim / config->n_heads;
   config->n_experts = ext2[1];
   config->n_active = ext2[2];
@@ -1091,93 +1118,146 @@ static void matmul_rows_q8(float* out, const int8_t* xq, const float* xs,
 }
 
 // ----------------------------------------------------------------------------
-// Q4 weights: groups of 32 values in 16 bytes (low nibble = value k, high nibble = value k+16,
-// stored as q+8) with one fp32 scale per group. Activations stay int8 with scales per GS.
-
-#if defined(__ARM_FEATURE_DOTPROD)
-// unpack 16 bytes into the two signed int8x16 halves of a 32-value group
-static inline void q4_unpack(const uint8_t* p, int8x16_t* lo, int8x16_t* hi) {
-    const uint8x16_t v = vld1q_u8(p);
-    *lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, vdupq_n_u8(0x0F))), vdupq_n_s8(8));
-    *hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v, 4)), vdupq_n_s8(8));
+// Q4 weights (q4_format 1): value = s * u + m per group of 32, u in 0..15, s and m in fp16.
+// File: per row 16 bytes per group (byte k = u[k] | u[k+16] << 4), then per group [s, m].
+// Memory (packed at load like Q8): blocks of 4 rows; per group 4 chunks of 16 bytes, chunk j =
+// [row0 bytes 4j..4j+3 | row1 | row2 | row3]: its low nibbles are the 4 rows x k = 4j..4j+3, its high
+// nibbles the same for k = 16+4j..; the scales of a block per group as [s0 s1 s2 s3 m0 m1 m2 m3].
+// sum_k (s u_k + m) x_k = s * sum_k u_k x_k + m * sum_k x_k: the min only needs the group sums of the
+// activations (once per token), so the inner loop is AND / shift / sdot by lane.
+#define Q4_MAXG 2048 // groups of 32 per row (n <= 65536)
+#if defined(__aarch64__)
+typedef __fp16 half_t;
+#else
+typedef _Float16 half_t;
+#endif
+static inline const half_t* q4_scales(const QuantizedTensor* w, int n, int i) { // block of row i
+    return (const half_t*)(w->s + (size_t)(i / 4) * 4 * (n / 32));
 }
-#endif
-
-static void matmul_rows_q4(float* out, const int8_t* xq, const float* xs, const QuantizedTensor* w, int n, int r0, int r1) {
-    const int nb = n / 32, bpr = n / 2, xsh = GS / 32;
-    const uint8_t* wq = (const uint8_t*)w->q;
-    int i = r0;
-#if defined(__ARM_FEATURE_DOTPROD)
-    for (; i + 4 <= r1; i += 4) {
-        const uint8_t* w0 = wq + (size_t)i * bpr;
-        const float* s0 = w->s + (size_t)i * nb;
-        float32x4_t acc = vdupq_n_f32(0.0f);
-        for (int b = 0; b < nb; b++) {
-            const int8x16_t x0 = vld1q_s8(xq + b * 32), x1 = vld1q_s8(xq + b * 32 + 16);
-            int32x4_t a[4];
-            for (int r = 0; r < 4; r++) {
-                int8x16_t lo, hi;
-                q4_unpack(w0 + (size_t)r * bpr + b * 16, &lo, &hi);
-                a[r] = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo, x0), hi, x1);
-            }
-            int32x4_t rr = vpaddq_s32(vpaddq_s32(a[0], a[1]), vpaddq_s32(a[2], a[3]));
-            float32x4_t ws = {s0[b], s0[b + nb], s0[b + 2 * nb], s0[b + 3 * nb]};
-            acc = vfmaq_f32(acc, vcvtq_f32_s32(rr), vmulq_n_f32(ws, xs[b / xsh]));
-        }
-        vst1q_f32(out + i, acc);
-    }
-#endif
-    for (; i < r1; i++) {
-        const uint8_t* wr = wq + (size_t)i * bpr;
-        const float* sr = w->s + (size_t)i * nb;
+static void matmul_rows_q4_scalar(float* out, const int8_t* xq, const float* xs, const QuantizedTensor* w, int n, int r0, int r1) {
+    const uint8_t* q = (const uint8_t*)w->q;
+    for (int i = r0; i < r1; i++) {
+        const uint8_t* bq = q + (size_t)(i / 4) * 4 * (n / 2);
+        const half_t* sc = q4_scales(w, n, i);
         float val = 0.0f;
-        for (int b = 0; b < nb; b++) {
-            int32_t iv = 0;
-            for (int k = 0; k < 16; k++) {
-                iv += ((wr[b * 16 + k] & 15) - 8) * xq[b * 32 + k] + ((wr[b * 16 + k] >> 4) - 8) * xq[b * 32 + 16 + k];
+        for (int g = 0; g < n / 32; g++) {
+            int32_t su = 0, sx = 0;
+            for (int kk = 0; kk < 32; kk++) {
+                int j = (kk % 16) / 4, b = kk % 4;
+                uint8_t byte = bq[(size_t)g * 64 + j * 16 + (i % 4) * 4 + b];
+                int u = kk < 16 ? (byte & 15) : (byte >> 4);
+                su += u * xq[g * 32 + kk];
+                sx += xq[g * 32 + kk];
             }
-            val += iv * sr[b] * xs[b / xsh];
+            float xsc = xs[g * 32 / GS];
+            val += (float)sc[g * 8 + i % 4] * xsc * su + (float)sc[g * 8 + 4 + i % 4] * xsc * sx;
         }
         out[i] = val;
     }
 }
-
-/* batched kernels: 4 rows x 4 tokens. Every 16-byte weight load (and, for Q4, every unpack) is
- * reused for 4 tokens; partial sums are reduced per group. */
-static void matmul_rows_batch_q4(float* out, int ldo, const int8_t* xq, const float* xs, int B,
-                                 const QuantizedTensor* w, int n, int r0, int r1) {
-    const int nb = n / 32, bpr = n / 2, xsh = GS / 32, ngx = n / GS;
-    const uint8_t* wq = (const uint8_t*)w->q;
+#if defined(__ARM_FEATURE_DOTPROD)
+// group sums of the activations of one token, times their scales: the min terms
+static inline void q4_xsums(float* xsum, const int8_t* xq, const float* xs, int n) {
+    for (int g = 0; g < n / 32; g++)
+        xsum[g] = (float)(vaddlvq_s8(vld1q_s8(xq + g * 32)) + vaddlvq_s8(vld1q_s8(xq + g * 32 + 16))) * xs[g * 32 / GS];
+}
+#endif
+static void matmul_rows_q4(float* out, const int8_t* xq, const float* xs, const QuantizedTensor* w, int n, int r0, int r1) {
     int i = r0;
 #if defined(__ARM_FEATURE_DOTPROD)
-    for (; i + 4 <= r1; i += 4) {
-        const uint8_t* w0 = wq + (size_t)i * bpr;
-        const float* s0 = w->s + (size_t)i * nb;
-        int t = 0;
-        for (; t + 4 <= B; t += 4) {
-            float32x4_t acc[4] = {vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)};
-            for (int b = 0; b < nb; b++) {
-                int8x16_t lo[4], hi[4];
-                for (int r = 0; r < 4; r++) q4_unpack(w0 + (size_t)r * bpr + b * 16, &lo[r], &hi[r]);
-                const float32x4_t ws = {s0[b], s0[b + nb], s0[b + 2 * nb], s0[b + 3 * nb]};
-                for (int u = 0; u < 4; u++) {
-                    const int8_t* x = xq + (size_t)(t + u) * n + b * 32;
-                    const int8x16_t x0 = vld1q_s8(x), x1 = vld1q_s8(x + 16);
-                    int32x4_t a0 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo[0], x0), hi[0], x1);
-                    int32x4_t a1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo[1], x0), hi[1], x1);
-                    int32x4_t a2 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo[2], x0), hi[2], x1);
-                    int32x4_t a3 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), lo[3], x0), hi[3], x1);
-                    int32x4_t rr = vpaddq_s32(vpaddq_s32(a0, a1), vpaddq_s32(a2, a3));
-                    acc[u] = vfmaq_f32(acc[u], vcvtq_f32_s32(rr), vmulq_n_f32(ws, xs[(size_t)(t + u) * ngx + b / xsh]));
-                }
+    if (r0 % 4 == 0 && GS % 32 == 0 && n / 32 <= Q4_MAXG) {
+        const int ng = n / 32;
+        float xsum[Q4_MAXG];
+        q4_xsums(xsum, xq, xs, n);
+        const uint8_t* qend = (const uint8_t*)w->q + (size_t)r1 * (n / 2);
+        const uint8x16_t m15 = vdupq_n_u8(0x0F);
+        for (; i + 4 <= r1; i += 4) {
+            const uint8_t* wb = (const uint8_t*)w->q + (size_t)i * (n / 2);
+            const half_t* sb = q4_scales(w, n, i);
+            float32x4_t acc = vdupq_n_f32(0.0f);
+            for (int g = 0; g < ng; g++) {
+                const uint8_t* wg = wb + (size_t)g * 64;
+                if (wg + 2048 + 64 <= qend) __builtin_prefetch(wg + 2048, 0, 0);
+                const int8x16_t xa = vld1q_s8(xq + g * 32), xb = vld1q_s8(xq + g * 32 + 16);
+                int32x4_t a = vdupq_n_s32(0), b = a;
+                uint8x16_t v;
+#define Q4_CHUNK(J) v = vld1q_u8(wg + J * 16); \
+                a = vdotq_laneq_s32(a, vreinterpretq_s8_u8(vandq_u8(v, m15)), xa, J); \
+                b = vdotq_laneq_s32(b, vreinterpretq_s8_u8(vshrq_n_u8(v, 4)), xb, J);
+                Q4_CHUNK(0) Q4_CHUNK(1) Q4_CHUNK(2) Q4_CHUNK(3)
+#undef Q4_CHUNK
+                const float16x8_t sm = vld1q_f16((const float16_t*)(sb + g * 8));
+                acc = vfmaq_f32(acc, vcvtq_f32_s32(vaddq_s32(a, b)), vmulq_n_f32(vcvt_f32_f16(vget_low_f16(sm)), xs[g * 32 / GS]));
+                acc = vfmaq_n_f32(acc, vcvt_high_f32_f16(sm), xsum[g]);
             }
-            for (int u = 0; u < 4; u++) vst1q_f32(out + (size_t)(t + u) * ldo + i, acc[u]);
+            vst1q_f32(out + i, acc);
         }
-        for (; t < B; t++) matmul_rows_q4(out + (size_t)t * ldo, xq + (size_t)t * n, xs + (size_t)t * ngx, w, n, i, i + 4);
     }
 #endif
-    if (i < r1)
-        for (int t = 0; t < B; t++) matmul_rows_q4(out + (size_t)t * ldo, xq + (size_t)t * n, xs + (size_t)t * ngx, w, n, i, r1);
+    if (i < r1) matmul_rows_q4_scalar(out, xq, xs, w, n, i, r1);
+}
+#if defined(__ARM_FEATURE_DOTPROD)
+// tile of 4 rows x TT tokens: the 8 unpacked weight vectors of a group serve TT tokens
+#define Q4_TILE(TT)                                                                                         \
+    do {                                                                                                    \
+        float32x4_t acc[TT];                                                                                \
+        for (int u = 0; u < TT; u++) acc[u] = vdupq_n_f32(0.0f);                                            \
+        for (int g = 0; g < ng; g++) {                                                                      \
+            const uint8_t* wg = wb + (size_t)g * 64;                                                        \
+            const uint8x16_t v0 = vld1q_u8(wg), v1 = vld1q_u8(wg + 16), v2 = vld1q_u8(wg + 32), v3 = vld1q_u8(wg + 48); \
+            const int8x16_t l0 = vreinterpretq_s8_u8(vandq_u8(v0, m15)), h0 = vreinterpretq_s8_u8(vshrq_n_u8(v0, 4)); \
+            const int8x16_t l1 = vreinterpretq_s8_u8(vandq_u8(v1, m15)), h1 = vreinterpretq_s8_u8(vshrq_n_u8(v1, 4)); \
+            const int8x16_t l2 = vreinterpretq_s8_u8(vandq_u8(v2, m15)), h2 = vreinterpretq_s8_u8(vshrq_n_u8(v2, 4)); \
+            const int8x16_t l3 = vreinterpretq_s8_u8(vandq_u8(v3, m15)), h3 = vreinterpretq_s8_u8(vshrq_n_u8(v3, 4)); \
+            const float16x8_t sm = vld1q_f16((const float16_t*)(sb + g * 8));                               \
+            const float32x4_t s4 = vcvt_f32_f16(vget_low_f16(sm)), m4 = vcvt_high_f32_f16(sm);              \
+            for (int u = 0; u < TT; u++) {                                                                  \
+                const int8_t* xp = xq + (size_t)(t + u) * n + g * 32;                                       \
+                const int8x16_t xa = vld1q_s8(xp), xb = vld1q_s8(xp + 16);                                   \
+                int32x4_t a = vdupq_n_s32(0);                                                               \
+                a = vdotq_laneq_s32(a, l0, xa, 0); a = vdotq_laneq_s32(a, h0, xb, 0);                       \
+                a = vdotq_laneq_s32(a, l1, xa, 1); a = vdotq_laneq_s32(a, h1, xb, 1);                       \
+                a = vdotq_laneq_s32(a, l2, xa, 2); a = vdotq_laneq_s32(a, h2, xb, 2);                       \
+                a = vdotq_laneq_s32(a, l3, xa, 3); a = vdotq_laneq_s32(a, h3, xb, 3);                       \
+                acc[u] = vfmaq_f32(acc[u], vcvtq_f32_s32(a), vmulq_n_f32(s4, xs[(size_t)(t + u) * ngx + g * 32 / GS])); \
+                acc[u] = vfmaq_n_f32(acc[u], m4, xsum[u][g]);                                               \
+            }                                                                                               \
+        }                                                                                                   \
+        for (int u = 0; u < TT; u++) vst1q_f32(out + (size_t)(t + u) * ldo + i, acc[u]);                     \
+    } while (0)
+#endif
+static void matmul_rows_batch_q4(float* out, int ldo, const int8_t* xq, const float* xs, int B,
+                                 const QuantizedTensor* w, int n, int r0, int r1) {
+    const int ngx = n / GS;
+    int iend = r0;
+#if defined(__ARM_FEATURE_DOTPROD)
+    if (r0 % 4 == 0 && GS % 32 == 0 && n / 32 <= Q4_MAXG) {
+        const int ng = n / 32;
+        const uint8x16_t m15 = vdupq_n_u8(0x0F);
+        static _Thread_local float xsum[8][Q4_MAXG];
+        iend = r0 + (r1 - r0) / 4 * 4;
+        int t = 0;
+        for (; t + 8 <= B; t += 8) { // token tiles outside: the thread's weights stay in L2
+            for (int u = 0; u < 8; u++) q4_xsums(xsum[u], xq + (size_t)(t + u) * n, xs + (size_t)(t + u) * ngx, n);
+            for (int i = r0; i < iend; i += 4) {
+                const uint8_t* wb = (const uint8_t*)w->q + (size_t)i * (n / 2);
+                const half_t* sb = q4_scales(w, n, i);
+                Q4_TILE(8);
+            }
+        }
+        for (; t + 4 <= B; t += 4) {
+            for (int u = 0; u < 4; u++) q4_xsums(xsum[u], xq + (size_t)(t + u) * n, xs + (size_t)(t + u) * ngx, n);
+            for (int i = r0; i < iend; i += 4) {
+                const uint8_t* wb = (const uint8_t*)w->q + (size_t)i * (n / 2);
+                const half_t* sb = q4_scales(w, n, i);
+                Q4_TILE(4);
+            }
+        }
+        for (; t < B; t++) matmul_rows_q4(out + (size_t)t * ldo, xq + (size_t)t * n, xs + (size_t)t * ngx, w, n, r0, iend);
+    }
+#endif
+    if (iend < r1)
+        for (int t = 0; t < B; t++) matmul_rows_q4_scalar(out + (size_t)t * ldo, xq + (size_t)t * n, xs + (size_t)t * ngx, w, n, iend, r1);
 }
 
 // tile of 4 rows x TT tokens on the packed layout
@@ -2004,6 +2084,37 @@ static struct {
     int8_t* gq; float* gqs;  // MoE: quantized hidden activations per slot
 } BN[MAX_NODES];
 
+/* Importance statistics (imatrix, `-m imatrix`): the mean x^2 of every input channel of every matmul,
+ * collected on the batched path. They weight the rounding error when a model is quantized to Q4
+ * (scripts/export_hf_q8.py --imatrix). Dense: att (L, dim), wo (L, q_dim), ffn (L, dim), w2
+ * (L, hidden); MoE: ffn (L, E, dim) and w2 (L, E, moe_hidden) per expert, over the tokens routed to it. */
+static struct {
+    int on;
+    double *att, *wo, *ffn, *w2;
+    long long ntok;   // tokens seen
+    long long* nexp;  // MoE: (L, E) tokens routed to each expert
+} IMX;
+// channels split among all threads; X (B, ld), optionally rmsnorm'ed with weight nw first
+static void imx_dense(ThreadBuf* tb, double* acc, const float* X, int ld, int B, int n, const float* nw) {
+    int tid = (int)(tb - P.tb), c0, c1;
+    c0 = (int)((long)n * tid / P.nth);
+    c1 = (int)((long)n * (tid + 1) / P.nth);
+    for (int b = 0; b < B; b++) {
+        const float* x = X + (size_t)b * ld;
+        float inv = 1.0f;
+        if (nw) {
+            float ss = 0.0f;
+            for (int i = 0; i < n; i++) ss += x[i] * x[i];
+            inv = 1.0f / sqrtf(ss / n + NORM_EPS);
+        }
+        for (int c = c0; c < c1; c++) {
+            float v = x[c] * (nw ? inv * nw[c] : 1.0f);
+            acc[c] += (double)v * v;
+        }
+    }
+    barrier(tb);
+}
+
 /* MoE FFN for a block of B tokens (prefill). Input: BT.xq/BT.xs (normalized + quantized ffn input).
  * Tokens are grouped by expert so every expert's weights are read once per block:
  * router (batched) -> top-k per token -> per-expert token lists with gathered inputs ->
@@ -2013,7 +2124,7 @@ static void moe_batch(ThreadBuf* tb, int l, int B) {
     Transformer* transformer = P.t;
     Config* p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
-    const int tid = (int)(tb - P.tb), nth = P.nth;
+    const int tid = (int)(tb - P.tb);
     const int dim = p->dim, E = p->n_experts, A = p->n_active, mh = p->moe_hidden;
     const int ngd = dim / GS, ngm = mh / GS;
     int r0, r1;
@@ -2088,6 +2199,19 @@ static void moe_batch(ThreadBuf* tb, int l, int B) {
         }
     }
     barrier(tb);
+    if (IMX.on) { // per expert: its ffn inputs (dequantized) and its w2 inputs, experts split among threads
+        for (int e = tid; e < E; e += P.nth) {
+            double* af = IMX.ffn + ((size_t)l * E + e) * dim;
+            double* a2 = IMX.w2 + ((size_t)l * E + e) * mh;
+            for (int sl = off[e]; sl < off[e + 1]; sl++) {
+                int b = BT.moe_tok[sl];
+                for (int c = 0; c < dim; c++) { double v = (double)XQ[(size_t)b * dim + c] * XS[(size_t)b * ngd + c / GS]; af[c] += v * v; }
+                for (int c = 0; c < mh; c++) { double v = BT.gh[(size_t)sl * mh + c] / (BT.moe_w[sl] > 0 ? BT.moe_w[sl] : 1.0f); a2[c] += v * v; }
+            }
+            IMX.nexp[(size_t)l * E + e] += off[e + 1] - off[e];
+        }
+        barrier(tb);
+    }
     // quantize the hidden activations of every slot
     const int S = off[E];
     int s0, s1;
@@ -2166,6 +2290,7 @@ static void forward_batch_thread(int tid) {
     for (int l = 0; l < p->n_layers; l++) {
         size_t loff = (size_t)l * p->seq_len * kv_dim;
 
+        if (IMX.on) imx_dense(tb, IMX.att + (size_t)l * dim, BT.x, dim, B, dim, w->rms_att_weight + l * dim);
         // attention rmsnorm + quantize, split over tokens
         for (int b = n0; b < n1; b++) {
             rmsnorm(tb->xb, BT.x + (size_t)b * dim, w->rms_att_weight + l * dim, dim);
@@ -2288,6 +2413,7 @@ static void forward_batch_thread(int tid) {
         }
         barrier(tb);
 
+        if (IMX.on) imx_dense(tb, IMX.wo + (size_t)l * q_dim, BT.xb, q_dim, B, q_dim, NULL);
         // quantize the attention output, split over tokens
         for (int b = n0; b < n1; b++) {
             quantize_vec(XQ + (size_t)b * q_dim, XS + (size_t)b * ngq, BT.xb + (size_t)b * q_dim, q_dim);
@@ -2306,6 +2432,7 @@ static void forward_batch_thread(int tid) {
         }
         barrier(tb);
 
+        if (IMX.on && p->n_experts == 0) imx_dense(tb, IMX.ffn + (size_t)l * dim, BT.x, dim, B, dim, w->rms_ffn_weight + l * dim);
         // ffn rmsnorm + quantize, split over tokens
         for (int b = n0; b < n1; b++) {
             rmsnorm(tb->xb, BT.x + (size_t)b * dim, w->rms_ffn_weight + l * dim, dim);
@@ -2333,6 +2460,7 @@ static void forward_batch_thread(int tid) {
             }
             barrier(tb);
 
+            if (IMX.on) imx_dense(tb, IMX.w2 + (size_t)l * hidden_dim, BT.hb, hidden_dim, B, hidden_dim, NULL);
             // quantize the hidden activations, split over tokens
             for (int b = n0; b < n1; b++) {
                 quantize_vec(XQ + (size_t)b * hidden_dim, XS + (size_t)b * ngh, BT.hb + (size_t)b * hidden_dim, hidden_dim);
@@ -4057,6 +4185,59 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
 
 // ----------------------------------------------------------------------------
 // CLI, include only if not testing
+/* -m imatrix: run a text through the model (chunks of up to 512 tokens, each from position 0) and
+ * write the importance statistics: "NMX1", int L, dim, q_dim, hidden, E, moe_hidden, long long ntok,
+ * then float32 means: att (L,dim), wo (L,q_dim), ffn (L,[E,]dim), w2 (L,[E,]hidden or moe_hidden),
+ * and for MoE the int64 token counts (L,E). Collect on a model exported without --smooth. */
+static void imatrix(Transformer* t, Tokenizer* tk, const char* text_path, const char* out_path) {
+    Config* p = &t->config;
+    FILE* f = fopen(text_path, "rb");
+    if (!f) { fprintf(stderr, "cannot open %s\n", text_path); exit(EXIT_FAILURE); }
+    fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
+    char* txt = malloc(n + 1);
+    if (fread(txt, 1, n, f) != (size_t)n) { fprintf(stderr, "read failed\n"); exit(EXIT_FAILURE); }
+    txt[n] = 0; fclose(f);
+    int* ids = malloc((n + 8) * sizeof(int)), nt = 0;
+    encode(tk, txt, 0, 0, ids, &nt);
+    const int L = p->n_layers, E = p->n_experts, H = E > 0 ? p->moe_hidden : p->hidden_dim, EE = E > 0 ? E : 1;
+    IMX.att = calloc((size_t)L * p->dim, sizeof(double));
+    IMX.wo = calloc((size_t)L * p->q_dim, sizeof(double));
+    IMX.ffn = calloc((size_t)L * EE * p->dim, sizeof(double));
+    IMX.w2 = calloc((size_t)L * EE * H, sizeof(double));
+    IMX.nexp = calloc((size_t)L * EE, sizeof(long long));
+    IMX.on = 1;
+    const int CH = 512;
+    long t0 = time_in_ms();
+    for (int c = 0; c + 16 <= nt; c += CH - 1) {
+        int len = nt - c < CH - 1 ? nt - c : CH - 1;
+        int chunk[CH];
+        chunk[0] = BOS_ID;
+        memcpy(chunk + 1, ids + c, len * sizeof(int));
+        forward_batch(t, chunk, len + 1, 0);
+        IMX.ntok += len + 1;
+        fprintf(stderr, "\r[imatrix] %lld / %d tokens", IMX.ntok, nt);
+    }
+    IMX.on = 0;
+    fprintf(stderr, " (%.1f s)\n", (time_in_ms() - t0) / 1000.0);
+    FILE* o = fopen(out_path, "wb");
+    if (!o) { fprintf(stderr, "cannot write %s\n", out_path); exit(EXIT_FAILURE); }
+    int hdr[7] = {0x31584D4E, L, p->dim, p->q_dim, H, E, E > 0 ? p->moe_hidden : 0};
+    fwrite(hdr, sizeof(int), 7, o);
+    fwrite(&IMX.ntok, sizeof(long long), 1, o);
+    struct { double* a; size_t rows, n; } parts[4] = {{IMX.att, L, p->dim}, {IMX.wo, L, p->q_dim}, {IMX.ffn, (size_t)L * EE, p->dim}, {IMX.w2, (size_t)L * EE, H}};
+    for (int k = 0; k < 4; k++)
+        for (size_t r = 0; r < parts[k].rows; r++) {
+            double cnt = (E > 0 && k >= 2) ? (double)IMX.nexp[r] : (double)IMX.ntok;
+            for (size_t i = 0; i < parts[k].n; i++) {
+                float v = cnt > 0 ? (float)(parts[k].a[r * parts[k].n + i] / cnt) : 0.0f;
+                fwrite(&v, sizeof(float), 1, o);
+            }
+        }
+    if (E > 0) fwrite(IMX.nexp, sizeof(long long), (size_t)L * E, o);
+    fclose(o);
+    fprintf(stderr, "[imatrix] %lld tokens -> %s\n", IMX.ntok, out_path);
+}
+
 #ifndef TESTING
 
 void error_usage() {
@@ -4069,7 +4250,8 @@ void error_usage() {
   fprintf(stderr, "  -n <int>    number of steps to run for, default 4096. 0 = max_seq_len\n");
   fprintf(stderr, "  -i <string> input prompt\n");
   fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
-  fprintf(stderr, "  -m <string> mode: generate|chat, default: generate\n");
+  fprintf(stderr, "  -m <string> mode: generate|chat|imatrix, default: generate\n");
+  fprintf(stderr, "              imatrix: -i <text file> -o <out.imx> collects Q4 importance statistics\n");
   fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
   fprintf(stderr, "  -T <int>    number of threads, default 0 = auto (placed on the most idle CPUs; RUNQ_PIN=1 keeps them pinned, RUNQ_PIN=0 disables placement)\n");
   fprintf(stderr, "  -c <int>    context window in tokens (KV cache size), default 8192\n");
@@ -4095,6 +4277,7 @@ int main(int argc, char *argv[]) {
   int nthreads = 0;                // threads for the forward pass, 0 = auto
   int ctx = 8192;                  // context window (KV cache size) in tokens
   char *tools_path = NULL;         // tools.json for tool calling in chat mode
+  char *out_path = NULL;           // -o: output file (imatrix mode)
   char *draft_path = NULL;         // draft model for speculative decoding
 
   // poor man's C argparse so we can override the defaults above from the command line
@@ -4143,6 +4326,8 @@ int main(int argc, char *argv[]) {
       NODES_REQ = atoi(argv[i + 1]);
     } else if (argv[i][1] == 'f') {
       tools_path = argv[i + 1];
+    } else if (argv[i][1] == 'o') {
+      out_path = argv[i + 1];
     } else {
       error_usage();
     }
@@ -4211,6 +4396,9 @@ int main(int argc, char *argv[]) {
     generate(&transformer, &tokenizer, &sampler, prompt, steps);
   } else if (strcmp(mode, "chat") == 0) {
     chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
+  } else if (strcmp(mode, "imatrix") == 0) {
+    if (!prompt || !out_path) error_usage();
+    imatrix(&transformer, &tokenizer, prompt, out_path);
   } else {
     fprintf(stderr, "unknown mode: %s\n", mode);
     error_usage();

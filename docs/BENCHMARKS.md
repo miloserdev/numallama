@@ -15,10 +15,10 @@ single socket under `numactl -N0 -m0 -t 96`; for 2 sockets the best of `--numa d
 | Model | llama.cpp 1 socket | numallama 1 socket | numallama 2 sockets | llama.cpp best 2-socket |
 |---|---|---|---|---|
 | Llama 3.2 3B Q8 | 36 / 512 | 48 / 1125 | **76** / **1172** | 4.6 / 249 |
-| Llama 3.2 3B Q4 (llama.cpp Q4_0) | 64 / 803 | 70 / 756 | **103** / **923** | 21 / 394 |
+| Llama 3.2 3B Q4 (llama.cpp Q4_0) | 64 / 803 | 69 / **865** | **99** / **985** | 21 / 394 |
 | Llama 3.2 3B Q4_K_M (llama.cpp) | 64 / 568 | — | — | — |
 | Llama 3.1 8B Q8 | 19 / 274 | 21 / 437 | **39** / **680** | 3.6 / 140 |
-| Llama 3.1 8B Q4 (llama.cpp Q4_K_M) | 29 / 246 | 34 / 341 | **58** / **495** | 0.8 / 132 |
+| Llama 3.1 8B Q4 (llama.cpp Q4_K_M) | 29 / 246 | 34 / **397** | **59** / **542** | 0.8 / 132 |
 
 (decode / prefill 512 tokens)
 
@@ -26,8 +26,8 @@ single socket under `numactl -N0 -m0 -t 96`; for 2 sockets the best of `--numa d
   soon as the thread count exceeds the truly idle cores, and the weights are not split by node.
 - Prefill: Q8 weights are repacked at load into 4-row blocks interleaved by 4 bytes, so one `sdot` by
   lane gives 4 rows at once (no horizontal reductions) and each weight vector serves 8 tokens; every
-  socket quantizes the block inputs into its own memory. llama.cpp still wins 3B Q4 prefill on one
-  socket (our Q4 kernel is not repacked yet).
+  socket quantizes the block inputs into its own memory. Q4 uses the same layout; its min term is
+  folded out of the inner loop (sum (s u + m) x = s sum u x + m sum x, with sum x once per token).
 
 Quality, Llama 3.2 3B, mean KL divergence to full precision on the same 4 x 512-token chunks
 (second half of each chunk scored, as `llama-perplexity --kl-divergence`):
@@ -36,9 +36,15 @@ Quality, Llama 3.2 3B, mean KL divergence to full precision on the same 4 x 512-
 |---|---|---|
 | llama.cpp Q8_0 | 0.0004 | 99.5% |
 | numallama Q8 | 0.0006 | 99.0% |
+| **numallama Q4** (asymmetric g32 fp16 s+m, imatrix, wv in Q8; 2.22 GB) | **0.013** | **96.1%** |
 | llama.cpp Q4_K_M | 0.015 | 95.8% |
 | llama.cpp Q4_0 | 0.025 | 94.6% |
-| numallama Q4 (symmetric, groups of 32) | 0.038 | 92.8% |
+| numallama old Q4 (symmetric g32, no imatrix; removed) | 0.038 | 92.8% |
+
+Where the 4-bit error came from (fp32 forward with fake-quantized weights, 2 chunks):
+asymmetric g32 alone 0.031; + importance matrix 0.014; + wv in Q8 0.012; + w2 in Q8 in 1/3 of the
+layers 0.010 (~5.4 bit/weight); + all w2 in Q8 0.008 (~5.9 bit/weight). The importance matrix is
+collected by the engine on the Q8 model (`-m imatrix`, ~30 s for 19k tokens), per expert for MoE.
 
 ## Mixture of experts: Qwen3-30B-A3B-Instruct-2507 (abliterated), Q8 (32 GB)
 
@@ -48,6 +54,10 @@ Quality, Llama 3.2 3B, mean KL divergence to full precision on the same 4 x 512-
 |---|---|---|
 | decode | 47 tok/s | **71 tok/s** |
 | prefill 512 tokens (batched, grouped by expert) | — | 523 tok/s (token by token: 69) |
+| **Q4** (19.4 GB, imatrix): decode | **67 tok/s** | **91 tok/s** |
+| Q4: prefill 512 tokens | — | 505 tok/s |
+
+Q4 vs Q8 on the same 43 tokens: top-1 agreement 93%, KL 0.018.
 
 Logits vs an fp32 numpy reference: top-1 97.7%, mean KL 0.0075.
 

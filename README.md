@@ -10,7 +10,10 @@ Highlights:
 - **Mixture of experts (Qwen3-MoE, e.g. Qwen3-30B-A3B)**: int8 router, top-k routing, every expert
   split evenly between the NUMA nodes; batched prefill groups the tokens by expert so every expert is
   read once per block. Also Qwen3 attention (head_dim != dim / heads, per-head q/k RMSNorm).
-- **int8 (Q8) and 4-bit (Q4) weights** with NEON `sdot` kernels (single token, 4x4 batched).
+- **int8 (Q8) and 4-bit (Q4) weights**, repacked at load into 4-row blocks for NEON `sdot` by lane
+  (single token and 4x8 batched kernels). Q4 is asymmetric (groups of 32, fp16 scale + min) and
+  quantized with an importance matrix collected by the engine itself: on Llama 3.2 3B its KL to
+  full precision is 0.013 (llama.cpp Q4_K_M: 0.015).
 - **Multi-socket NUMA**: every weight matrix and the KV cache are split between the sockets
   (`mbind`), each socket's threads compute only its rows, per-node work counters and per-node
   activation buffers keep cross-socket traffic minimal; attention and the MoE router synchronize
@@ -37,7 +40,8 @@ The binary is still called `runq` (the name of the upstream int8 runtime).
 | `src/tools.h` | tool calling: minimal JSON parser, `tools.json` loading, sandboxed command execution |
 | `scripts/export_hf_q8.py` | Hugging Face safetensors → `.bin` (Q8 / Q4, optional SmoothQuant, numpy only) |
 | `scripts/export_tokenizer.py` | `tokenizer.json` → `tokenizer.bin` |
-| `scripts/calibrate.py` | activation statistics on a calibration text (for `--smooth` / `--imatrix`) |
+| `scripts/calibrate.py` | fp32 numpy activation statistics (max \|x\| for `--smooth`) |
+| `data/calibration.txt` | calibration text for `-m imatrix` (English, Russian, code) |
 | `config/tools.json` | tools offered to the model in chat mode |
 | `data/tokenizer.bin` | Llama 3 tokenizer |
 | `tests/` | fp32 numpy reference, tokenizer reference, engine consistency checks |
@@ -59,13 +63,17 @@ use portable C fallbacks.
 ```bash
 # Llama 3.x: weights + the bundled tokenizer
 python3 scripts/export_hf_q8.py /path/to/Llama-3.1-8B-Instruct llama31_8b_q80.bin
-# 4-bit (faster decode, lower quality); w2 is the most sensitive matrix
-python3 scripts/export_hf_q8.py /path/to/model model_q4.bin --q4                 # all matrices
-python3 scripts/export_hf_q8.py /path/to/model model_q4.bin --q4 wq,wk,wv,wo,w1,w3
+# 4-bit: collect the importance matrix with the Q8 model, then export (wv stays Q8 by default)
+./runq llama31_8b_q80.bin -m imatrix -i data/calibration.txt -o llama31_8b.imx
+python3 scripts/export_hf_q8.py /path/to/Llama-3.1-8B-Instruct llama31_8b_q4.bin --q4 --imatrix llama31_8b.imx
+python3 scripts/export_hf_q8.py /path/to/model model_q4.bin --q4 wq,wk,wo,w1,w3   # explicit kinds (w2 is the most sensitive)
 
 # Qwen3-MoE (e.g. Qwen3-30B-A3B-Instruct-2507): ~32 GB in Q8
 python3 scripts/export_hf_q8.py /path/to/Qwen3-30B-A3B-Instruct-2507 qwen3_30b_a3b_q80.bin
 python3 scripts/export_tokenizer.py /path/to/Qwen3-30B-A3B-Instruct-2507 qwen3_tokenizer.bin
+# ... and in Q4 (~17 GB; per-expert importance; EXPORT_PROCS limits the quantizer processes)
+./runq qwen3_30b_a3b_q80.bin -z qwen3_tokenizer.bin -m imatrix -i data/calibration.txt -o qwen3_30b.imx
+EXPORT_PROCS=24 python3 scripts/export_hf_q8.py /path/to/Qwen3-30B-A3B-Instruct-2507 qwen3_30b_a3b_q4.bin --q4 --imatrix qwen3_30b.imx
 
 # Qwen2.5: calibrate, export with SmoothQuant, export its tokenizer
 python3 scripts/calibrate.py /path/to/Qwen2.5-7B-Instruct calib.txt qwen7b.npz
@@ -73,7 +81,9 @@ python3 scripts/export_hf_q8.py /path/to/Qwen2.5-7B-Instruct qwen7b_q80.bin --im
 python3 scripts/export_tokenizer.py /path/to/Qwen2.5-7B-Instruct qwen7b_tokenizer.bin
 ```
 
-`calib.txt` is any natural text of a few thousand words (a mix of the languages you use).
+`calib.txt` is any natural text of a few thousand words (a mix of the languages you use). Collect
+`-m imatrix` statistics on a model exported without `--smooth`. Q4 files of the old symmetric format
+are refused: re-export them.
 
 ## Run
 
