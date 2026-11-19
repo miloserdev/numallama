@@ -44,6 +44,45 @@ Requirements: Linux, gcc or clang, Python 3 with numpy (only for converting mode
 model file plus a few GB. Tuned and tested on AArch64 with dotprod (Ampere Altra / Neoverse N1); other
 CPUs build with portable C fallbacks, which are not tuned or regularly tested.
 
+### Ready-made models
+
+Converted models are published on Hugging Face, so you can skip the conversion:
+
+```bash
+make                                   # -> ./runq
+pip install huggingface_hub
+hf download miloserdev/Qwen3-30B-A3B-Instruct-2507-numallama --local-dir models/qwen3-30b
+./runq models/qwen3-30b/qwen3-30b-a3b-instruct-2507-q4.bin -z models/qwen3-30b/tokenizer.bin -m chat
+./runq models/qwen3-30b/qwen3-30b-a3b-instruct-2507-q4.bin -z models/qwen3-30b/tokenizer.bin -m server -P 8080
+```
+
+Each repository holds the Q4 and/or Q8 file, `tokenizer.bin`, the license of the original model and a
+model card with the exact commands and measured speed.
+
+| Repository (`huggingface.co/miloserdev/...`) | Files | License |
+|---|---|---|
+| [Qwen3-30B-A3B-Instruct-2507-numallama](https://huggingface.co/miloserdev/Qwen3-30B-A3B-Instruct-2507-numallama) | Q4 19 GB, Q8 32 GB | Apache 2.0 |
+| [Qwen3.8-27B-numallama](https://huggingface.co/miloserdev/Qwen3.8-27B-numallama) | Q4 18 GB, Q8 29 GB | Apache 2.0 |
+| [Qwen2.5-7B-Instruct-numallama](https://huggingface.co/miloserdev/Qwen2.5-7B-Instruct-numallama) | Q8 8 GB | Apache 2.0 |
+| [Qwen2.5-3B-Instruct-numallama](https://huggingface.co/miloserdev/Qwen2.5-3B-Instruct-numallama) | Q4 2.1 GB, Q8 3.3 GB | Qwen Research (non-commercial) |
+| [Llama-3.1-8B-Instruct-numallama](https://huggingface.co/miloserdev/Llama-3.1-8B-Instruct-numallama) | Q4 5.5 GB, Q8 8.5 GB | Llama 3.1 Community License |
+| [Llama-3.2-3B-Instruct-numallama](https://huggingface.co/miloserdev/Llama-3.2-3B-Instruct-numallama) | Q4 2.2 GB, Q8 3.4 GB | Llama 3.2 Community License |
+| [Llama-3.2-1B-Instruct-numallama](https://huggingface.co/miloserdev/Llama-3.2-1B-Instruct-numallama) | Q8 1.3 GB | Llama 3.2 Community License |
+
+Abliterated versions (refusals removed by their authors, same license as the original):
+[Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/miloserdev/Qwen3-30B-A3B-Instruct-2507-abliterated-numallama),
+[Qwen3.8-27B](https://huggingface.co/miloserdev/Qwen3.8-27B-abliterated-numallama),
+[Qwen2.5-7B-Instruct](https://huggingface.co/miloserdev/Qwen2.5-7B-Instruct-abliterated-numallama),
+[Llama-3.1-8B-Instruct](https://huggingface.co/miloserdev/Llama-3.1-8B-Instruct-abliterated-numallama),
+[Llama-3.2-3B-Instruct](https://huggingface.co/miloserdev/Llama-3.2-3B-Instruct-abliterated-numallama).
+
+Llama models: Built with Llama. Their use is subject to the Llama 3.1 / 3.2 Community License and Meta's
+Acceptable Use Policy (included in each repository or linked from its card).
+
+The files are numallama's own format, not GGUF: they do not work with llama.cpp, Ollama or transformers.
+
+### Convert a model yourself
+
 ```bash
 # 1. build
 make                                   # -> ./runq
