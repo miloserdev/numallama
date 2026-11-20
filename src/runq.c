@@ -1264,34 +1264,86 @@ static void matmul_rows_q4(float* out, const int8_t* xq, const float* xs, const 
     if (i < r1) matmul_rows_q4_scalar(out, xq, xs, w, n, i, r1);
 }
 #if defined(__ARM_FEATURE_DOTPROD)
-// tile of 4 rows x TT tokens: the 8 unpacked weight vectors of a group serve TT tokens
-#define Q4_TILE(TT)                                                                                         \
-    do {                                                                                                    \
-        float32x4_t acc[TT];                                                                                \
-        for (int u = 0; u < TT; u++) acc[u] = vdupq_n_f32(0.0f);                                            \
-        for (int g = 0; g < ng; g++) {                                                                      \
-            const uint8_t* wg = wb + (size_t)g * 64;                                                        \
-            const uint8x16_t v0 = vld1q_u8(wg), v1 = vld1q_u8(wg + 16), v2 = vld1q_u8(wg + 32), v3 = vld1q_u8(wg + 48); \
-            const int8x16_t l0 = vreinterpretq_s8_u8(vandq_u8(v0, m15)), h0 = vreinterpretq_s8_u8(vshrq_n_u8(v0, 4)); \
-            const int8x16_t l1 = vreinterpretq_s8_u8(vandq_u8(v1, m15)), h1 = vreinterpretq_s8_u8(vshrq_n_u8(v1, 4)); \
-            const int8x16_t l2 = vreinterpretq_s8_u8(vandq_u8(v2, m15)), h2 = vreinterpretq_s8_u8(vshrq_n_u8(v2, 4)); \
-            const int8x16_t l3 = vreinterpretq_s8_u8(vandq_u8(v3, m15)), h3 = vreinterpretq_s8_u8(vshrq_n_u8(v3, 4)); \
-            const float16x8_t sm = vld1q_f16((const float16_t*)(sb + g * 8));                               \
-            const float32x4_t s4 = vcvt_f32_f16(vget_low_f16(sm)), m4 = vcvt_high_f32_f16(sm);              \
-            for (int u = 0; u < TT; u++) {                                                                  \
-                const int8_t* xp = xq + (size_t)(t + u) * n + g * 32;                                       \
-                const int8x16_t xa = vld1q_s8(xp), xb = vld1q_s8(xp + 16);                                   \
-                int32x4_t a = vdupq_n_s32(0);                                                               \
-                a = vdotq_laneq_s32(a, l0, xa, 0); a = vdotq_laneq_s32(a, h0, xb, 0);                       \
-                a = vdotq_laneq_s32(a, l1, xa, 1); a = vdotq_laneq_s32(a, h1, xb, 1);                       \
-                a = vdotq_laneq_s32(a, l2, xa, 2); a = vdotq_laneq_s32(a, h2, xb, 2);                       \
-                a = vdotq_laneq_s32(a, l3, xa, 3); a = vdotq_laneq_s32(a, h3, xb, 3);                       \
-                acc[u] = vfmaq_f32(acc[u], vcvtq_f32_s32(a), vmulq_n_f32(s4, xs[(size_t)(t + u) * ngx + g * 32 / GS])); \
-                acc[u] = vfmaq_n_f32(acc[u], m4, xsum[u][g]);                                               \
-            }                                                                                               \
-        }                                                                                                   \
-        for (int u = 0; u < TT; u++) vst1q_f32(out + (size_t)(t + u) * ldo + i, acc[u]);                     \
-    } while (0)
+/* Batched kernels on packed activations (the layout of Arm KleidiAI's qsi8d32p4x4 LHS): per quad of
+ * 4 tokens and group of 32 values, 8 vectors of 16 bytes; vector j < 4 holds bytes 4j..4j+3 of the
+ * 4 tokens (lane t = token t), vector 4 + j bytes 16+4j.. . One load then feeds 4 sdot by lane, one
+ * per token, and the whole tile streams through one buffer instead of one row per token.
+ * Per group the quad's 4 activation scales and 4 scaled group sums (for the Q4 min) are vectors. */
+typedef struct { int8_t* q; float* s; float* m; } XPack;
+static XPack xpack_buf(void) { // per thread, room for 8 tokens of the widest input, first touched by its owner
+    static _Thread_local XPack p;
+    if (!p.q) {
+        p.q = aligned_alloc(64, (size_t)8 * Q4_MAXG * 32);
+        p.s = aligned_alloc(64, sizeof(float) * 8 * Q4_MAXG);
+        p.m = aligned_alloc(64, sizeof(float) * 8 * Q4_MAXG);
+    }
+    return p;
+}
+// pack tokens x[0..3] (rows of length n, scales per GS) into quad buffers at q / s / m
+static void xpack_quad(int8_t* q, float* s, float* m, const int8_t* xq, const float* xs, int n) {
+    const int ng = n / 32, ngx = n / GS;
+    for (int g = 0; g < ng; g++) {
+        int8x16_t a[4], b[4];
+        float sc[4], sm[4];
+        for (int t = 0; t < 4; t++) {
+            a[t] = vld1q_s8(xq + (size_t)t * n + g * 32);
+            b[t] = vld1q_s8(xq + (size_t)t * n + g * 32 + 16);
+            sc[t] = xs[(size_t)t * ngx + g * 32 / GS];
+            sm[t] = sc[t] * (float)(vaddlvq_s8(a[t]) + vaddlvq_s8(b[t]));
+        }
+        int8_t* d = q + (size_t)g * 128;
+        for (int h = 0; h < 2; h++) { // 4 x 4 transpose of 32-bit words
+            const int8x16_t* v = h ? b : a;
+            const int32x4_t t0 = vtrn1q_s32(vreinterpretq_s32_s8(v[0]), vreinterpretq_s32_s8(v[1]));
+            const int32x4_t t1 = vtrn2q_s32(vreinterpretq_s32_s8(v[0]), vreinterpretq_s32_s8(v[1]));
+            const int32x4_t t2 = vtrn1q_s32(vreinterpretq_s32_s8(v[2]), vreinterpretq_s32_s8(v[3]));
+            const int32x4_t t3 = vtrn2q_s32(vreinterpretq_s32_s8(v[2]), vreinterpretq_s32_s8(v[3]));
+            vst1q_s64((int64_t*)(d + h * 64), vtrn1q_s64(vreinterpretq_s64_s32(t0), vreinterpretq_s64_s32(t2)));
+            vst1q_s64((int64_t*)(d + h * 64 + 16), vtrn1q_s64(vreinterpretq_s64_s32(t1), vreinterpretq_s64_s32(t3)));
+            vst1q_s64((int64_t*)(d + h * 64 + 32), vtrn2q_s64(vreinterpretq_s64_s32(t0), vreinterpretq_s64_s32(t2)));
+            vst1q_s64((int64_t*)(d + h * 64 + 48), vtrn2q_s64(vreinterpretq_s64_s32(t1), vreinterpretq_s64_s32(t3)));
+        }
+        vst1q_f32(s + g * 4, vld1q_f32(sc));
+        vst1q_f32(m + g * 4, vld1q_f32(sm));
+    }
+}
+// 4 rows x 4 NQ tokens of Q4 on packed activations (quads at xp + q * ng * 128, scales at ps / pm + q * ng * 4)
+static inline __attribute__((always_inline)) void q4_tile_packed(float* out, int ldo, const XPack* xp, int NQ,
+                                                                 const uint8_t* wb, const half_t* sb, int ng) {
+    const uint8x16_t m15 = vdupq_n_u8(0x0F);
+    float32x4_t c[8];
+    for (int u = 0; u < 4 * NQ; u++) c[u] = vdupq_n_f32(0.0f);
+    for (int g = 0; g < ng; g++) {
+        const uint8_t* wg = wb + (size_t)g * 64;
+        const uint8x16_t v0 = vld1q_u8(wg), v1 = vld1q_u8(wg + 16), v2 = vld1q_u8(wg + 32), v3 = vld1q_u8(wg + 48);
+        const int8x16_t W[8] = {
+            vreinterpretq_s8_u8(vandq_u8(v0, m15)), vreinterpretq_s8_u8(vandq_u8(v1, m15)),
+            vreinterpretq_s8_u8(vandq_u8(v2, m15)), vreinterpretq_s8_u8(vandq_u8(v3, m15)),
+            vreinterpretq_s8_u8(vshrq_n_u8(v0, 4)), vreinterpretq_s8_u8(vshrq_n_u8(v1, 4)),
+            vreinterpretq_s8_u8(vshrq_n_u8(v2, 4)), vreinterpretq_s8_u8(vshrq_n_u8(v3, 4))};
+        const float16x8_t sm = vld1q_f16((const float16_t*)(sb + g * 8));
+        const float32x4_t s4 = vcvt_f32_f16(vget_low_f16(sm)), m4 = vcvt_high_f32_f16(sm);
+        for (int q = 0; q < NQ; q++) {
+            const int8_t* x = xp->q + ((size_t)q * ng + g) * 128;
+            int32x4_t a0 = vdupq_n_s32(0), a1 = a0, a2 = a0, a3 = a0;
+            for (int j = 0; j < 8; j++) {
+                const int8x16_t X = vld1q_s8(x + j * 16);
+                a0 = vdotq_laneq_s32(a0, W[j], X, 0);
+                a1 = vdotq_laneq_s32(a1, W[j], X, 1);
+                a2 = vdotq_laneq_s32(a2, W[j], X, 2);
+                a3 = vdotq_laneq_s32(a3, W[j], X, 3);
+            }
+            const float32x4_t xs4 = vld1q_f32(xp->s + ((size_t)q * ng + g) * 4);
+            const float32x4_t xm4 = vld1q_f32(xp->m + ((size_t)q * ng + g) * 4);
+            float32x4_t* cq = c + 4 * q;
+            cq[0] = vfmaq_laneq_f32(vfmaq_f32(cq[0], vcvtq_f32_s32(a0), vmulq_laneq_f32(s4, xs4, 0)), m4, xm4, 0);
+            cq[1] = vfmaq_laneq_f32(vfmaq_f32(cq[1], vcvtq_f32_s32(a1), vmulq_laneq_f32(s4, xs4, 1)), m4, xm4, 1);
+            cq[2] = vfmaq_laneq_f32(vfmaq_f32(cq[2], vcvtq_f32_s32(a2), vmulq_laneq_f32(s4, xs4, 2)), m4, xm4, 2);
+            cq[3] = vfmaq_laneq_f32(vfmaq_f32(cq[3], vcvtq_f32_s32(a3), vmulq_laneq_f32(s4, xs4, 3)), m4, xm4, 3);
+        }
+    }
+    for (int u = 0; u < 4 * NQ; u++) vst1q_f32(out + (size_t)u * ldo, c[u]);
+}
 #endif
 static void matmul_rows_batch_q4(float* out, int ldo, const int8_t* xq, const float* xs, int B,
                                  const QuantizedTensor* w, int n, int r0, int r1) {
@@ -1300,25 +1352,20 @@ static void matmul_rows_batch_q4(float* out, int ldo, const int8_t* xq, const fl
 #if defined(__ARM_FEATURE_DOTPROD)
     if (r0 % 4 == 0 && GS % 32 == 0 && n / 32 <= Q4_MAXG) {
         const int ng = n / 32;
-        const uint8x16_t m15 = vdupq_n_u8(0x0F);
-        static _Thread_local float xsum[8][Q4_MAXG];
+        const XPack xp = xpack_buf();
+        const XPack xp2 = {xp.q + (size_t)ng * 128, xp.s + (size_t)ng * 4, xp.m + (size_t)ng * 4};
         iend = r0 + (r1 - r0) / 4 * 4;
         int t = 0;
         for (; t + 8 <= B; t += 8) { // token tiles outside: the thread's weights stay in L2
-            for (int u = 0; u < 8; u++) q4_xsums(xsum[u], xq + (size_t)(t + u) * n, xs + (size_t)(t + u) * ngx, n);
-            for (int i = r0; i < iend; i += 4) {
-                const uint8_t* wb = (const uint8_t*)w->q + (size_t)i * (n / 2);
-                const half_t* sb = q4_scales(w, n, i);
-                Q4_TILE(8);
-            }
+            xpack_quad(xp.q, xp.s, xp.m, xq + (size_t)t * n, xs + (size_t)t * ngx, n);
+            xpack_quad(xp2.q, xp2.s, xp2.m, xq + (size_t)(t + 4) * n, xs + (size_t)(t + 4) * ngx, n);
+            for (int i = r0; i < iend; i += 4)
+                q4_tile_packed(out + (size_t)t * ldo + i, ldo, &xp, 2, (const uint8_t*)w->q + (size_t)i * (n / 2), q4_scales(w, n, i), ng);
         }
         for (; t + 4 <= B; t += 4) {
-            for (int u = 0; u < 4; u++) q4_xsums(xsum[u], xq + (size_t)(t + u) * n, xs + (size_t)(t + u) * ngx, n);
-            for (int i = r0; i < iend; i += 4) {
-                const uint8_t* wb = (const uint8_t*)w->q + (size_t)i * (n / 2);
-                const half_t* sb = q4_scales(w, n, i);
-                Q4_TILE(4);
-            }
+            xpack_quad(xp.q, xp.s, xp.m, xq + (size_t)t * n, xs + (size_t)t * ngx, n);
+            for (int i = r0; i < iend; i += 4)
+                q4_tile_packed(out + (size_t)t * ldo + i, ldo, &xp, 1, (const uint8_t*)w->q + (size_t)i * (n / 2), q4_scales(w, n, i), ng);
         }
         for (; t < B; t++) matmul_rows_q4(out + (size_t)t * ldo, xq + (size_t)t * n, xs + (size_t)t * ngx, w, n, r0, iend);
     }
@@ -1327,53 +1374,81 @@ static void matmul_rows_batch_q4(float* out, int ldo, const int8_t* xq, const fl
         for (int t = 0; t < B; t++) matmul_rows_q4_scalar(out + (size_t)t * ldo, xq + (size_t)t * n, xs + (size_t)t * ngx, w, n, iend, r1);
 }
 
-// tile of 4 rows x TT tokens on the packed layout
-#define Q8_TILE(TT)                                                                                        \
-    do {                                                                                                   \
-        float32x4_t acc[TT];                                                                               \
-        for (int u = 0; u < TT; u++) acc[u] = vdupq_n_f32(0.0f);                                           \
-        for (int g = 0; g < ng; g++) {                                                                     \
-            int32x4_t a[TT];                                                                               \
-            for (int u = 0; u < TT; u++) a[u] = vdupq_n_s32(0);                                            \
-            const int8_t* wg = wb + (size_t)g * GS * 4;                                                    \
-            for (int k = 0; k < GS; k += 16) {                                                             \
-                int8x16_t w0 = vld1q_s8(wg + k * 4), w1 = vld1q_s8(wg + k * 4 + 16);                       \
-                int8x16_t w2 = vld1q_s8(wg + k * 4 + 32), w3 = vld1q_s8(wg + k * 4 + 48);                  \
-                for (int u = 0; u < TT; u++) {                                                             \
-                    int8x16_t xv = vld1q_s8(xq + (size_t)(t + u) * n + g * GS + k);                         \
-                    a[u] = vdotq_laneq_s32(a[u], w0, xv, 0);                                               \
-                    a[u] = vdotq_laneq_s32(a[u], w1, xv, 1);                                               \
-                    a[u] = vdotq_laneq_s32(a[u], w2, xv, 2);                                               \
-                    a[u] = vdotq_laneq_s32(a[u], w3, xv, 3);                                               \
-                }                                                                                          \
-            }                                                                                              \
-            const float32x4_t ws = vld1q_f32(sb + g * 4);                                                  \
-            for (int u = 0; u < TT; u++)                                                                   \
-                acc[u] = vfmaq_f32(acc[u], vcvtq_f32_s32(a[u]), vmulq_n_f32(ws, xs[(size_t)(t + u) * ng + g])); \
-        }                                                                                                  \
-        for (int u = 0; u < TT; u++) vst1q_f32(out + (size_t)(t + u) * ldo + i, acc[u]);                    \
-    } while (0)
+#if defined(__ARM_FEATURE_DOTPROD)
+// Q8: pack tokens x[0..3] per 16 values (4 vectors: bytes 4j..4j+3 of the 4 tokens) and their GS scales
+static void xpack_quad8(int8_t* q, float* s, const int8_t* xq, const float* xs, int n) {
+    const int ngx = n / GS;
+    for (int k = 0; k < n; k += 16) {
+        int32x4_t v[4];
+        for (int t = 0; t < 4; t++) v[t] = vreinterpretq_s32_s8(vld1q_s8(xq + (size_t)t * n + k));
+        const int32x4_t t0 = vtrn1q_s32(v[0], v[1]), t1 = vtrn2q_s32(v[0], v[1]);
+        const int32x4_t t2 = vtrn1q_s32(v[2], v[3]), t3 = vtrn2q_s32(v[2], v[3]);
+        int8_t* d = q + (size_t)k * 4;
+        vst1q_s64((int64_t*)d, vtrn1q_s64(vreinterpretq_s64_s32(t0), vreinterpretq_s64_s32(t2)));
+        vst1q_s64((int64_t*)(d + 16), vtrn1q_s64(vreinterpretq_s64_s32(t1), vreinterpretq_s64_s32(t3)));
+        vst1q_s64((int64_t*)(d + 32), vtrn2q_s64(vreinterpretq_s64_s32(t0), vreinterpretq_s64_s32(t2)));
+        vst1q_s64((int64_t*)(d + 48), vtrn2q_s64(vreinterpretq_s64_s32(t1), vreinterpretq_s64_s32(t3)));
+    }
+    for (int g = 0; g < ngx; g++)
+        for (int t = 0; t < 4; t++) s[g * 4 + t] = xs[(size_t)t * ngx + g];
+}
+// 4 rows x 4 NQ tokens of Q8 (packed weight layout) on packed activations (quad q at xp + q * n * 4)
+static inline __attribute__((always_inline)) void q8_tile_packed(float* out, int ldo, const XPack* xp, int NQ,
+                                                                 const int8_t* wb, const float* sb, int n) {
+    const int ng = n / GS;
+    float32x4_t c[8];
+    for (int u = 0; u < 4 * NQ; u++) c[u] = vdupq_n_f32(0.0f);
+    for (int g = 0; g < ng; g++) {
+        int32x4_t a[8];
+        for (int u = 0; u < 4 * NQ; u++) a[u] = vdupq_n_s32(0);
+        for (int k = g * GS; k < (g + 1) * GS; k += 16) {
+            const int8_t* wk = wb + (size_t)k * 4;
+            const int8x16_t W0 = vld1q_s8(wk), W1 = vld1q_s8(wk + 16), W2 = vld1q_s8(wk + 32), W3 = vld1q_s8(wk + 48);
+            for (int q = 0; q < NQ; q++) {
+                const int8_t* x = xp->q + (size_t)q * n * 4 + (size_t)k * 4;
+                int32x4_t* aq = a + 4 * q;
+#define Q8_STEP(J, WJ) { const int8x16_t X = vld1q_s8(x + J * 16); \
+                aq[0] = vdotq_laneq_s32(aq[0], WJ, X, 0); aq[1] = vdotq_laneq_s32(aq[1], WJ, X, 1); \
+                aq[2] = vdotq_laneq_s32(aq[2], WJ, X, 2); aq[3] = vdotq_laneq_s32(aq[3], WJ, X, 3); }
+                Q8_STEP(0, W0) Q8_STEP(1, W1) Q8_STEP(2, W2) Q8_STEP(3, W3)
+#undef Q8_STEP
+            }
+        }
+        const float32x4_t ws = vld1q_f32(sb + g * 4);
+        for (int q = 0; q < NQ; q++) {
+            const float32x4_t xs4 = vld1q_f32(xp->s + ((size_t)q * ng + g) * 4);
+            float32x4_t* cq = c + 4 * q;
+            cq[0] = vfmaq_f32(cq[0], vcvtq_f32_s32(a[4 * q + 0]), vmulq_laneq_f32(ws, xs4, 0));
+            cq[1] = vfmaq_f32(cq[1], vcvtq_f32_s32(a[4 * q + 1]), vmulq_laneq_f32(ws, xs4, 1));
+            cq[2] = vfmaq_f32(cq[2], vcvtq_f32_s32(a[4 * q + 2]), vmulq_laneq_f32(ws, xs4, 2));
+            cq[3] = vfmaq_f32(cq[3], vcvtq_f32_s32(a[4 * q + 3]), vmulq_laneq_f32(ws, xs4, 3));
+        }
+    }
+    for (int u = 0; u < 4 * NQ; u++) vst1q_f32(out + (size_t)u * ldo, c[u]);
+}
+#endif
 static void matmul_rows_batch_q8(float* out, int ldo, const int8_t* xq, const float* xs, int B,
                                  const QuantizedTensor* w, int n, int r0, int r1) {
     const int ng = n / GS;
     int iend = r0;
 #if defined(__ARM_FEATURE_DOTPROD)
-    if (GS % 16 == 0 && r0 % 4 == 0) {
+    if (GS % 16 == 0 && r0 % 4 == 0 && n <= Q4_MAXG * 32 && ng <= Q4_MAXG) {
+        const XPack xp = xpack_buf();
+        const XPack xp2 = {xp.q + (size_t)n * 4, xp.s + (size_t)ng * 4, NULL};
         iend = r0 + (r1 - r0) / 4 * 4;
         // token tiles outside, the thread's rows inside: its weights stay in L2, the tile's inputs in L1
         int t = 0;
-        for (; t + 8 <= B; t += 8)
-            for (int i = r0; i < iend; i += 4) {
-                const int8_t* wb = w->q + (size_t)i * n;
-                const float* sb = w->s + (size_t)i * ng;
-                Q8_TILE(8);
-            }
-        for (; t + 4 <= B; t += 4)
-            for (int i = r0; i < iend; i += 4) {
-                const int8_t* wb = w->q + (size_t)i * n;
-                const float* sb = w->s + (size_t)i * ng;
-                Q8_TILE(4);
-            }
+        for (; t + 8 <= B; t += 8) {
+            xpack_quad8(xp.q, xp.s, xq + (size_t)t * n, xs + (size_t)t * ng, n);
+            xpack_quad8(xp2.q, xp2.s, xq + (size_t)(t + 4) * n, xs + (size_t)(t + 4) * ng, n);
+            for (int i = r0; i < iend; i += 4)
+                q8_tile_packed(out + (size_t)t * ldo + i, ldo, &xp, 2, w->q + (size_t)i * n, w->s + (size_t)i * ng, n);
+        }
+        for (; t + 4 <= B; t += 4) {
+            xpack_quad8(xp.q, xp.s, xq + (size_t)t * n, xs + (size_t)t * ng, n);
+            for (int i = r0; i < iend; i += 4)
+                q8_tile_packed(out + (size_t)t * ldo + i, ldo, &xp, 1, w->q + (size_t)i * n, w->s + (size_t)i * ng, n);
+        }
         for (; t < B; t++) matmul_rows_q8(out + (size_t)t * ldo, xq + (size_t)t * n, xs + (size_t)t * ng, w, n, r0, iend);
     }
 #endif
@@ -2415,6 +2490,73 @@ static void matmul_rows_batch(float* out, int ldo, const int8_t* xq, const float
     else matmul_rows_batch_q8(out, ldo, xq, xs, B, w, n, r0, r1);
 }
 
+/* Batched matmul of the node's rows of a d-row matrix, balanced over the node's threads. The work
+ * items are (block of 4 rows, tile of 8 tokens), numbered row-block major, and every thread takes an
+ * equal contiguous share: with 4-row granularity alone the threads got e.g. 20 or 24 rows of w2 and
+ * the others waited for the slowest at the barrier. Tiles stay the outer loop, so a thread's rows
+ * stay in L2 across tiles. With w2 set the same rows of a second matrix go to out2 (w1 | w3).
+ * post(ctx, b0, b1, r0, r1) runs on every piece the thread computed. */
+typedef void (*BatchPost)(void* ctx, int b0, int b1, int r0, int r1);
+static void matmul_batch_node(float* out, int ldo, const int8_t* xq, const float* xs, int B, const QuantizedTensor* w,
+                              int n, int d, const ThreadBuf* tb, const QuantizedTensor* w2, float* out2,
+                              BatchPost post, void* ctx) {
+    int lo, hi;
+    node_rows(d, tb->node, &lo, &hi);
+    const int NR = (hi - lo) / 4, NT = (B + 7) / 8, ngx = n / GS;
+    const long tot = (long)NR * NT, l0 = tot * tb->ltid / tb->nthn, l1 = tot * (tb->ltid + 1) / tb->nthn;
+    for (int pass = 0; pass < (w2 ? 3 : 2); pass++) // one matrix at a time (w1 then w3), then post
+        for (int t = 0; t < NT; t++) {
+            const long s = l0 - t, e = l1 - t; // items rb * NT + t in [l0, l1): rb in [ceil(s / NT), ceil(e / NT))
+            const int rbs = s <= 0 ? 0 : (int)((s + NT - 1) / NT);
+            int rbe = e <= 0 ? 0 : (int)((e + NT - 1) / NT);
+            if (rbe > NR) rbe = NR;
+            if (rbs >= rbe) continue;
+            const int b0 = 8 * t, nb = B - b0 < 8 ? B - b0 : 8, r0 = lo + 4 * rbs, r1 = lo + 4 * rbe;
+            const int last = w2 ? 2 : 1;
+            if (pass < last) {
+                const QuantizedTensor* m = pass ? w2 : w;
+                float* o = pass ? out2 : out;
+                matmul_rows_batch(o + (size_t)b0 * ldo, ldo, xq + (size_t)b0 * n, xs + (size_t)b0 * ngx, nb, m, n, r0, r1);
+            } else if (post) post(ctx, b0, b0 + nb, r0, r1);
+        }
+    if (tb->ltid == tb->nthn - 1 && lo + 4 * NR < hi) { // rows beyond the last full block
+        matmul_rows_batch(out, ldo, xq, xs, B, w, n, lo + 4 * NR, hi);
+        if (w2) matmul_rows_batch(out2, ldo, xq, xs, B, w2, n, lo + 4 * NR, hi);
+        if (post) post(ctx, 0, B, lo + 4 * NR, hi);
+    }
+}
+typedef struct { float* x; const float* o; int ld; } ResidCtx; // x[b][i] += o[b][i]
+static void post_residual(void* c, int b0, int b1, int r0, int r1) {
+    const ResidCtx* r = c;
+    for (int b = b0; b < b1; b++)
+        for (int i = r0; i < r1; i++) r->x[(size_t)b * r->ld + i] += r->o[(size_t)b * r->ld + i];
+}
+typedef struct { float* h1; const float* h3; int ld; } SwigluCtx; // h1 = silu(h1) * h3
+static void post_swiglu(void* c, int b0, int b1, int r0, int r1) {
+    const SwigluCtx* g = c;
+    for (int b = b0; b < b1; b++) {
+        float* h1 = g->h1 + (size_t)b * g->ld;
+        const float* h3 = g->h3 + (size_t)b * g->ld;
+        for (int i = r0; i < r1; i++) { float v = h1[i]; v *= (1.0f / (1.0f + expf(-v))); h1[i] = v * h3[i]; }
+    }
+}
+
+static void post_swiglu_hyb(void* c, int b0, int b1, int r0, int r1) { // h1 = silu_f(h1) * h3
+    const SwigluCtx* g = c;
+    for (int b = b0; b < b1; b++)
+        for (int i = r0; i < r1; i++) g->h1[(size_t)b * g->ld + i] = silu_f(g->h1[(size_t)b * g->ld + i]) * g->h3[(size_t)b * g->ld + i];
+}
+// first (token, head) pair whose cumulative cost reaches c; pair (b, h) costs pos0 + b + 1 (attention)
+static int att_item_at(long c, int H, int B, int pos0) {
+    long cum = 0;
+    for (int b = 0; b < B; b++) {
+        const long T = pos0 + b + 1, cb = (long)H * T;
+        if (c < cum + cb) return b * H + (int)((c - cum + T - 1) / T);
+        cum += cb;
+    }
+    return B * H;
+}
+
 // split B tokens among threads (for per-token work such as rmsnorm/quantize)
 static inline void tok_range(int B, int tid, int nth, int* b0, int* b1) {
     *b0 = (int)((long)B * tid / nth);
@@ -2708,17 +2850,14 @@ static void forward_hybrid_batch_thread(int tid) {
             if (IMX.on) imx_dense(tb, IMX.wo + (size_t)l * IMX_WO_W, BT.xb, q_dim, B, q_dim, NULL);
             for (int b = n0; b < n1; b++) quantize_vec(XQ + (size_t)b * q_dim, XS + (size_t)b * ngq, BT.xb + (size_t)b * q_dim, q_dim);
             barrier(tb);
-            part_range_node(dim, tb, &r0, &r1);
-            if (r0 < r1) {
-                matmul_rows_batch(BT.xb2, dim, XQ, XS, B, w->wo + fi, q_dim, r0, r1);
-                for (int b = 0; b < B; b++)
-                    for (int i = r0; i < r1; i++) BT.x[(size_t)b * dim + i] += BT.xb2[(size_t)b * dim + i];
+            {
+                ResidCtx rc = {BT.x, BT.xb2, dim};
+                matmul_batch_node(BT.xb2, dim, XQ, XS, B, w->wo + fi, q_dim, dim, tb, NULL, NULL, post_residual, &rc);
             }
             barrier(tb);
         } else {
             const int li = hyb_lidx(p, l);
-            part_range_node(LI, tb, &r0, &r1);
-            if (r0 < r1) matmul_rows_batch(BT.lin, LI, XQ, XS, B, w->w_in + li, dim, r0, r1);
+            matmul_batch_node(BT.lin, LI, XQ, XS, B, w->w_in + li, dim, LI, tb, NULL, NULL, NULL, NULL);
             barrier(tb);
             { // conv / activations: channels split among all threads, tokens in order
                 int c0, c1;
@@ -2742,11 +2881,9 @@ static void forward_hybrid_batch_thread(int tid) {
             if (IMX.on) imx_dense(tb, IMX.wo + (size_t)l * IMX_WO_W, BT.xb, vd, B, vd, NULL);
             for (int b = n0; b < n1; b++) quantize_vec(XQ + (size_t)b * vd, XS + (size_t)b * ngv, BT.xb + (size_t)b * vd, vd);
             barrier(tb);
-            part_range_node(dim, tb, &r0, &r1);
-            if (r0 < r1) {
-                matmul_rows_batch(BT.xb2, dim, XQ, XS, B, w->w_out + li, vd, r0, r1);
-                for (int b = 0; b < B; b++)
-                    for (int i = r0; i < r1; i++) BT.x[(size_t)b * dim + i] += BT.xb2[(size_t)b * dim + i];
+            {
+                ResidCtx rc = {BT.x, BT.xb2, dim};
+                matmul_batch_node(BT.xb2, dim, XQ, XS, B, w->w_out + li, vd, dim, tb, NULL, NULL, post_residual, &rc);
             }
             barrier(tb);
         }
@@ -2756,25 +2893,17 @@ static void forward_hybrid_batch_thread(int tid) {
             quantize_vec(XQ + (size_t)b * dim, XS + (size_t)b * ngd, tb->xb, dim);
         }
         barrier(tb);
-        part_range_node(hidden_dim, tb, &r0, &r1);
-        if (r0 < r1) {
-            matmul_rows_batch(BT.hb, hidden_dim, XQ, XS, B, w->w1 + l, dim, r0, r1);
-            matmul_rows_batch(BT.hb2, hidden_dim, XQ, XS, B, w->w3 + l, dim, r0, r1);
-            for (int b = 0; b < B; b++) {
-                float* h1 = BT.hb + (size_t)b * hidden_dim;
-                const float* h3 = BT.hb2 + (size_t)b * hidden_dim;
-                for (int i = r0; i < r1; i++) h1[i] = silu_f(h1[i]) * h3[i];
-            }
+        {
+            SwigluCtx gc = {BT.hb, BT.hb2, hidden_dim};
+            matmul_batch_node(BT.hb, hidden_dim, XQ, XS, B, w->w1 + l, dim, hidden_dim, tb, w->w3 + l, BT.hb2, post_swiglu_hyb, &gc);
         }
         barrier(tb);
         if (IMX.on) imx_dense(tb, IMX.w2 + (size_t)l * hidden_dim, BT.hb, hidden_dim, B, hidden_dim, NULL);
         for (int b = n0; b < n1; b++) quantize_vec(XQ + (size_t)b * hidden_dim, XS + (size_t)b * ngh, BT.hb + (size_t)b * hidden_dim, hidden_dim);
         barrier(tb);
-        part_range_node(dim, tb, &r0, &r1);
-        if (r0 < r1) {
-            matmul_rows_batch(BT.xb2, dim, XQ, XS, B, w->w2 + l, hidden_dim, r0, r1);
-            for (int b = 0; b < B; b++)
-                for (int i = r0; i < r1; i++) BT.x[(size_t)b * dim + i] += BT.xb2[(size_t)b * dim + i];
+        {
+            ResidCtx rc = {BT.x, BT.xb2, dim};
+            matmul_batch_node(BT.xb2, dim, XQ, XS, B, w->w2 + l, hidden_dim, dim, tb, NULL, NULL, post_residual, &rc);
         }
         barrier(tb);
     }
@@ -2820,6 +2949,7 @@ static void forward_batch_thread(int tid) {
     float* XS = BN[tb->node].xs;
     tok_range(B, tb->ltid, tb->nthn, &n0, &n1); // this thread's tokens for the node-local quantizations
 
+    PROF(tid, PH_ROPE);
     // embeddings and RoPE tables for this thread's share of the tokens
     tok_range(B, tid, nth, &b0, &b1);
     for (int b = b0; b < b1; b++) {
@@ -2853,6 +2983,7 @@ static void forward_batch_thread(int tid) {
         size_t loff = (size_t)l * p->seq_len * kv_dim;
 
         if (IMX.on) imx_dense(tb, IMX.att + (size_t)l * dim, BT.x, dim, B, dim, w->rms_att_weight + l * dim);
+        PROF(tid, PH_NORM);
         // attention rmsnorm + quantize, split over tokens
         for (int b = n0; b < n1; b++) {
             rmsnorm(tb->xb, BT.x + (size_t)b * dim, w->rms_att_weight + l * dim, dim);
@@ -2860,6 +2991,7 @@ static void forward_batch_thread(int tid) {
         }
         barrier(tb);
 
+        PROF(tid, PH_QKV);
         // fused q|k|v for all tokens
         {
             int a = qa, e = qe;
@@ -2928,22 +3060,31 @@ static void forward_batch_thread(int tid) {
             barrier(tb);
         }
 
-        // causal attention: work items are (kv group, token); each item handles the kv_mul query
-        // heads of its group, so K and V rows are loaded once per item
+        PROF(tid, PH_ATT);
+        // causal attention: the node's (token, query head) pairs, a pair costing the token's
+        // position, are split among the node's threads by equal cost into contiguous ranges (a
+        // round-robin split by (kv group, token) left the slowest thread at ~1.8x the mean). Heads of
+        // the same kv group of a token are processed together, so their K and V rows load once.
         float* att = BT.att + (size_t)tid * kv_mul * p->seq_len;
         int g0, g1;
         node_groups(p->n_kv_heads, tb->node, &g0, &g1);
-        for (int item = tb->ltid; item < (g1 - g0) * B; item += tb->nthn) {
-            int g = g0 + item % (g1 - g0), b = item / (g1 - g0);
-            int T = pos0 + b + 1;
+        const int H = (g1 - g0) * kv_mul; // query heads of the node per token
+        const long cost = (long)H * ((long)B * pos0 + (long)B * (B + 1) / 2);
+        int i0 = att_item_at(cost * tb->ltid / tb->nthn, H, B, pos0);
+        int i1 = tb->ltid == tb->nthn - 1 ? B * H : att_item_at(cost * (tb->ltid + 1) / tb->nthn, H, B, pos0);
+        for (int item = i0; item < i1;) {
+            const int b = item / H, gl = (item % H) / kv_mul, ra = item % kv_mul;
+            const int base = b * H + gl * kv_mul, rb = base + kv_mul <= i1 ? kv_mul : i1 - base;
+            item = base + rb;
+            const int g = g0 + gl, T = pos0 + b + 1;
             const float* kb = s->key_cache + loff + (size_t)g * p->seq_len * head_size;
             const float* vb = s->value_cache + loff + (size_t)g * p->seq_len * head_size;
             const float* qb = BT.q + (size_t)b * q_dim + (size_t)g * kv_mul * head_size;
             float m[KV_MUL_MAX], sum[KV_MUL_MAX];
-            for (int r = 0; r < kv_mul; r++) m[r] = -FLT_MAX;
+            for (int r = ra; r < rb; r++) m[r] = -FLT_MAX;
             for (int t = 0; t < T; t++) {
                 const float* k = kb + (size_t)t * head_size;
-                for (int r = 0; r < kv_mul; r++) {
+                for (int r = ra; r < rb; r++) {
                     const float* q = qb + r * head_size;
                     float score = 0.0f;
                     for (int i = 0; i < head_size; i++) { score += q[i] * k[i]; }
@@ -2952,23 +3093,23 @@ static void forward_batch_thread(int tid) {
                     m[r] = score > m[r] ? score : m[r];
                 }
             }
-            for (int r = 0; r < kv_mul; r++) {
+            for (int r = ra; r < rb; r++) {
                 float* ar = att + (size_t)r * p->seq_len;
                 float sm = 0.0f;
                 for (int t = 0; t < T; t++) { float ev = expf(ar[t] - m[r]); ar[t] = ev; sm += ev; }
                 sum[r] = 1.0f / sm;
             }
             float* ob = BT.xb + (size_t)b * q_dim + (size_t)g * kv_mul * head_size;
-            memset(ob, 0, kv_mul * head_size * sizeof(float));
+            memset(ob + (size_t)ra * head_size, 0, (size_t)(rb - ra) * head_size * sizeof(float));
             for (int t = 0; t < T; t++) {
                 const float* v = vb + (size_t)t * head_size;
-                for (int r = 0; r < kv_mul; r++) {
+                for (int r = ra; r < rb; r++) {
                     float a = att[(size_t)r * p->seq_len + t];
                     float* o = ob + r * head_size;
                     for (int i = 0; i < head_size; i++) { o[i] += a * v[i]; }
                 }
             }
-            for (int r = 0; r < kv_mul; r++) {
+            for (int r = ra; r < rb; r++) {
                 float* o = ob + r * head_size;
                 for (int i = 0; i < head_size; i++) { o[i] *= sum[r]; }
             }
@@ -2976,25 +3117,23 @@ static void forward_batch_thread(int tid) {
         barrier(tb);
 
         if (IMX.on) imx_dense(tb, IMX.wo + (size_t)l * IMX_WO_W, BT.xb, q_dim, B, q_dim, NULL);
+        PROF(tid, PH_MERGE);
         // quantize the attention output, split over tokens
         for (int b = n0; b < n1; b++) {
             quantize_vec(XQ + (size_t)b * q_dim, XS + (size_t)b * ngq, BT.xb + (size_t)b * q_dim, q_dim);
         }
         barrier(tb);
 
+        PROF(tid, PH_WO);
         // output projection + residual
-        part_range_node(dim, tb, &r0, &r1);
         {
-            matmul_rows_batch(BT.xb2, dim, XQ, XS, B, w->wo + l, q_dim, r0, r1);
-            for (int b = 0; b < B; b++) {
-                float* x = BT.x + (size_t)b * dim;
-                const float* o = BT.xb2 + (size_t)b * dim;
-                for (int i = r0; i < r1; i++) { x[i] += o[i]; }
-            }
+            ResidCtx rc = {BT.x, BT.xb2, dim};
+            matmul_batch_node(BT.xb2, dim, XQ, XS, B, w->wo + l, q_dim, dim, tb, NULL, NULL, post_residual, &rc);
         }
         barrier(tb);
 
         if (IMX.on && p->n_experts == 0) imx_dense(tb, IMX.ffn + (size_t)l * dim, BT.x, dim, B, dim, w->rms_ffn_weight + l * dim);
+        PROF(tid, PH_FNORM);
         // ffn rmsnorm + quantize, split over tokens
         for (int b = n0; b < n1; b++) {
             rmsnorm(tb->xb, BT.x + (size_t)b * dim, w->rms_ffn_weight + l * dim, dim);
@@ -3002,47 +3141,36 @@ static void forward_batch_thread(int tid) {
         }
         barrier(tb);
 
+        PROF(tid, PH_W13);
         if (p->n_experts > 0) {
             moe_batch(tb, l, B);
         } else {
             // fused w1|w3 + SwiGLU
-            part_range_node(hidden_dim, tb, &r0, &r1);
             {
-                matmul_rows_batch(BT.hb, hidden_dim, XQ, XS, B, w->w1 + l, dim, r0, r1);
-                matmul_rows_batch(BT.hb2, hidden_dim, XQ, XS, B, w->w3 + l, dim, r0, r1);
-                for (int b = 0; b < B; b++) {
-                    float* h1 = BT.hb + (size_t)b * hidden_dim;
-                    const float* h3 = BT.hb2 + (size_t)b * hidden_dim;
-                    for (int i = r0; i < r1; i++) {
-                        float val = h1[i];
-                        val *= (1.0f / (1.0f + expf(-val)));
-                        h1[i] = val * h3[i];
-                    }
-                }
+                SwigluCtx gc = {BT.hb, BT.hb2, hidden_dim};
+                matmul_batch_node(BT.hb, hidden_dim, XQ, XS, B, w->w1 + l, dim, hidden_dim, tb, w->w3 + l, BT.hb2, post_swiglu, &gc);
             }
             barrier(tb);
 
             if (IMX.on) imx_dense(tb, IMX.w2 + (size_t)l * hidden_dim, BT.hb, hidden_dim, B, hidden_dim, NULL);
+            PROF(tid, PH_QH);
             // quantize the hidden activations, split over tokens
             for (int b = n0; b < n1; b++) {
                 quantize_vec(XQ + (size_t)b * hidden_dim, XS + (size_t)b * ngh, BT.hb + (size_t)b * hidden_dim, hidden_dim);
             }
             barrier(tb);
 
+            PROF(tid, PH_W2);
             // w2 + residual
-            part_range_node(dim, tb, &r0, &r1);
             {
-                matmul_rows_batch(BT.xb2, dim, XQ, XS, B, w->w2 + l, hidden_dim, r0, r1);
-                for (int b = 0; b < B; b++) {
-                    float* x = BT.x + (size_t)b * dim;
-                    const float* o = BT.xb2 + (size_t)b * dim;
-                    for (int i = r0; i < r1; i++) { x[i] += o[i]; }
-                }
+                ResidCtx rc = {BT.x, BT.xb2, dim};
+                matmul_batch_node(BT.xb2, dim, XQ, XS, B, w->w2 + l, hidden_dim, dim, tb, NULL, NULL, post_residual, &rc);
             }
         }
         barrier(tb);
     }
 
+    PROF(tid, PH_CLS);
     if (BT.logits_all) { // logits of every position
         for (int b = n0; b < n1; b++) {
             rmsnorm(tb->xb, BT.x + (size_t)b * dim, w->rms_final_weight, dim);
@@ -3052,6 +3180,7 @@ static void forward_batch_thread(int tid) {
         part_range_node(p->vocab_size, tb, &r0, &r1);
         matmul_rows_batch(BT.logits_all, p->vocab_size, XQ, XS, B, w->wcls, dim, r0, r1);
         barrier(tb);
+        PROF(tid, PH_IDLE);
         return;
     }
     // logits for the last token only (private rmsnorm + quantize, split classifier rows)
@@ -3060,6 +3189,7 @@ static void forward_batch_thread(int tid) {
     part_range_node(p->vocab_size, tb, &r0, &r1);
     matmul_rows(s->logits, tb->q, tb->s, w->wcls, dim, r0, r1);
     barrier(tb);
+    PROF(tid, PH_IDLE);
 }
 
 /* Multi-token decode step (B = 2..SPEC_MAX_TOK tokens at positions pos0..pos0+B-1), used to verify
