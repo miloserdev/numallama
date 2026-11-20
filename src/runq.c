@@ -32,7 +32,8 @@ double ROPE_THETA = 500000.0; // Llama 3 default
 double ROPE_FACTOR = 0.0;     // > 0 enables llama3 rope scaling (Llama 3.1 / 3.2)
 double ROPE_LOW_FREQ = 1.0, ROPE_HIGH_FREQ = 4.0, ROPE_ORIG_CTX = 8192.0;
 // architecture info from the extended header
-enum { ARCH_LLAMA3 = 0, ARCH_QWEN2 = 1, ARCH_QWEN3 = 2, ARCH_QWEN35 = 3 }; // Qwen*: ChatML template, Qwen tokenizer
+enum { ARCH_LLAMA3 = 0, ARCH_QWEN2 = 1, ARCH_QWEN3 = 2, ARCH_QWEN35 = 3, ARCH_GLM5 = 4 }; // Qwen*: ChatML template, Qwen tokenizer
+#define ARCH_IS_QWEN (ARCH >= ARCH_QWEN2 && ARCH <= ARCH_QWEN35)
 int ARCH = ARCH_LLAMA3;
 float NORM_EPS = 1e-5f;
 int QKV_BIAS = 0;
@@ -85,7 +86,13 @@ typedef struct {
   int lin_nk, lin_nv, lin_dk, lin_dv, conv_k; // linear attention: k / v heads, their dims, conv kernel
   int attn_gate, rot_dim;  // full attention: sigmoid output gate, rotary dims (partial RoPE, rotate-half)
   int conv_dim, lin_in;    // 2 nk dk + nv dv; rows of the fused input projection (conv_dim + nv dv + 2 nv)
+  // GLM-5.3-Flash (arch 4, see glm.h): n_attn MLA layers (the others KDA, which reuse lin_* / conv_* above),
+  // n_kv_heads 1 and head_dim kv_lora_rank (the KV cache holds the MLA latent)
+  int glm, g_dense, g_ql, g_kvl, g_qk, g_vh, g_H, g_dh, g_K, g_hc, g_sk, g_ihh, g_ih, g_itopk, g_kpool, g_tail, g_q4;
+  float g_hc_eps, g_rscale, g_limit, g_lower;
+  uint32_t g_amask[2];
 } Config;
+#define RECURRENT(p) ((p)->hybrid || (p)->glm) // a recurrent state that can only advance
 
 typedef struct {
   int8_t *q; // quantized values (Q4: packed nibbles)
@@ -124,6 +131,7 @@ typedef struct {
                            // and w2 (layer, n_experts * dim, moe_hidden): expert e owns a contiguous block of rows
   // (optional) classifier weights for the logits, on the last layer
   QuantizedTensor *wcls;
+  struct GlmWeights *glm;  // GLM-5.3-Flash weights (arch 4), or NULL
 } TransformerWeights;
 
 typedef struct {
@@ -152,7 +160,13 @@ typedef struct {
   int snap_pos;              // ... at this position (-1: none), e.g. right after the system prompt
   float *key_cache;   // (layer, seq_len, dim)
   float *value_cache; // (layer, seq_len, dim)
+  struct GlmState *glm; // GLM-5.3-Flash buffers, or NULL
 } RunState;
+static void glm_alloc_state(RunState *s, const Config *p, int nth);
+struct GlmWeights;
+static void glm_map_weights(TransformerWeights *tw, Config *p, void *ptr);
+static void glm_place(const Config *p, struct GlmWeights *w);
+static void glm_pack(const Config *p, struct GlmWeights *w);
 
 typedef struct {
   Config config;              // the hyperparameters of the architecture (the blueprint)
@@ -194,11 +208,18 @@ void malloc_run_state(RunState *s, Config *p) {
   s->att = calloc((size_t)p->n_heads * p->seq_len, sizeof(float));
   s->logits = calloc(p->vocab_size, sizeof(float));
   s->key_cache = calloc((size_t)p->n_attn * p->seq_len * kv_dim, sizeof(float));
-  s->value_cache = calloc((size_t)p->n_attn * p->seq_len * kv_dim, sizeof(float));
+  s->value_cache = p->glm ? calloc(1, sizeof(float)) : calloc((size_t)p->n_attn * p->seq_len * kv_dim, sizeof(float)); // GLM: latent only
+  s->glm = NULL;
   s->gate = s->lin = s->lin_o = s->lin_S = s->conv_state = NULL;
   s->next_pos = 0;
   s->snap_S = s->snap_conv = NULL;
   s->snap_pos = -1;
+  if (p->glm) {
+    int nlin = p->n_layers - p->n_attn;
+    s->lin_S = malloc((size_t)nlin * p->lin_nv * p->lin_dv * p->lin_dk * sizeof(float)); // first touched by its threads
+    s->conv_state = calloc((size_t)nlin * p->conv_dim * (p->conv_k - 1), sizeof(float));
+    glm_alloc_state(s, p, 1024);
+  }
   if (p->hybrid) {
     int nlin = p->n_layers - p->n_attn;
     s->gate = calloc(p->q_dim, sizeof(float));
@@ -567,6 +588,21 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weigh
   if (fread(&q4_format, sizeof(int), 1, file) != 1) q4_format = 0;
   int hyb[8] = {0}; // full_interval, linear k heads, v heads, k dim, v dim, conv kernel, attention gate, rotary dims
   if (fread(hyb, sizeof(hyb), 1, file) != 1) memset(hyb, 0, sizeof(hyb));
+  int gh[24] = {0}; // GLM block (export_glm5next.py)
+  if (fread(gh, sizeof(gh), 1, file) != 1) memset(gh, 0, sizeof(gh));
+  config->glm = ARCH == ARCH_GLM5;
+  if (config->glm) {
+    config->g_dense = gh[0]; config->g_ql = gh[1]; config->g_kvl = gh[2]; config->g_qk = gh[3]; config->g_vh = gh[4];
+    config->g_H = gh[5]; config->g_dh = gh[6]; config->g_K = gh[7]; config->g_hc = gh[8]; config->g_sk = gh[9];
+    memcpy(&config->g_hc_eps, &gh[10], 4); memcpy(&config->g_rscale, &gh[11], 4);
+    memcpy(&config->g_limit, &gh[12], 4); memcpy(&config->g_lower, &gh[13], 4);
+    config->g_ihh = gh[14]; config->g_ih = gh[15]; config->g_itopk = gh[16]; config->g_kpool = gh[17];
+    config->g_amask[0] = (uint32_t)gh[18]; config->g_amask[1] = (uint32_t)gh[19]; config->g_q4 = gh[20]; config->g_tail = gh[21];
+    if (config->g_hc > 8 || config->g_kpool > 16 || config->g_kvl > 1024 || config->g_dh > 256 || ext2[2] > 15) {
+      fprintf(stderr, "%s: unsupported GLM dimensions\n", checkpoint);
+      exit(EXIT_FAILURE);
+    }
+  }
   config->hybrid = ARCH == ARCH_QWEN35 && hyb[0] > 0;
   config->full_interval = hyb[0];
   config->n_attn = config->hybrid ? config->n_layers / hyb[0] : config->n_layers;
@@ -587,6 +623,15 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weigh
   config->norm_topk = ext2[5];
   config->q_dim = config->n_heads * config->head_dim;
   config->kv_dim = config->n_kv_heads * config->head_dim;
+  if (config->glm) { // KDA reuses the hybrid recurrent-state fields; n_attn = MLA layers
+    int na = 0;
+    for (int l = 0; l < config->n_layers; l++) na += (config->g_amask[l >> 5] >> (l & 31)) & 1;
+    config->n_attn = na;
+    config->lin_nk = config->lin_nv = config->g_H;
+    config->lin_dk = config->lin_dv = config->g_dh;
+    config->conv_k = config->g_K;
+    config->conv_dim = 3 * config->g_H * config->g_dh;
+  }
   // figure out the file size
   fseek(file, 0, SEEK_END); // move file pointer to end of file
   *file_size = ftell(file); // get the file size, in bytes
@@ -600,9 +645,14 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weigh
   madvise(*data, *file_size, MADV_HUGEPAGE);
 #endif
   void *weights_ptr = ((char *)*data) + header_size; // skip header bytes. char is 1 byte
-  memory_map_weights(weights, config, weights_ptr, shared_classifier); // pointers only, nothing touched yet
+  weights->glm = NULL;
+  if (config->glm) glm_map_weights(weights, config, weights_ptr);
+  else memory_map_weights(weights, config, weights_ptr, shared_classifier); // pointers only, nothing touched yet
 #if defined(__linux__)
-  if (NN > 1) place_weights(weights, config); // each node gets its rows of every matrix
+  if (NN > 1) { // each node gets its rows of every matrix
+    if (config->glm) glm_place(config, weights->glm);
+    else place_weights(weights, config);
+  }
 #endif
   fseek(file, 0, SEEK_SET);
   if (fread(*data, 1, *file_size, file) != (size_t)*file_size) {
@@ -611,6 +661,7 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weigh
   }
   fclose(file);
   dequantize(weights->q_tokens, weights->token_embedding_table, config->vocab_size * config->dim);
+  if (config->glm) { glm_pack(config, weights->glm); return; }
   pack_q8(weights, config); // after the embeddings were dequantized (the classifier may share them)
   for (int k = 0; k < NN; k++) weights->wg_node[k] = weights->wg;
 #if defined(__linux__)
@@ -649,7 +700,7 @@ void build_transformer(Transformer *t, char *checkpoint_path, int ctx) {
   // allocate the RunState buffers
   malloc_run_state(&t->state, &t->config);
 #if defined(__linux__)
-  if (NN > 1) { // KV cache of kv head g lives on the node that runs its attention
+  if (NN > 1 && !t->config.glm) { // KV cache of kv head g lives on the node that runs its attention
     Config *p = &t->config;
     int hs = p->head_dim;
     size_t head_bytes = (size_t)p->seq_len * hs * sizeof(float);
@@ -1730,7 +1781,10 @@ static void forward_hybrid_thread(int tid) {
     PROF(tid, PH_IDLE);
 }
 
+#include "glm.h"
+
 static void forward_thread(int tid) {
+    if (P.t->config.glm) { forward_glm_thread(tid); return; }
     if (P.t->config.hybrid) { forward_hybrid_thread(tid); return; }
     Transformer* transformer = P.t;
     Config* p = &transformer->config;
@@ -2302,17 +2356,19 @@ void init_pool(Transformer* t, int nth) {
     P.nth = nth;
     P.t = t;
     if (NN == 1 || NODE_T0[NN] != nth) { NN = 1; NODE_T0[0] = 0; NODE_T0[1] = nth; } // no (matching) placement
-    if (p->n_heads / p->n_kv_heads > KV_MUL_MAX) {
+    if (!p->glm && p->n_heads / p->n_kv_heads > KV_MUL_MAX) {
         fprintf(stderr, "n_heads / n_kv_heads > %d is not supported\n", KV_MUL_MAX);
         exit(EXIT_FAILURE);
     }
+    if (getenv("GLM_LAYERS")) GLM_LAYERS = atoi(getenv("GLM_LAYERS")); // debug: run only the first n layers
+    if (getenv("GLM_DEBUG_SEL")) GLM_DEBUG_SEL = 1;
     init_model_runtime(t);
     use_model(t);
     int qmax = p->dim > p->hidden_dim ? p->dim : p->hidden_dim;
     if (p->q_dim > qmax) qmax = p->q_dim;
     if (p->n_experts > 0 && p->n_active * p->moe_hidden > qmax) qmax = p->n_active * p->moe_hidden;
     P_qmax = qmax;
-    if (p->n_experts > 256 || (p->n_experts > 0 && SPEC_MAX_TOK * p->n_experts > 4096)) { fprintf(stderr, "at most 256 experts are supported\n"); exit(EXIT_FAILURE); }
+    if (!p->glm && (p->n_experts > 256 || (p->n_experts > 0 && SPEC_MAX_TOK * p->n_experts > 4096))) { fprintf(stderr, "at most 256 experts are supported\n"); exit(EXIT_FAILURE); }
     if (p->n_active > MOE_MAX_ACTIVE) { fprintf(stderr, "at most %d active experts are supported\n", MOE_MAX_ACTIVE); exit(EXIT_FAILURE); }
     P.tb = aligned_alloc(128, nth * sizeof(ThreadBuf));
     memset(P.tb, 0, nth * sizeof(ThreadBuf));
@@ -2422,7 +2478,7 @@ void free_pool(void) {
 
 float* forward(Transformer* transformer, int token, int pos) {
     use_model(transformer);
-    if (transformer->config.hybrid) { // the recurrent state can only advance, or restart at 0
+    if (RECURRENT(&transformer->config)) { // the recurrent state can only advance, or restart at 0
         if (pos != 0 && pos != transformer->state.next_pos) {
             fprintf(stderr, "hybrid model: position %d out of order (state at %d)\n", pos, transformer->state.next_pos);
             exit(EXIT_FAILURE);
@@ -2930,7 +2986,10 @@ static void forward_hybrid_batch_thread(int tid) {
     barrier(tb);
 }
 
+#include "glm_batch.h"
+
 static void forward_batch_thread(int tid) {
+    if (P.t->config.glm) { forward_glm_batch_thread(tid); return; }
     if (P.t->config.hybrid) { forward_hybrid_batch_thread(tid); return; }
     Transformer* transformer = P.t;
     Config* p = &transformer->config;
@@ -3487,6 +3546,7 @@ static void forward_multi_thread(int tid) {
 
 static void init_batch(Transformer* t) {
     Config* p = &t->config;
+    if (p->glm) { glm_init_batch(t); return; } // GLM: buffers of its own (glm_batch.h)
     int kv_dim = p->kv_dim, q_dim = p->q_dim, head_size = p->head_dim;
     int qmax = p->dim > p->hidden_dim ? p->dim : p->hidden_dim;
     if (q_dim > qmax) qmax = q_dim;
@@ -3563,7 +3623,7 @@ float* forward_all(Transformer* transformer, const int* tokens, int n, int pos0)
     use_model(transformer);
     int V = transformer->config.vocab_size;
     if (!SPEC_LOGITS) SPEC_LOGITS = malloc((size_t)SPEC_MAX * V * sizeof(float));
-    if (n == 1 || transformer->config.hybrid) { // hybrid: no multi-token step (the state cannot roll back)
+    if (n == 1 || RECURRENT(&transformer->config)) { // hybrid: no multi-token step (the state cannot roll back)
         for (int i = 0; i < n; i++) memcpy(SPEC_LOGITS + (size_t)i * V, forward(transformer, tokens[i], pos0 + i), V * sizeof(float));
         return SPEC_LOGITS;
     }
@@ -3593,7 +3653,7 @@ float* forward_all(Transformer* transformer, const int* tokens, int n, int pos0)
 
 float* forward_batch(Transformer* transformer, const int* tokens, int n, int pos0) {
     use_model(transformer);
-    if (transformer->config.hybrid) {
+    if (transformer->config.hybrid || transformer->config.glm) {
         if (!HYB_BATCH) { // token by token
             float* l = NULL;
             for (int i = 0; i < n; i++) l = forward(transformer, tokens[i], pos0 + i);
@@ -3817,7 +3877,7 @@ static int pretoken_len(const unsigned char *s) {
   // \p{N}{1,3}
   if (cp_is_number(c)) {
     int i = n, d, m, k = 1;
-    int maxd = ARCH >= ARCH_QWEN2 ? 1 : 3; // \p{N} (Qwen2) vs \p{N}{1,3} (Llama 3)
+    int maxd = ARCH_IS_QWEN ? 1 : 3; // \p{N} (Qwen2) vs \p{N}{1,3} (Llama 3, GLM)
     while (k < maxd && s[i] && (m = utf8_decode(s + i, &d), cp_is_number(d))) { i += m; k++; }
     return i;
   }
@@ -4375,7 +4435,7 @@ static size_t hyb_state_floats(const Config *p) { return (size_t)(p->n_layers - 
 static size_t hyb_conv_floats(const Config *p) { return (size_t)(p->n_layers - p->n_attn) * p->conv_dim * (p->conv_k - 1); }
 static void hybrid_snapshot(Transformer *t) {
   RunState *s = &t->state;
-  if (!t->config.hybrid) return;
+  if (!RECURRENT(&t->config)) return;
   if (!s->snap_S) {
     s->snap_S = malloc(hyb_state_floats(&t->config) * sizeof(float));
     s->snap_conv = malloc(hyb_conv_floats(&t->config) * sizeof(float));
@@ -4386,7 +4446,7 @@ static void hybrid_snapshot(Transformer *t) {
 }
 static int hybrid_restore(Transformer *t, int pos) { // 1 if the state now stands at pos
   RunState *s = &t->state;
-  if (!t->config.hybrid) return 1;
+  if (!RECURRENT(&t->config)) return 1;
   if (s->snap_pos != pos) return 0;
   memcpy(s->lin_S, s->snap_S, hyb_state_floats(&t->config) * sizeof(float));
   memcpy(s->conv_state, s->snap_conv, hyb_conv_floats(&t->config) * sizeof(float));
@@ -4469,6 +4529,7 @@ static Tools *g_tools = NULL; // set by -f tools.json
 // ChatML special token ids (Qwen2.5 / Qwen3 values; looked up in the vocabulary by init_special_tokens)
 static int QWEN_ENDOFTEXT = 151643, QWEN_IM_END = 151645, QWEN_TOOL_CALL = 151657, QWEN_TOOL_CALL_END = 151658;
 static int QWEN_THINK = -1, QWEN_THINK_END = -1;
+static int GLM_USER = -1, GLM_OBSERVATION = -1; // GLM: a reply ends where the next turn would start
 static int THINK = 0; // -r 1: Qwen3.5 / 3.8 reasoning (the reply starts inside <think>); 0: an empty think block
 static int find_special(Tokenizer *tk, const char *s) {
   for (int i = SPECIAL_START; i < tk->vocab_size; i++)
@@ -4484,16 +4545,29 @@ static void init_special_tokens(Tokenizer *tk) {
   if ((v = find_special(tk, "</tool_call>")) >= 0) QWEN_TOOL_CALL_END = v;
   QWEN_THINK = find_special(tk, "<think>");
   QWEN_THINK_END = find_special(tk, "</think>");
+  if (ARCH == ARCH_GLM5) {
+    QWEN_IM_END = -1;
+    GLM_USER = find_special(tk, "<|user|>");
+    GLM_OBSERVATION = find_special(tk, "<|observation|>");
+  }
 }
 
 static int is_end_token(int t) {
+  if (ARCH == ARCH_GLM5) return t == QWEN_ENDOFTEXT || t == GLM_USER || t == GLM_OBSERVATION;
   if (ARCH >= ARCH_QWEN2) return t == QWEN_IM_END || t == QWEN_ENDOFTEXT;
   return t == LLAMA3_EOT || t == LLAMA3_EOS || t == LLAMA3_EOM;
 }
 
 // text that follows the end token of an assistant message in the template
-static const char *after_end(void) { return ARCH >= ARCH_QWEN2 ? "\n" : ""; }
-static const char *end_text(void) { return ARCH >= ARCH_QWEN2 ? "<|im_end|>" : "<|eot_id|>"; }
+// (GLM: none, the next turn's role token ends the message; the model's end token is not kept)
+static const char *after_end(void) { return ARCH_IS_QWEN ? "\n" : ""; }
+static const char *end_text(void) { return ARCH == ARCH_GLM5 ? "" : ARCH_IS_QWEN ? "<|im_end|>" : "<|eot_id|>"; }
+// the generation prompt opens a think block (Qwen3.5 / 3.8, GLM): -r 1 leaves it open, otherwise it is empty
+#define THINK_IN_PROMPT (ARCH == ARCH_QWEN35 || ARCH == ARCH_GLM5)
+static const char *think_open(void) {
+  if (ARCH == ARCH_GLM5) return THINK ? "<think>" : "<think></think>";
+  return THINK ? "<think>\n" : "<think>\n\n</think>\n\n";
+}
 
 // append the tokens of plain text (special tokens are NOT recognized: user content can't inject them)
 static int push_text(Tokenizer *tk, const char *s, int *msg, int m) {
@@ -4514,7 +4588,7 @@ static int push_tpl(Tokenizer *tk, const char *s, int *msg, int m) {
     for (int i = SPECIAL_START; i < tk->vocab_size; i++) {
       const char *v = tk->vocab[i];
       size_t l = strlen(v);
-      if (l > 2 && v[0] == '<' && v[l - 1] == '>' && strncmp(v, "<|unused_", 9) && strncmp(v, "<|dup_", 6)) {
+      if (l > 2 && ((v[0] == '<' && v[l - 1] == '>') || (v[0] == '[' && v[l - 1] == ']')) && strncmp(v, "<|unused_", 9) && strncmp(v, "<|dup_", 6)) {
         special_ids[n_special] = i;
         special_len[n_special++] = l;
       }
@@ -4524,7 +4598,7 @@ static int push_tpl(Tokenizer *tk, const char *s, int *msg, int m) {
   sb_puts(&seg, "");
   while (*s) {
     int found = -1;
-    if (*s == '<') {
+    if (*s == '<' || *s == '[') {
       for (int k = 0; k < n_special; k++) {
         if (!strncmp(s, tk->vocab[special_ids[k]], special_len[k])) { found = k; break; }
       }
@@ -4546,7 +4620,20 @@ static int push_tpl(Tokenizer *tk, const char *s, int *msg, int m) {
 static int build_system(Tokenizer *tk, const char *sys_text, int *msg, int m) {
   SBuf b = {0};
   sb_puts(&b, "");
-  if (ARCH == ARCH_QWEN35) { // Qwen3.5 / 3.8 template (XML tool calls, optional reasoning instructions)
+  if (ARCH == ARCH_GLM5) { // GLM-5.3: no newlines between turns, reasoning effort in the first system message
+    sb_puts(&b, "[gMASK]<sop><|system|>Reasoning Effort: Max");
+    if (g_tools) {
+      sb_puts(&b, "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+                  "You are provided with function signatures within <tools></tools> XML tags:\n<tools>");
+      char *tp = tools_prompt(g_tools, -1, "\n", "");
+      sb_puts(&b, tp);
+      free(tp);
+      sb_puts(&b, "\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n"
+                  "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>"
+                  "<arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>");
+    }
+    if (sys_text[0]) { sb_puts(&b, "<|system|>"); sb_puts(&b, sys_text); }
+  } else if (ARCH == ARCH_QWEN35) { // Qwen3.5 / 3.8 template (XML tool calls, optional reasoning instructions)
     const char *reason = THINK ? "Reasoning effort is set to xhigh. Please think carefully through the task, validate key "
                                  "assumptions, consider plausible alternatives, and prioritize correctness, consistency, and "
                                  "clarity in the final answer." : "";
@@ -4624,11 +4711,16 @@ static int build_system(Tokenizer *tk, const char *sys_text, int *msg, int m) {
 
 static int build_user(Tokenizer *tk, const char *prefix, const char *text, int *msg, int m) {
   m = push_tpl(tk, prefix, msg, m);
-  if (ARCH >= ARCH_QWEN2) {
+  if (ARCH == ARCH_GLM5) {
+    m = push_tpl(tk, "<|user|>", msg, m);
+    m = push_text(tk, text, msg, m);
+    m = push_tpl(tk, "<|assistant|>", msg, m);
+    m = push_tpl(tk, think_open(), msg, m);
+  } else if (ARCH >= ARCH_QWEN2) {
     m = push_tpl(tk, "<|im_start|>user\n", msg, m);
     m = push_text(tk, text, msg, m);
     m = push_tpl(tk, "<|im_end|>\n<|im_start|>assistant\n", msg, m);
-    if (ARCH == ARCH_QWEN35) m = push_tpl(tk, THINK ? "<think>\n" : "<think>\n\n</think>\n\n", msg, m);
+    if (ARCH == ARCH_QWEN35) m = push_tpl(tk, think_open(), msg, m);
   } else {
     m = push_tpl(tk, "<|start_header_id|>user<|end_header_id|>\n\n", msg, m);
     m = push_text(tk, text, msg, m);
@@ -4639,7 +4731,16 @@ static int build_user(Tokenizer *tk, const char *prefix, const char *text, int *
 
 static int build_tool_results(Tokenizer *tk, const char *prefix, char **outs, int n, int *msg, int m) {
   m = push_tpl(tk, prefix, msg, m);
-  if (ARCH >= ARCH_QWEN2) {
+  if (ARCH == ARCH_GLM5) {
+    m = push_tpl(tk, "<|observation|>", msg, m);
+    for (int i = 0; i < n; i++) {
+      m = push_tpl(tk, "<tool_response>", msg, m);
+      m = push_text(tk, outs[i], msg, m);
+      m = push_tpl(tk, "</tool_response>", msg, m);
+    }
+    m = push_tpl(tk, "<|assistant|>", msg, m);
+    m = push_tpl(tk, think_open(), msg, m);
+  } else if (ARCH >= ARCH_QWEN2) {
     m = push_tpl(tk, "<|im_start|>user", msg, m);
     for (int i = 0; i < n; i++) {
       m = push_tpl(tk, "\n<tool_response>\n", msg, m);
@@ -4647,7 +4748,7 @@ static int build_tool_results(Tokenizer *tk, const char *prefix, char **outs, in
       m = push_tpl(tk, "\n</tool_response>", msg, m);
     }
     m = push_tpl(tk, "<|im_end|>\n<|im_start|>assistant\n", msg, m);
-    if (ARCH == ARCH_QWEN35) m = push_tpl(tk, THINK ? "<think>\n" : "<think>\n\n</think>\n\n", msg, m);
+    if (ARCH == ARCH_QWEN35) m = push_tpl(tk, think_open(), msg, m);
   } else {
     for (int i = 0; i < n; i++) {
       m = push_tpl(tk, "<|start_header_id|>ipython<|end_header_id|>\n\n", msg, m);
@@ -4698,6 +4799,49 @@ static JNode *normalize_call(JNode *j) {
 /* Qwen3.5 / 3.8 call body: <function=NAME>\n<parameter=P>\nVALUE\n</parameter>...</function>
  * -> {"name": NAME, "parameters": {P: VALUE, ...}} (a VALUE that parses as a JSON number / object /
  * array / literal keeps its type, anything else is a string). NULL if it is not a call. */
+/* GLM: name<arg_key>k</arg_key><arg_value>v</arg_value>... (v is raw text, or JSON for non-strings) */
+static JNode *parse_glm_call(const char *s) {
+  while (*s && isspace((unsigned char)*s)) s++;
+  const char *ne = strstr(s, "<arg_key>");
+  if (!ne) ne = s + strlen(s);
+  const char *nend = ne;
+  while (nend > s && isspace((unsigned char)nend[-1])) nend--;
+  if (nend == s) return NULL;
+  JNode *out = calloc(1, sizeof(JNode));
+  out->type = J_OBJ;
+  JNode *n = calloc(1, sizeof(JNode));
+  n->type = J_STR; n->key = strdup("name"); n->str = strndup(s, nend - s);
+  out->child = n;
+  JNode *params = calloc(1, sizeof(JNode));
+  params->type = J_OBJ; params->key = strdup("parameters");
+  n->next = params;
+  JNode **tail = &params->child;
+  const char *p = ne;
+  while ((p = strstr(p, "<arg_key>")) != NULL) {
+    p += 9;
+    const char *ke = strstr(p, "</arg_key>");
+    if (!ke) break;
+    const char *v = strstr(ke, "<arg_value>");
+    if (!v) break;
+    v += 11;
+    const char *ve = strstr(v, "</arg_value>");
+    if (!ve) break;
+    char *val = strndup(v, ve - v);
+    JNode *j = NULL;
+    if (val[0] && strchr("-0123456789{[tfn", val[0])) {
+      const char *endp = NULL;
+      j = json_parse(val, &endp);
+      if (j && (j->type == J_STR || (endp && *endp))) { json_free(j); j = NULL; }
+    }
+    if (!j) { j = calloc(1, sizeof(JNode)); j->type = J_STR; j->str = strdup(val); }
+    free(val);
+    j->key = strndup(p, ke - p);
+    *tail = j;
+    tail = &j->next;
+    p = ve + 12;
+  }
+  return out;
+}
 static JNode *parse_xml_call(const char *s) {
   const char *f = strstr(s, "<function=");
   if (!f) return NULL;
@@ -4813,7 +4957,8 @@ static void reply_token(ReplyState *rs, Tokenizer *tk, int next) {
     buf->buf[0] = '\0';
   } else if (ARCH >= ARCH_QWEN2 && next == QWEN_TOOL_CALL_END) {
     if (rs->mode == 2 && rs->n_calls < MAX_CALLS_PER_REPLY) {
-      JNode *c = ARCH == ARCH_QWEN35 && strstr(buf->buf, "<function=") ? parse_xml_call(buf->buf) : normalize_call(json_parse(buf->buf, NULL));
+      JNode *c = ARCH == ARCH_GLM5 ? parse_glm_call(buf->buf)
+                 : ARCH == ARCH_QWEN35 && strstr(buf->buf, "<function=") ? parse_xml_call(buf->buf) : normalize_call(json_parse(buf->buf, NULL));
       if (c) rs->calls[rs->n_calls++] = c;
       else { out_text("<tool_call>", 0); out_text(buf->buf, 0); out_text("</tool_call>", 0); }
     }
@@ -4865,7 +5010,7 @@ static void reply_token(ReplyState *rs, Tokenizer *tk, int next) {
 static int chat_reply(Transformer *tr, Tokenizer *tk, Sampler *sp, ChatHistory *h, float *logits, int *ended, int *gen,
                       JNode **calls) {
   ReplyState rs = {.mode = 0, .n_calls = 0, .token = -1, .calls = calls};
-  if (ARCH == ARCH_QWEN35 && THINK) { out_ctl("\033[2m"); rs.think = 1; } // the prompt already opened <think>
+  if (THINK_IN_PROMPT && THINK) { out_ctl("\033[2m"); rs.think = 1; } // the prompt already opened <think>
   sb_puts(&rs.buf, "");
   const int V = tr->config.vocab_size;
   float *own = malloc((size_t)V * sizeof(float)); // logits we own (the shared buffers get overwritten)
@@ -4879,7 +5024,8 @@ static int chat_reply(Transformer *tr, Tokenizer *tk, Sampler *sp, ChatHistory *
     int next = pending >= 0 ? pending : sample(sp, own);
     pending = -1;
     if (is_end_token(next)) {
-      if (h->n < h->cap) {
+      if (ARCH == ARCH_GLM5) *ended = 1; // the next turn starts with its own role token
+      else if (h->n < h->cap) {
         chat_feed(tr, h, &next, 1); // keep the end token in the history
         *ended = 1;
       }
@@ -5286,7 +5432,7 @@ int main(int argc, char *argv[]) {
 #endif
   build_transformer(&transformer, checkpoint_path, ctx);
   init_pool(&transformer, nthreads);
-  if (transformer.config.hybrid && (SPEC_K > 0 || draft_path)) { // a recurrent state cannot drop rejected drafts
+  if (RECURRENT(&transformer.config) && (SPEC_K > 0 || draft_path)) { // a recurrent state cannot drop rejected drafts
     SPEC_K = 0;
     draft_path = NULL;
   }

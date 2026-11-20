@@ -196,7 +196,20 @@ static void render_calls(SBuf *b, JNode *calls, int had_text) {
     JNode *fn = json_get(c, "function"), *name = fn ? json_get(fn, "name") : NULL;
     if (!name || name->type != J_STR) continue;
     JNode *args = call_args(fn);
-    if (ARCH == ARCH_QWEN35) {
+    if (ARCH == ARCH_GLM5) { // calls follow the text directly, one after the other
+      sb_puts(b, "<tool_call>");
+      sb_puts(b, name->str);
+      for (JNode *p = args->child; p; p = p->next) {
+        sb_puts(b, "<arg_key>");
+        sb_puts(b, p->key);
+        sb_puts(b, "</arg_key><arg_value>");
+        char *v = arg_to_string(p);
+        sb_puts(b, v);
+        free(v);
+        sb_puts(b, "</arg_value>");
+      }
+      sb_puts(b, "</tool_call>");
+    } else if (ARCH == ARCH_QWEN35) {
       sb_puts(b, i == 0 ? (had_text ? "\n\n" : "") : "\n");
       sb_puts(b, "<tool_call>\n<function=");
       sb_puts(b, name->str);
@@ -248,21 +261,27 @@ static int render_chat(Tokenizer *tk, JNode *messages, int *out, char *err, size
   while (sl > 0 && isspace((unsigned char)st[sl - 1])) st[--sl] = '\0';
   int n = build_system(tk, st, out, 0);
   free(sys.buf);
-  const int qwen = ARCH >= ARCH_QWEN2;
-  int in_tools = 0; // Qwen: consecutive tool messages share one user message
+  const int glm = ARCH == ARCH_GLM5, qwen = ARCH_IS_QWEN;
+  int in_tools = 0; // Qwen: consecutive tool messages share one user message (GLM: one <|observation|>)
   for (JNode *m = messages->child; m; m = m->next) {
     const char *role = json_get(m, "role")->str;
     if (!strcmp(role, "system") || !strcmp(role, "developer")) continue;
     int is_tool = !strcmp(role, "tool") || !strcmp(role, "function");
-    if (in_tools && !is_tool) { n = push_tpl(tk, "<|im_end|>\n", out, n); in_tools = 0; }
+    if (in_tools && !is_tool) { if (qwen) n = push_tpl(tk, "<|im_end|>\n", out, n); in_tools = 0; }
     t.len = 0;
     if (!msg_text(json_get(m, "content"), &t)) { snprintf(err, errlen, "only text content is supported"); free(t.buf); return -1; }
     if (!strcmp(role, "user")) {
-      n = push_tpl(tk, qwen ? "<|im_start|>user\n" : "<|start_header_id|>user<|end_header_id|>\n\n", out, n);
+      n = push_tpl(tk, glm ? "<|user|>" : qwen ? "<|im_start|>user\n" : "<|start_header_id|>user<|end_header_id|>\n\n", out, n);
       n = push_text(tk, t.buf, out, n);
-      n = push_tpl(tk, qwen ? "<|im_end|>\n" : "<|eot_id|>", out, n);
+      n = push_tpl(tk, glm ? "" : qwen ? "<|im_end|>\n" : "<|eot_id|>", out, n);
     } else if (is_tool) {
-      if (qwen) {
+      if (glm) {
+        if (!in_tools) n = push_tpl(tk, "<|observation|>", out, n);
+        in_tools = 1;
+        n = push_tpl(tk, "<tool_response>", out, n);
+        n = push_text(tk, t.buf, out, n);
+        n = push_tpl(tk, "</tool_response>", out, n);
+      } else if (qwen) {
         if (!in_tools) n = push_tpl(tk, "<|im_start|>user", out, n);
         in_tools = 1;
         n = push_tpl(tk, "\n<tool_response>\n", out, n);
@@ -276,7 +295,7 @@ static int render_chat(Tokenizer *tk, JNode *messages, int *out, char *err, size
     } else if (!strcmp(role, "assistant")) {
       JNode *calls = json_get(m, "tool_calls");
       int has_calls = calls && calls->type == J_ARR && calls->child;
-      if (!qwen && has_calls) { // Llama 3.1: one call per message
+      if (!qwen && !glm && has_calls) { // Llama 3.1: one call per message
         for (JNode *c = calls->child; c; c = c->next) {
           JNode one = {.type = J_ARR, .child = c};
           JNode *nx = c->next;
@@ -292,8 +311,19 @@ static int render_chat(Tokenizer *tk, JNode *messages, int *out, char *err, size
         }
         continue;
       }
-      n = push_tpl(tk, qwen ? "<|im_start|>assistant\n" : "<|start_header_id|>assistant<|end_header_id|>\n\n", out, n);
-      if (ARCH == ARCH_QWEN35) { // the same think block the generation prompt opens
+      n = push_tpl(tk, glm ? "<|assistant|>" : qwen ? "<|im_start|>assistant\n" : "<|start_header_id|>assistant<|end_header_id|>\n\n", out, n);
+      if (glm) { // reasoning is kept in the history (clear_thinking = false)
+        JNode *rc = json_get(m, "reasoning_content");
+        n = push_tpl(tk, "<think>", out, n);
+        if (rc && rc->type == J_STR) n = push_text(tk, rc->str, out, n);
+        n = push_tpl(tk, "</think>", out, n);
+        char *c = t.buf; // the template strips the content
+        while (*c && isspace((unsigned char)*c)) c++;
+        size_t cl = strlen(c);
+        while (cl > 0 && isspace((unsigned char)c[cl - 1])) c[--cl] = '\0';
+        memmove(t.buf, c, cl + 1);
+        t.len = cl;
+      } else if (ARCH == ARCH_QWEN35) { // the same think block the generation prompt opens
         JNode *rc = json_get(m, "reasoning_content");
         if (THINK && rc && rc->type == J_STR) {
           n = push_tpl(tk, "<think>\n", out, n);
@@ -319,11 +349,14 @@ static int render_chat(Tokenizer *tk, JNode *messages, int *out, char *err, size
       return -1;
     }
   }
-  if (in_tools) n = push_tpl(tk, "<|im_end|>\n", out, n);
+  if (in_tools && qwen) n = push_tpl(tk, "<|im_end|>\n", out, n);
   free(t.buf);
-  if (qwen) {
+  if (glm) {
+    n = push_tpl(tk, "<|assistant|>", out, n);
+    n = push_tpl(tk, think_open(), out, n);
+  } else if (qwen) {
     n = push_tpl(tk, "<|im_start|>assistant\n", out, n);
-    if (ARCH == ARCH_QWEN35) n = push_tpl(tk, THINK ? "<think>\n" : "<think>\n\n</think>\n\n", out, n);
+    if (ARCH == ARCH_QWEN35) n = push_tpl(tk, think_open(), out, n);
   } else {
     n = push_tpl(tk, "<|start_header_id|>assistant<|end_header_id|>\n\n", out, n);
   }
