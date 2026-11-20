@@ -135,38 +135,13 @@ static void glm_post_swiglu(void* c, int b0, int b1, int r0, int r1) {
     }
 }
 
-/* selected tokens of block token at pos (into out, count into *nout; -1: every token up to pos while there
- * are at most top-k / kpool complete pools); score: scratch of 2 * pools floats */
+// selected tokens of the block token at pos into out (*nout = -1: every token up to pos); score: 2 * pools floats
 static void glm_select_into(const Config* p, const GlmState* g, int ai, int pos, const float* qidx, const float* hw,
                             float* score, int* out, int* nout) {
-    const int kp = p->g_kpool, ih = p->g_ih, ihh = p->g_ihh, T = pos + 1, npool = T / kp, maxpool = p->g_itopk / kp;
-    if (npool <= maxpool) { *nout = -1; return; }
-    const float* pk = g->ipool + (size_t)ai * (p->seq_len / kp + 1) * ih;
-    const float sc = 1.0f / sqrtf((float)ih), hs = 1.0f / sqrtf((float)ihh);
-    for (int j = 0; j < npool; j++) {
-        const float* k = pk + (size_t)j * ih;
-        float s = 0.0f;
-        for (int h = 0; h < ihh; h++) {
-            const float* q = qidx + (size_t)h * ih;
-            float d = 0.0f;
-            for (int i = 0; i < ih; i++) d += q[i] * k[i];
-            d *= sc;
-            if (d > 0.0f) s += hw[h] * hs * d;
-        }
-        score[j] = s;
-    }
-    float* tmp = score + npool; // the maxpool-th largest score
-    memcpy(tmp, score, npool * sizeof(float));
-    qsort(tmp, npool, sizeof(float), glm_cmp_desc);
-    const float thr = tmp[maxpool - 1];
-    int above = 0, n = 0;
-    for (int j = 0; j < npool; j++) above += score[j] > thr;
-    int eq_left = maxpool - above;
-    for (int j = 0; j < npool; j++)
-        if (score[j] > thr || (score[j] == thr && eq_left-- > 0))
-            for (int t = j * kp; t < j * kp + kp; t++) out[n++] = t;
-    for (int t = npool * kp; t < T; t++) out[n++] = t;
-    *nout = n;
+    if (!glm_selects(p, pos)) { *nout = -1; return; }
+    const int np = (pos + 1) / p->g_kpool;
+    glm_pool_scores(p, g, ai, 0, np, qidx, hw, score);
+    *nout = glm_pick(p, score, pos, out, score + np);
 }
 
 static void forward_glm_batch_thread(int tid) {

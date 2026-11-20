@@ -204,7 +204,7 @@ static void glm_alloc_state(RunState* s, const Config* p, int nth) {
     g->ikey = malloc(LA * T * p->g_ih * sizeof(float));
     g->igate = malloc(LA * T * p->g_ih * sizeof(float));
     g->ipool = malloc(LA * (T / p->g_kpool + 1) * p->g_ih * sizeof(float));
-    g->iscore = malloc((T / p->g_kpool + 1) * sizeof(float));
+    g->iscore = malloc(2 * (T / p->g_kpool + 1) * sizeof(float));
     g->isel = malloc((T + 8) * sizeof(int));
     if (!g->hs || !g->h1 || !g->ikey || !g->igate || !g->ipool || !g->isel) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
 }
@@ -291,25 +291,19 @@ static void glm_matmul_heads(float* out, const int8_t* xq, const float* xs, cons
 }
 static inline float glm_sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
-/* DSA indexer for the current token of attention layer ai at position pos: the tokens to attend to,
- * sorted, in g->isel[0 .. g->nsel). With at most top-k / kpool complete pools every visible token is
- * kept; otherwise the top-scoring pools of kpool tokens plus the incomplete tail pool. Run by one thread. */
+/* DSA indexer: with at most top-k / kpool complete pools every visible token is kept (nsel = -1),
+ * otherwise the top-scoring pools of kpool tokens plus the incomplete tail pool. */
 static int glm_cmp_desc(const void* a, const void* b) {
     float x = *(const float*)a, y = *(const float*)b;
     return x < y ? 1 : x > y ? -1 : 0;
 }
-static void glm_indexer_select(const Config* p, GlmState* g, int ai, int pos, const float* qidx, const float* hw) {
-    const int kp = p->g_kpool, ih = p->g_ih, ihh = p->g_ihh, T = pos + 1, npool = T / kp, maxpool = p->g_itopk / kp;
-    int n = 0;
-    if (npool <= maxpool) {
-        for (int t = 0; t < T; t++) g->isel[n++] = t;
-        g->nsel = n;
-        return;
-    }
+// index scores of pools [j0, j1) of attention layer ai for the indexer queries qidx and head weights hw
+static void glm_pool_scores(const Config* p, const GlmState* g, int ai, int j0, int j1, const float* qidx, const float* hw, float* score) {
+    const int kp = p->g_kpool, ih = p->g_ih, ihh = p->g_ihh;
     const float* pk = g->ipool + (size_t)ai * (p->seq_len / kp + 1) * ih;
     const float sc = 1.0f / sqrtf((float)ih);
     const float hs = 1.0f / sqrtf((float)ihh); // head weights are weights_proj(x) / sqrt(heads)
-    for (int j = 0; j < npool; j++) {
+    for (int j = j0; j < j1; j++) {
         const float* k = pk + (size_t)j * ih;
         float s = 0.0f;
         for (int h = 0; h < ihh; h++) {
@@ -319,26 +313,27 @@ static void glm_indexer_select(const Config* p, GlmState* g, int ai, int pos, co
             d *= sc;
             if (d > 0.0f) s += hw[h] * hs * d;
         }
-        g->iscore[j] = s;
+        score[j] = s;
     }
-    // threshold = maxpool-th largest score (ties: lower pool index first, as a stable top-k would not
-    // guarantee either; exact ties of float scores do not happen in practice)
-    float* tmp = malloc(npool * sizeof(float));
-    memcpy(tmp, g->iscore, npool * sizeof(float));
+}
+/* the tokens of the top-scoring maxpool pools plus the tail after the last complete pool, ascending;
+ * tmp: npool floats of scratch. Ties at the threshold go to the lower pool index. Returns their number. */
+static int glm_pick(const Config* p, const float* score, int pos, int* out, float* tmp) {
+    const int kp = p->g_kpool, T = pos + 1, npool = T / kp, maxpool = p->g_itopk / kp;
+    memcpy(tmp, score, npool * sizeof(float));
     qsort(tmp, npool, sizeof(float), glm_cmp_desc);
     const float thr = tmp[maxpool - 1];
-    int above = 0;
-    for (int j = 0; j < npool; j++) above += g->iscore[j] > thr;
+    int above = 0, n = 0;
+    for (int j = 0; j < npool; j++) above += score[j] > thr;
     int eq_left = maxpool - above;
-    free(tmp);
-    for (int j = 0; j < npool; j++) {
-        int take = g->iscore[j] > thr || (g->iscore[j] == thr && eq_left-- > 0);
-        if (take)
-            for (int t = j * kp; t < j * kp + kp; t++) g->isel[n++] = t;
-    }
-    for (int t = npool * kp; t < T; t++) g->isel[n++] = t; // tail
-    g->nsel = n;
+    for (int j = 0; j < npool; j++)
+        if (score[j] > thr || (score[j] == thr && eq_left-- > 0))
+            for (int t = j * kp; t < j * kp + kp; t++) out[n++] = t;
+    for (int t = npool * kp; t < T; t++) out[n++] = t;
+    return n;
 }
+// does the indexer of a token at pos have to choose (more complete pools than top-k / kpool)?
+static inline int glm_selects(const Config* p, int pos) { return (pos + 1) / p->g_kpool > p->g_itopk / p->g_kpool; }
 // pooled indexer key of pool j of layer ai (once its kp tokens are cached): softmax over the pool's
 // tokens (per channel) of gate score + position embedding, weighted sum of the keys
 static void glm_pool_key(const Config* p, const GlmWeights* w, GlmState* g, int ai, int j) {
@@ -520,25 +515,33 @@ static void forward_glm_thread(int tid) {
                 node_norm_quant(tb, g->mla, w->qa_norm + (size_t)ai * ql, ql);
                 while (grab_rows(base + 1, nh * qk + ihh * ih, tb, &r0, &r1)) matmul_rows(g->qb, nq, ns, w->q_b + ai, ql, r0, r1);
                 barrier(tb);
-                if (tid == 0) {
-                    glm_indexer_select(p, g, ai, pos, g->qb + (size_t)nh * qk, g->mla + ql + kvl + ih);
-                    if (GLM_DEBUG_SEL && ai == 0 && (pos + 1) / kp > p->g_itopk / kp) {
-                        fprintf(stderr, "score %d:", pos);
-                        for (int j = 0; j < (pos + 1) / kp; j++) fprintf(stderr, " %.5f", g->iscore[j]);
-                        fprintf(stderr, "\n");
-                    }
-                    if (GLM_DEBUG_SEL && ai == 0) {
-                        fprintf(stderr, "sel %d:", pos);
-                        for (int j = 0; j < g->nsel; j++) fprintf(stderr, " %d", g->isel[j]);
-                        fprintf(stderr, "\n");
-                    }
+                const int sel = glm_selects(p, pos);
+                if (sel) { // indexer: score the complete pools (all threads)
+                    const int np = (pos + 1) / kp, j0 = (int)((long)np * tid / nth), j1 = (int)((long)np * (tid + 1) / nth);
+                    glm_pool_scores(p, g, ai, j0, j1, g->qb + (size_t)nh * qk, g->mla + ql + kvl + ih, g->iscore);
                 }
                 node_quant(tb, g->qb, nh * qk);
                 // absorbed queries: q'_h = W_k,h^T q_h (kvl values per head)
                 while (grab_rows(base + 2, nh * kvl, tb, &r0, &r1)) glm_matmul_heads(g->qabs, nq, ns, w->kv_bk + ai, kvl, qk, qk, r0, r1);
                 barrier(tb);
+                if (sel) { // tid 0 picks the tokens; without selection every token up to pos is attended
+                    if (tid == 0) {
+                        g->nsel = glm_pick(p, g->iscore, pos, g->isel, g->iscore + (pos + 1) / kp);
+                        if (GLM_DEBUG_SEL && ai == 0) {
+                            fprintf(stderr, "score %d:", pos);
+                            for (int j = 0; j < (pos + 1) / kp; j++) fprintf(stderr, " %.5f", g->iscore[j]);
+                            fprintf(stderr, "\n");
+                        }
+                    }
+                    barrier(tb);
+                }
+                if (GLM_DEBUG_SEL && ai == 0 && tid == 0) {
+                    fprintf(stderr, "sel %d:", pos);
+                    for (int j = 0; j < (!sel ? pos + 1 : g->nsel); j++) fprintf(stderr, " %d", !sel ? j : g->isel[j]);
+                    fprintf(stderr, "\n");
+                }
                 // attention over the selected tokens: items (head, chunk of the selection)
-                const int T = g->nsel;
+                const int all = !sel, T = all ? pos + 1 : g->nsel;
                 const int C = T / 64 < 1 ? 1 : (T / 64 < P.C ? T / 64 : P.C);
                 const float scale = 1.0f / sqrtf((float)qk);
                 const float* lc = s->key_cache + (size_t)ai * p->seq_len * kvl;
@@ -549,7 +552,7 @@ static void forward_glm_thread(int tid) {
                     float* att = s->att + (size_t)h * p->seq_len;
                     float m = -FLT_MAX;
                     for (int j = t0; j < t1; j++) {
-                        const float* kv = lc + (size_t)g->isel[j] * kvl;
+                        const float* kv = lc + (size_t)(all ? j : g->isel[j]) * kvl;
                         float sc = 0.0f;
                         for (int i = 0; i < kvl; i++) sc += q[i] * kv[i];
                         sc *= scale;
@@ -562,7 +565,7 @@ static void forward_glm_thread(int tid) {
                     for (int j = t0; j < t1; j++) {
                         const float e = expf(att[j] - m);
                         sm += e;
-                        const float* kv = lc + (size_t)g->isel[j] * kvl;
+                        const float* kv = lc + (size_t)(all ? j : g->isel[j]) * kvl;
                         for (int i = 0; i < kvl; i++) acc[i] += e * kv[i];
                     }
                     pr[0] = m;
