@@ -369,6 +369,9 @@ static void forward_glm_thread(int tid) {
     const float* ns = NB[tb->node].s;
     float pre[8], post[8], comb[64];
     int r0, r1;
+    // the mHC projection (24 x hc*D fp32) is split among at most 32 threads: every thread then reduces
+    // only 32 partial rows (reading 256 threads' partials across both sockets cost more than the dots)
+    const int hcpt = nth < 32 ? nth : 32;
 
     if (tb->ltid == 0) {
         struct WorkCounter* wc = P.work[tb->node][(P.seq + 1) & 1];
@@ -397,9 +400,9 @@ static void forward_glm_thread(int tid) {
         for (int part = 0; part < 2; part++) {
             // ---- mHC: collapse the streams into the block input
             const size_t hi = (size_t)2 * l + part;
-            glm_hc_partial(p, w->hc_fn + hi * 24 * hc * D, g->hs, g->hcp + (size_t)tid * 32, tid, nth);
+            if (tid < hcpt) glm_hc_partial(p, w->hc_fn + hi * 24 * hc * D, g->hs, g->hcp + (size_t)tid * 32, tid, hcpt);
             barrier(tb);
-            glm_hc_weights(p, g->hcp, nth, w->hc_base + hi * 24, w->hc_scale + hi * 4, pre, post, comb);
+            glm_hc_weights(p, g->hcp, hcpt, w->hc_base + hi * 24, w->hc_scale + hi * 4, pre, post, comb);
             {
                 int a = (int)((long)D * tid / nth), b = (int)((long)D * (tid + 1) / nth);
                 for (int i = a; i < b; i++) {
