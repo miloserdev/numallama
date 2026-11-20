@@ -2446,7 +2446,12 @@ float* forward(Transformer* transformer, int token, int pos) {
 // Every weight row is loaded once per block and reused for all B tokens (matrix x matrix),
 // which turns the memory-bound decode loop into a compute-bound one.
 
-#define BATCH_MAX 128
+/* Tokens per block. Every block streams all weights from memory once, so larger blocks read them
+ * less often and pass fewer barriers: 512 instead of 128 gave +5..11% prefill (8B Q8: w2 134 -> 113
+ * ms, barrier waits 168 -> 97 ms per 512 tokens). The buffers grow with it (8B: hb/hb2 29 MB each). */
+#ifndef BATCH_MAX
+#define BATCH_MAX 512
+#endif
 
 typedef struct {
     int B;            // tokens in the current block
