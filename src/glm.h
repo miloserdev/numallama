@@ -48,6 +48,7 @@ typedef struct GlmState {
     float* iscore;  // (seq / kpool) pool scores of the current token
     int* isel;      // (seq) selected tokens (sorted), -1 terminated
     int nsel;
+    float* lat[MAX_NODES]; // MLA latent cache (n_attn, seq_len, kvl), one copy per NUMA node (glm_init_batch)
 } GlmState;
 
 #define GLM_PH 12 // work-counter phases per layer
@@ -492,14 +493,16 @@ static void forward_glm_thread(int tid) {
                 const int rows = ql + kvl + 2 * ih + ihh;
                 while (grab_rows(base + 0, rows, tb, &r0, &r1)) matmul_rows(g->mla, nq, ns, w->mla_in + ai, D, r0, r1);
                 barrier(tb);
-                float* lat = s->key_cache + ((size_t)ai * p->seq_len + pos) * kvl;
-                if (tid == nth - 1) { // latent kv: RMSNorm(kv_a) into the cache
+                const size_t lato = ((size_t)ai * p->seq_len + pos) * kvl;
+                if (tid == nth - 1) { // latent kv: RMSNorm(kv_a) into the cache (every node's copy)
                     const float* kv = g->mla + ql;
                     const float* nw = w->kva_norm + (size_t)ai * kvl;
+                    float* lat = g->lat[0] + lato;
                     float ss = 0.0f;
                     for (int i = 0; i < kvl; i++) ss += kv[i] * kv[i];
                     const float inv = 1.0f / sqrtf(ss / kvl + NORM_EPS);
                     for (int i = 0; i < kvl; i++) lat[i] = nw[i] * (kv[i] * inv);
+                    for (int k = 1; k < NN; k++) memcpy(g->lat[k] + lato, lat, kvl * sizeof(float));
                 }
                 if (tid == (nth >= 2 ? nth - 2 : 0)) { // indexer key (LayerNorm) and k-pool gate scores into the cache
                     const float* kr = g->mla + ql + kvl;
@@ -547,7 +550,7 @@ static void forward_glm_thread(int tid) {
                 const int all = !sel, T = all ? pos + 1 : g->nsel;
                 const int C = T / 64 < 1 ? 1 : (T / 64 < P.C ? T / 64 : P.C);
                 const float scale = 1.0f / sqrtf((float)qk);
-                const float* lc = s->key_cache + (size_t)ai * p->seq_len * kvl;
+                const float* lc = g->lat[tb->node] + (size_t)ai * p->seq_len * kvl;
                 for (int item = tid; item < nh * C; item += nth) {
                     const int h = item / C, c = item % C;
                     const int t0 = (int)((long)T * c / C), t1 = (int)((long)T * (c + 1) / C);

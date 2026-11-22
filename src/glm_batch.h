@@ -5,6 +5,8 @@
  * runs over that token's indexer selection; the MoE groups the tokens by expert (the shared expert is
  * one more expert that every token uses). Included by runq.c after the batch helpers. */
 
+#define GLM_HG 16 // heads per attention item (they share the latent keys)
+
 typedef struct {
     float* hs;     // (B, hc, D) residual streams
     float* xc;     // (B, D) normalized block input
@@ -31,10 +33,28 @@ typedef struct {
     int* isel;     // (B, itopk + kpool) selected tokens per token
     int* nsel;     // (B) their number (-1: every token up to the position)
     long* ccum;    // (B + 1) cumulative attention cost
-    float* att;    // (nth, seq_len) scores
+    float* att;    // (nth, GLM_HG, W) attention probabilities of a head group
+    float* fnc;    // (nth, 24, fncw) this thread's column slice of the mHC projection
+    int fncw;
+    size_t atts;   // att row stride per thread
     int W;         // isel row width
 } GlmBatch;
 static GlmBatch GB;
+// GLM_PROF=1: wall time per prefill phase (tid 0, after the phase's barrier), printed after every block
+static int GLM_PROF = 0;
+static double GLM_PT[24], GLM_PLAST, GLM_TT[1024];
+static long GLM_TI[1024];
+static const char* GLM_PN[24] = {"embed", "hc", "kda_in", "kda_conv", "kda_fg", "kda_rec", "kda_out", "mla_in", "mla_cache",
+                                 "mla_qb", "mla_sel", "mla_qabs", "mla_attn", "mla_v_o", "dense", "moe_router", "moe_up",
+                                 "moe_down", "logits", "hc_part", "hc_red"};
+static inline void glm_pt(int tid, int k) {
+    if (!GLM_PROF || tid) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    double t = ts.tv_sec + ts.tv_nsec * 1e-9;
+    if (k >= 0) GLM_PT[k] += t - GLM_PLAST;
+    GLM_PLAST = t;
+}
 static struct { int8_t *xq; float *xs; int8_t *gxq; float *gxs; int8_t *gq; float *gqs; } GBN[MAX_NODES];
 
 static void* glm_node_alloc(size_t bytes, int k) {
@@ -87,7 +107,10 @@ static void glm_init_batch(Transformer* t) {
     GB.isel = calloc(B * GB.W, sizeof(int));
     GB.nsel = calloc(B, sizeof(int));
     GB.ccum = calloc(B + 1, sizeof(long));
-    GB.att = calloc((size_t)P.nth * p->seq_len, sizeof(float));
+    GB.atts = (size_t)GLM_HG * GB.W > (size_t)p->seq_len ? (size_t)GLM_HG * GB.W : (size_t)p->seq_len;
+    GB.att = calloc((size_t)P.nth * GB.atts, sizeof(float));
+    GB.fncw = (int)(hc * D / P.nth + 1);
+    GB.fnc = calloc((size_t)P.nth * 24 * GB.fncw, sizeof(float));
     size_t xin = nh * p->g_kvl; // widest block input: head-major latent contexts
     if (nh * p->g_vh > xin) xin = nh * p->g_vh;
     if ((size_t)p->hidden_dim > xin) xin = p->hidden_dim;
@@ -101,6 +124,12 @@ static void glm_init_batch(Transformer* t) {
         GBN[k].gqs = glm_node_alloc(S * (mh / GS) * sizeof(float), k);
     }
     if (!GB.hs || !GB.lin || !GB.qabs || !GB.ctx || !GB.gout || !GB.att) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    GLM_PROF = getenv("GLM_PROF") != NULL;
+    { // MLA latent cache: a copy per node (every token's latent is written to all, attention reads its own)
+        const size_t lb = (size_t)p->n_attn * p->seq_len * p->g_kvl * sizeof(float);
+        for (int k = 0; k < NN; k++) t->state.glm->lat[k] = NN == 1 ? t->state.key_cache : glm_node_alloc(lb, k);
+    }
+    if (nh % 4 || p->g_kvl % 16) { fprintf(stderr, "GLM batch attention needs heads %% 4 == 0 and kv_lora %% 16 == 0\n"); exit(EXIT_FAILURE); }
     HYB_BATCH = 1; // forward_batch: blocks through forward_glm_batch_thread
 }
 
@@ -135,6 +164,79 @@ static void glm_post_swiglu(void* c, int b0, int b1, int r0, int r1) {
     }
 }
 
+/* Attention of hg heads (a multiple of 4, at most GLM_HG) of one token over T latent keys (shared by all heads, MQA-like): rows of
+ * lc picked by sl (NULL: rows 0..T-1). q / o: head h at q + h * qs / o + h * os (kvl floats each).
+ * The keys are read once for the whole head group: 4 keys x 4 heads register tiles for the scores,
+ * 64-key tiles (L2-resident) x 4 heads x 16 channels for the weighted sum. pr: hg * T floats. */
+static void glm_attn_heads(int hg, const float* q, size_t qs, float* o, size_t os, const float* lc, const int* sl, int T, int kvl,
+                           float scale, float* pr) {
+    for (int j = 0; j < T; j += 4) {
+        const float* k[4];
+        for (int u = 0; u < 4; u++) { int jj = j + u < T ? j + u : T - 1; k[u] = lc + (size_t)(sl ? sl[jj] : jj) * kvl; }
+        for (int h = 0; h < hg; h += 4) {
+            const float* qh[4] = {q + (size_t)h * qs, q + (size_t)(h + 1) * qs, q + (size_t)(h + 2) * qs, q + (size_t)(h + 3) * qs};
+            float r[4][4];
+#if defined(__ARM_NEON)
+            float32x4_t a[4][4];
+            for (int x = 0; x < 4; x++) for (int y = 0; y < 4; y++) a[x][y] = vdupq_n_f32(0.0f);
+            for (int i = 0; i < kvl; i += 4) {
+                float32x4_t kv[4], qv[4];
+                for (int u = 0; u < 4; u++) { kv[u] = vld1q_f32(k[u] + i); qv[u] = vld1q_f32(qh[u] + i); }
+                for (int x = 0; x < 4; x++) for (int y = 0; y < 4; y++) a[x][y] = vfmaq_f32(a[x][y], qv[x], kv[y]);
+            }
+            for (int x = 0; x < 4; x++) for (int y = 0; y < 4; y++) r[x][y] = vaddvq_f32(a[x][y]);
+#else
+            for (int x = 0; x < 4; x++) for (int y = 0; y < 4; y++) {
+                float acc = 0.0f;
+                for (int i = 0; i < kvl; i++) acc += qh[x][i] * k[y][i];
+                r[x][y] = acc;
+            }
+#endif
+            for (int x = 0; x < 4; x++)
+                for (int y = 0; y < 4 && j + y < T; y++) pr[(size_t)(h + x) * T + j + y] = r[x][y] * scale;
+        }
+    }
+    for (int h = 0; h < hg; h++) { // softmax per head
+        float* a = pr + (size_t)h * T, m = -FLT_MAX, z = 0.0f;
+        for (int j = 0; j < T; j++) m = a[j] > m ? a[j] : m;
+        for (int j = 0; j < T; j++) { a[j] = expf(a[j] - m); z += a[j]; }
+        const float inv = 1.0f / z;
+        for (int j = 0; j < T; j++) a[j] *= inv;
+    }
+    for (int h = 0; h < hg; h++) memset(o + (size_t)h * os, 0, kvl * sizeof(float));
+    for (int j0 = 0; j0 < T; j0 += 64) {
+        const int j1 = j0 + 64 < T ? j0 + 64 : T;
+        for (int h = 0; h < hg; h += 4)
+            for (int i = 0; i < kvl; i += 16) {
+#if defined(__ARM_NEON)
+                float32x4_t a[4][4];
+                for (int x = 0; x < 4; x++) for (int c = 0; c < 4; c++) a[x][c] = vld1q_f32(o + (size_t)(h + x) * os + i + 4 * c);
+                for (int j = j0; j < j1; j++) {
+                    const float* kv = lc + (size_t)(sl ? sl[j] : j) * kvl + i;
+                    float32x4_t k0 = vld1q_f32(kv), k1 = vld1q_f32(kv + 4), k2 = vld1q_f32(kv + 8), k3 = vld1q_f32(kv + 12);
+                    for (int x = 0; x < 4; x++) {
+                        const float pv = pr[(size_t)(h + x) * T + j];
+                        a[x][0] = vfmaq_n_f32(a[x][0], k0, pv);
+                        a[x][1] = vfmaq_n_f32(a[x][1], k1, pv);
+                        a[x][2] = vfmaq_n_f32(a[x][2], k2, pv);
+                        a[x][3] = vfmaq_n_f32(a[x][3], k3, pv);
+                    }
+                }
+                for (int x = 0; x < 4; x++) for (int c = 0; c < 4; c++) vst1q_f32(o + (size_t)(h + x) * os + i + 4 * c, a[x][c]);
+#else
+                for (int j = j0; j < j1; j++) {
+                    const float* kv = lc + (size_t)(sl ? sl[j] : j) * kvl + i;
+                    for (int x = 0; x < 4; x++) {
+                        const float pv = pr[(size_t)(h + x) * T + j];
+                        float* ov = o + (size_t)(h + x) * os + i;
+                        for (int c = 0; c < 16; c++) ov[c] += pv * kv[c];
+                    }
+                }
+#endif
+            }
+    }
+}
+
 // selected tokens of the block token at pos into out (*nout = -1: every token up to pos); score: 2 * pools floats
 static void glm_select_into(const Config* p, const GlmState* g, int ai, int pos, const float* qidx, const float* hw,
                             float* score, int* out, int* nout) {
@@ -164,6 +266,7 @@ static void forward_glm_batch_thread(int tid) {
     tok_range(B, tid, nth, &b0, &b1);          // tokens of this thread (global split)
     tok_range(B, tb->ltid, tb->nthn, &n0, &n1); // tokens of this thread within its node (node buffers)
 
+    glm_pt(tid, -1);
     if (pos0 == 0) { // new sequence: zero the states (same item partition as the decode step)
         const int nlin = p->n_layers - p->n_attn;
         for (int li = 0; li < nlin; li++)
@@ -179,6 +282,7 @@ static void forward_glm_batch_thread(int tid) {
         for (int n = 0; n < hc; n++) memcpy(GB.hs + ((size_t)b * hc + n) * D, emb, D * sizeof(float));
     }
     barrier(tb);
+    glm_pt(tid, 0);
 
     int li = 0, ai = 0;
     for (int l = 0; l < L; l++) {
@@ -186,23 +290,27 @@ static void forward_glm_batch_thread(int tid) {
         for (int part = 0; part < 2; part++) {
             const size_t hi = (size_t)2 * l + part;
             { // mHC partial products: this thread's column slice of the streams, all tokens
+                // the 24 rows of fn are 64 KB apart (L1 / L2 set conflicts): copy this thread's slice first
                 const float* fn = w->hc_fn + hi * 24 * N;
-                const int c0 = (int)((long)N * tid / nth), c1 = (int)((long)N * (tid + 1) / nth);
+                const int c0 = (int)((long)N * tid / nth), c1 = (int)((long)N * (tid + 1) / nth), cw = c1 - c0;
+                float* f = GB.fnc + (size_t)tid * GB.fncw * 24;
+                for (int r = 0; r < 24; r++) memcpy(f + (size_t)r * cw, fn + (size_t)r * N + c0, cw * sizeof(float));
                 for (int b = 0; b < B; b++) {
-                    const float* x = GB.hs + (size_t)b * N;
+                    const float* x = GB.hs + (size_t)b * N + c0;
                     float* o = GB.hcp + ((size_t)tid * B + b) * 32;
                     float ss = 0.0f;
-                    for (int j = c0; j < c1; j++) ss += x[j] * x[j];
+                    for (int j = 0; j < cw; j++) ss += x[j] * x[j];
                     for (int r = 0; r < 24; r++) {
-                        const float* row = fn + (size_t)r * N;
+                        const float* row = f + (size_t)r * cw;
                         float a = 0.0f;
-                        for (int j = c0; j < c1; j++) a += row[j] * x[j];
+                        for (int j = 0; j < cw; j++) a += row[j] * x[j];
                         o[r] = a;
                     }
                     o[24] = ss;
                 }
             }
             barrier(tb);
+            glm_pt(tid, 19);
             { // per token: weights, collapse, RMSNorm
                 const float* base = w->hc_base + hi * 24;
                 const float* sc = w->hc_scale + hi * 4;
@@ -231,13 +339,16 @@ static void forward_glm_batch_thread(int tid) {
                 }
             }
             barrier(tb);
+            glm_pt(tid, 20);
             for (int b = n0; b < n1; b++) quantize_vec(XQ + (size_t)b * D, XS + (size_t)b * (D / GS), GB.xc + (size_t)b * D, D);
             node_barrier(tb);
+            glm_pt(tid, 1);
             GlmHcCtx hcx = {p, GB.hs, GB.y, GB.hw};
 
             if (part == 0 && !attn) { // ---------------------------------------------- KDA
                 matmul_batch_node(GB.lin, LIN, XQ, XS, B, w->lin_in + li, D, LIN, tb, NULL, NULL, NULL, NULL);
                 barrier(tb);
+                glm_pt(tid, 2);
                 { // conv + SiLU per channel over the tokens; beta
                     int c0, c1;
                     tok_range(LIN, tid, nth, &c0, &c1);
@@ -259,6 +370,7 @@ static void forward_glm_batch_thread(int tid) {
                     }
                 }
                 barrier(tb);
+                glm_pt(tid, 3);
                 for (int b = n0; b < n1; b++) { // f_a | g_a (two input vectors per token)
                     quantize_vec(XQ + (size_t)b * dh, XS + (size_t)b * (dh / GS), GB.lin + (size_t)b * LIN + 3 * HD, dh);
                     quantize_vec(XQ + (size_t)(B + b) * dh, XS + (size_t)(B + b) * (dh / GS), GB.lin + (size_t)b * LIN + 3 * HD + dh, dh);
@@ -270,6 +382,7 @@ static void forward_glm_batch_thread(int tid) {
                     matmul_batch_node(GB.gate, HD, XQ + (size_t)B * dh, XS + (size_t)B * (dh / GS), B, w->g_b + li, dh, HD, tb, NULL, NULL, NULL, NULL);
                 }
                 barrier(tb);
+                glm_pt(tid, 4);
                 for (int it = tid; it < nitems; it += nth) { // gated delta rule over the tokens
                     const int h = it / ipr, c0 = (it % ipr) * HYB_ROWS;
                     float* S = hyb_state(p, s, li, h, c0);
@@ -297,6 +410,7 @@ static void forward_glm_batch_thread(int tid) {
                     }
                 }
                 barrier(tb);
+                glm_pt(tid, 5);
                 for (int b = n0; b < n1; b++) // gated RMSNorm per head, quantized (each node all heads of its tokens)
                     for (int h = 0; h < H; h++) {
                         const float* o = GB.lo + (size_t)b * HD + (size_t)h * dh;
@@ -311,18 +425,21 @@ static void forward_glm_batch_thread(int tid) {
                 node_barrier(tb);
                 matmul_batch_node(GB.y, D, XQ, XS, B, w->lin_out + li, HD, D, tb, NULL, NULL, glm_post_hc, &hcx);
                 barrier(tb);
+                glm_pt(tid, 6);
                 li++;
             } else if (part == 0) { // --------------------------------------------------- MLA + DSA
                 matmul_batch_node(GB.mla, MI, XQ, XS, B, w->mla_in + ai, D, MI, tb, NULL, NULL, NULL, NULL);
                 barrier(tb);
+                glm_pt(tid, 7);
                 for (int b = b0; b < b1; b++) { // caches (latent, indexer key / gate), q_a RMSNorm in place
                     float* m = GB.mla + (size_t)b * MI;
                     const int pos = pos0 + b;
                     float ss = 0.0f;
                     for (int i = 0; i < kvl; i++) ss += m[ql + i] * m[ql + i];
                     float inv = 1.0f / sqrtf(ss / kvl + NORM_EPS);
-                    float* lat = s->key_cache + ((size_t)ai * p->seq_len + pos) * kvl;
+                    float* lat = g->lat[0] + ((size_t)ai * p->seq_len + pos) * kvl;
                     for (int i = 0; i < kvl; i++) lat[i] = w->kva_norm[(size_t)ai * kvl + i] * (m[ql + i] * inv);
+                    for (int k = 1; k < NN; k++) memcpy(g->lat[k] + ((size_t)ai * p->seq_len + pos) * kvl, lat, kvl * sizeof(float));
                     const float* kr = m + ql + kvl;
                     float* ikk = g->ikey + ((size_t)ai * p->seq_len + pos) * ih;
                     float mu = 0.0f, var = 0.0f;
@@ -346,73 +463,73 @@ static void forward_glm_batch_thread(int tid) {
                 }
                 for (int b = n0; b < n1; b++) quantize_vec(XQ + (size_t)b * ql, XS + (size_t)b * (ql / GS), GB.mla + (size_t)b * MI, ql);
                 node_barrier(tb);
+                glm_pt(tid, 8);
                 matmul_batch_node(GB.qb, QB, XQ, XS, B, w->q_b + ai, ql, QB, tb, NULL, NULL, NULL, NULL);
                 barrier(tb);
+                glm_pt(tid, 9);
                 for (int b = n0; b < n1; b++) // q heads, head-major
                     for (int h = 0; h < nh; h++)
                         quantize_vec(XQ + ((size_t)h * B + b) * qk, XS + ((size_t)h * B + b) * (qk / GS), GB.qb + (size_t)b * QB + (size_t)h * qk, qk);
                 for (int b = b0; b < b1; b++) // indexer selection per token
                     glm_select_into(p, g, ai, pos0 + b, GB.qb + (size_t)b * QB + (size_t)nh * qk, GB.mla + (size_t)b * MI + ql + kvl + ih,
-                                    GB.att + (size_t)tid * p->seq_len, GB.isel + (size_t)b * GB.W, GB.nsel + b);
+                                    GB.att + (size_t)tid * GB.atts, GB.isel + (size_t)b * GB.W, GB.nsel + b);
                 node_barrier(tb);
+                glm_pt(tid, 10);
                 for (int h = 0; h < nh; h++) { // absorbed queries q'_h = W_k,h^T q_h
                     QuantizedTensor v = expert_view(w->kv_bk + ai, h, kvl, qk);
                     matmul_batch_node(GB.qabs + (size_t)h * B * kvl, kvl, XQ + (size_t)h * B * qk, XS + (size_t)h * B * (qk / GS), B, &v, qk, kvl, tb,
                                       NULL, NULL, NULL, NULL);
                 }
                 barrier(tb);
-                { // attention, items (token, head) balanced by their cost (number of keys)
+                glm_pt(tid, 11);
+                { // attention, items (token, head group) balanced by their cost (number of keys)
+                    const int hgs = nh % GLM_HG == 0 ? GLM_HG : 4, ng = nh / hgs;
                     long tot = 0;
                     for (int b = 0; b < B; b++) {
                         GB.ccum[b] = tot;
-                        tot += (long)nh * (GB.nsel[b] >= 0 ? GB.nsel[b] : pos0 + b + 1);
+                        tot += (long)ng * (GB.nsel[b] >= 0 ? GB.nsel[b] : pos0 + b + 1);
                     }
                     GB.ccum[B] = tot;
                     const long c0 = tot * tid / nth, c1 = tot * (tid + 1) / nth;
-                    // first item whose cost range starts at or after c: token by binary search, then head
-                    long it0, it1;
+                    // first item whose cost range starts at or after c: token by binary search, then head group
+                    long it0 = 0, it1 = 0;
                     for (int side = 0; side < 2; side++) {
                         long c = side ? c1 : c0, item;
                         int lo = 0, hi2 = B;
                         while (lo < hi2) { int mid = (lo + hi2) / 2; if (GB.ccum[mid + 1] <= c) lo = mid + 1; else hi2 = mid; }
-                        if (lo >= B) item = (long)B * nh;
+                        if (lo >= B) item = (long)B * ng;
                         else {
                             long T = GB.nsel[lo] >= 0 ? GB.nsel[lo] : pos0 + lo + 1;
                             long hh = (c - GB.ccum[lo] + T - 1) / T;
-                            item = (long)lo * nh + (hh > nh ? nh : hh);
+                            item = (long)lo * ng + (hh > ng ? ng : hh);
                         }
                         if (side) it1 = item; else it0 = item;
                     }
                     const float scale = 1.0f / sqrtf((float)qk);
-                    const float* lc = s->key_cache + (size_t)ai * p->seq_len * kvl;
-                    float* att = GB.att + (size_t)tid * p->seq_len;
+                    const float* lc = g->lat[tb->node] + (size_t)ai * p->seq_len * kvl;
+                    float* pr = GB.att + (size_t)tid * GB.atts;
+                    struct timespec ta, tb2;
+                    if (GLM_PROF) clock_gettime(CLOCK_MONOTONIC, &ta);
                     for (long item = it0; item < it1; item++) {
-                        const int b = (int)(item / nh), h = (int)(item % nh);
+                        const int b = (int)(item / ng), h = (int)(item % ng) * hgs;
                         const int all = GB.nsel[b] < 0, T = all ? pos0 + b + 1 : GB.nsel[b];
-                        const int* sl = GB.isel + (size_t)b * GB.W;
-                        const float* q = GB.qabs + ((size_t)h * B + b) * kvl;
-                        float m = -FLT_MAX;
-                        for (int j = 0; j < T; j++) {
-                            const float* kv = lc + (size_t)(all ? j : sl[j]) * kvl;
-                            float sc = 0.0f;
-                            for (int i = 0; i < kvl; i++) sc += q[i] * kv[i];
-                            sc *= scale;
-                            att[j] = sc;
-                            m = sc > m ? sc : m;
-                        }
-                        float sm = 0.0f;
-                        for (int j = 0; j < T; j++) { att[j] = expf(att[j] - m); sm += att[j]; }
-                        const float inv = 1.0f / sm;
-                        float* o = GB.ctx + ((size_t)h * B + b) * kvl;
-                        memset(o, 0, kvl * sizeof(float));
-                        for (int j = 0; j < T; j++) {
-                            const float* kv = lc + (size_t)(all ? j : sl[j]) * kvl;
-                            const float a = att[j] * inv;
-                            for (int i = 0; i < kvl; i++) o[i] += a * kv[i];
-                        }
+                        glm_attn_heads(hgs, GB.qabs + ((size_t)h * B + b) * kvl, (size_t)B * kvl, GB.ctx + ((size_t)h * B + b) * kvl,
+                                       (size_t)B * kvl, lc, all ? NULL : GB.isel + (size_t)b * GB.W, T, kvl, scale, pr);
+                    }
+                    if (GLM_PROF) {
+                        clock_gettime(CLOCK_MONOTONIC, &tb2);
+                        GLM_TT[tid] = (tb2.tv_sec - ta.tv_sec) + (tb2.tv_nsec - ta.tv_nsec) * 1e-9;
+                        GLM_TI[tid] = it1 - it0;
                     }
                 }
                 barrier(tb);
+                glm_pt(tid, 12);
+                if (GLM_PROF && tid == 0 && ai == 10) {
+                    double mx = 0, sm = 0; int am = 0;
+                    for (int t = 0; t < nth; t++) { sm += GLM_TT[t]; if (GLM_TT[t] > mx) { mx = GLM_TT[t]; am = t; } }
+                    fprintf(stderr, "[attn] mean %.1f ms max %.1f ms (thread %d, %ld items, node %d); thread 0 %.1f ms %ld items\n",
+                            sm / nth * 1e3, mx * 1e3, am, GLM_TI[am], P.tb[am].node, GLM_TT[0] * 1e3, GLM_TI[0]);
+                }
                 for (int b = n0; b < n1; b++)
                     for (int h = 0; h < nh; h++)
                         quantize_vec(XQ + ((size_t)h * B + b) * kvl, XS + ((size_t)h * B + b) * (kvl / GS), GB.ctx + ((size_t)h * B + b) * kvl, kvl);
@@ -427,6 +544,7 @@ static void forward_glm_batch_thread(int tid) {
                 node_barrier(tb);
                 matmul_batch_node(GB.y, D, XQ, XS, B, w->o_proj + ai, nh * vh, D, tb, NULL, NULL, glm_post_hc, &hcx);
                 barrier(tb);
+                glm_pt(tid, 13);
                 ai++;
             } else if (l < p->g_dense) { // --------------------------------------------- dense FFN
                 QuantizedTensor up1 = expert_view(w->w13 + l, 0, F, D), up3 = expert_view(w->w13 + l, 1, F, D);
@@ -437,6 +555,7 @@ static void forward_glm_batch_thread(int tid) {
                 node_barrier(tb);
                 matmul_batch_node(GB.y, D, XQ, XS, B, w->w2 + l, F, D, tb, NULL, NULL, glm_post_hc, &hcx);
                 barrier(tb);
+                glm_pt(tid, 14);
             } else { // ------------------------------------------------------------------- MoE
                 const int mi = l - p->g_dense, ngd = D / GS, ngm = mh / GS;
                 int8_t* GXQ = GBN[tb->node].gxq; float* GXS = GBN[tb->node].gxs;
@@ -497,6 +616,7 @@ static void forward_glm_batch_thread(int tid) {
                     }
                 }
                 node_barrier(tb);
+                glm_pt(tid, 15);
                 { // up projections + clamped SwiGLU * weight: this node's half of every used expert, dynamic 16-row chunks
                     int lo, hi2;
                     node_rows(mh, tb->node, &lo, &hi2);
@@ -526,6 +646,7 @@ static void forward_glm_batch_thread(int tid) {
                     }
                 }
                 barrier(tb);
+                glm_pt(tid, 16);
                 {
                     int s0, s1;
                     tok_range(S, tb->ltid, tb->nthn, &s0, &s1);
@@ -549,6 +670,7 @@ static void forward_glm_batch_thread(int tid) {
                     glm_post_hc(&hcx, 0, B, r0, r1);
                 }
                 barrier(tb);
+                glm_pt(tid, 17);
             }
         }
     }
@@ -570,4 +692,12 @@ static void forward_glm_batch_thread(int tid) {
         matmul_rows(s->logits, tb->q, tb->s, w->lm_head, D, r0, r1);
     }
     barrier(tb);
+    glm_pt(tid, 18);
+    if (GLM_PROF && tid == 0) {
+        double tot = 0;
+        for (int k = 0; k < 21; k++) tot += GLM_PT[k];
+        fprintf(stderr, "\n[glm prof] block B=%d pos0=%d, cumulative %.2f s:", B, pos0, tot);
+        for (int k = 0; k < 21; k++) fprintf(stderr, " %s %.2f", GLM_PN[k], GLM_PT[k]);
+        fprintf(stderr, "\n");
+    }
 }
