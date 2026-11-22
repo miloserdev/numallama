@@ -14,16 +14,14 @@
  * Tool calls are returned to the client, which runs them (the -f sandbox is a CLI chat feature). */
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
 #include <strings.h>
 #include <sys/socket.h>
-
-static const char *SRV_HOST = "127.0.0.1";
-static int SRV_PORT = 8080;
-static const char *SRV_KEY = NULL; // -A: required "Authorization: Bearer <key>"
-static const char *SRV_MODEL = "numallama";
+#include <sys/stat.h>
+#include <sys/statvfs.h>
 #define SRV_MAX_BODY (64 << 20)
 
 typedef struct {
@@ -37,6 +35,7 @@ typedef struct {
   int stop_hit;
   char id[48];
   long created;
+  volatile int *hb_stop;     // SSE keep-alive during prefill: cleared on the first content chunk
 } SrvReq;
 
 static void srv_write(SrvReq *r, const char *s, size_t n) {
@@ -131,6 +130,28 @@ static void srv_flush(SrvReq *r, int which, int final) {
   free(b.buf);
   free(part);
   *sent = lim;
+  if (r->hb_stop) { *r->hb_stop = 1; r->hb_stop = NULL; } // the stream flows: stop the keep-alive
+}
+
+// SSE comment lines while the prompt is being processed, so a client does not time out on a
+// silent connection (prefill of a long prompt can take a minute); harmless per the SSE spec.
+typedef struct {
+  int fd;
+  volatile int *stop, *failed;
+} SrvHb;
+static void *srv_heartbeat(void *arg) {
+  SrvHb *hb = arg;
+  while (!*hb->stop) {
+    struct timespec ts = {2, 0};
+    nanosleep(&ts, NULL);
+    if (*hb->stop) break;
+    if (send(hb->fd, ": keep-alive\n\n", 14, MSG_NOSIGNAL) != 14) {
+      *hb->failed = 1;
+      if (g_sink) g_sink->stop = 1;
+      break;
+    }
+  }
+  return NULL;
 }
 
 static void srv_text(void *ctx, const char *s, int reasoning) {
@@ -386,12 +407,65 @@ static int request_tools(JNode *tools, Tools *out) {
   return arr->child != NULL;
 }
 
+// A named conversation: the rendered token history (tok[0..n)) whose KV / state is valid in the
+// model. The session whose state currently sits in the model is "live"; any other session is
+// swapped in from its dump on demand. "default" is the anonymous session.
 typedef struct {
-  int *tok; // tokens whose KV entries are valid; hybrid: the state stands at n
+  char id[72];
+  int *tok;
   int n, cap;
-} SrvCache;
+  int live; // the model state matches tok[0..n)
+  long last_dump; // throttling: the state dump is expensive on a big session
+  int dumped_n;
+} SrvSession;
 
-static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, SrvCache *C, int fd, const char *body) {
+#define SRV_MAX_SESS 64
+static SrvSession g_sessions[SRV_MAX_SESS];
+static int g_nsessions;
+static SrvSession *g_live;
+static SrvSession *g_pending_dump; // set by srv_chat, written to disk after the connection closes
+static SrvSession g_fallback; // registry full / persistence off: one anonymous in-memory session
+
+static SrvSession *srv_session(const char *id, int cap) {
+  for (int i = 0; i < g_nsessions; i++)
+    if (!strcmp(g_sessions[i].id, id)) return &g_sessions[i];
+  if (g_nsessions >= SRV_MAX_SESS) return &g_fallback;
+  SrvSession *S = &g_sessions[g_nsessions++];
+  memset(S, 0, sizeof *S);
+  snprintf(S->id, sizeof S->id, "%s", id);
+  S->cap = cap;
+  S->tok = malloc((size_t)cap * sizeof(int));
+  return S;
+}
+
+// keep only [A-Za-z0-9._-] so the id is a safe file name
+static void srv_sanitize_id(char *id) {
+  for (char *c = id; *c; c++)
+    if (!isalnum((unsigned char)*c) && *c != '-' && *c != '_' && *c != '.') *c = '_';
+  id[63] = '\0';
+}
+
+static void srv_journal(const SrvSession *S, const char *body, int np, int gen, int reuse, const char *finish) {
+  if (!SRV_SESS_DIR || S == &g_fallback) return;
+  char path[1200];
+  snprintf(path, sizeof path, "%s/%s.jsonl", SRV_SESS_DIR, S->id);
+  struct stat st;
+  if (!stat(path, &st) && st.st_size > (200 << 20)) { // keep one backup of an overgrown journal
+    char old[1208];
+    snprintf(old, sizeof old, "%s.1", path);
+    rename(path, old);
+  }
+  FILE *f = fopen(path, "a");
+  if (!f) return;
+  fprintf(f, "{\"ts\": %ld, \"session\": \"%s\", \"prompt_tokens\": %d, \"completion_tokens\": %d, \"cached_tokens\": %d, "
+             "\"finish\": \"%s\", \"body\": ",
+          (long)time(NULL), S->id, np, gen, reuse, finish);
+  fputs(body, f); // the raw request JSON, embedded as an object
+  fputs("}\n", f);
+  fclose(f);
+}
+
+static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *sess_hdr, int fd, const char *body) {
   const int ctx = tr->config.seq_len;
   JNode *req = json_parse(body, NULL);
   JNode *messages = req ? json_get(req, "messages") : NULL;
@@ -405,6 +479,32 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, SrvCache *C, i
     srv_error(fd, 400, "invalid_request_error", "only n = 1 is supported");
     json_free(req);
     return;
+  }
+  // session identity: a body field wins, then the client's session headers; "default" if none
+  char sid[72] = "default";
+  JNode *sj = json_get(req, "session_id");
+  if (!sj) sj = json_get(req, "conversation_id");
+  if (sj && sj->type == J_STR && sj->str[0]) snprintf(sid, sizeof sid, "%s", sj->str);
+  else if (sess_hdr && sess_hdr[0]) snprintf(sid, sizeof sid, "%s", sess_hdr);
+  srv_sanitize_id(sid);
+  SrvSession *S = srv_session(sid, tr->config.seq_len);
+  if (S != g_live) { // the model holds another session's state: swap ours in from its dump
+    int loaded = 0;
+    if (SRV_SESS_DIR && S != &g_fallback) {
+      char path[1200];
+      snprintf(path, sizeof path, "%s/%s.bin", SRV_SESS_DIR, S->id);
+      loaded = sess_read(tr, S->tok, S->cap, path);
+    }
+    if (loaded > 0) {
+      fprintf(stderr, "[server] session %s: restored %d tokens from disk\n", S->id, loaded);
+      S->n = loaded;
+      S->live = 1;
+    } else {
+      if (S->n > 0) fprintf(stderr, "[server] session %s: state gone, re-processing from scratch\n", S->id);
+      S->n = 0; // no dump (or it does not match this model): the prompt below re-processes everything
+    }
+    if (g_live) g_live->live = 0;
+    g_live = S;
   }
   // per-request settings (restored at the end)
   const float temp0 = sp->temperature, topp0 = sp->topp;
@@ -450,34 +550,17 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, SrvCache *C, i
   }
   if (status) goto done;
 
-  // reuse the longest common prefix of the KV cache
-  long t0 = time_in_ms();
-  int lcp = 0;
-  while (lcp < C->n && lcp < np && C->tok[lcp] == P[lcp]) lcp++;
-  int reuse;
-  RunState *s = &tr->state;
-  if (!tr->config.hybrid) {
-    reuse = lcp < np ? lcp : np - 1; // at least one token is fed to get the logits
-  } else if (lcp == C->n && C->n < np) {
-    reuse = C->n; // the state is exactly at the end of the shared prefix
-  } else if (s->snap_S && s->snap_pos > 0 && s->snap_pos <= lcp && s->snap_pos < np && hybrid_restore(tr, s->snap_pos)) {
-    reuse = s->snap_pos; // back to the end of the previous prompt
-  } else {
-    reuse = 0;
-  }
-  if (DRAFT_POS > reuse) DRAFT_POS = reuse;
-  ChatHistory h = {.tok = C->tok, .n = reuse, .cap = ctx, .sys_len = 0, .turn = NULL, .n_turns = 0};
-  // hybrid: save the state one token before the end of the prompt, so that the same prompt again
-  // (a retry, a regenerate) or any continuation of it can start from there
-  if (tr->config.hybrid && np - 1 > reuse) chat_feed(tr, &h, P + reuse, np - 1 - reuse);
-  if (tr->config.hybrid && h.n == np - 1) hybrid_snapshot(tr);
-  float *logits = chat_feed(tr, &h, P + h.n, np - h.n);
-  long t1 = time_in_ms();
-
+  // for a stream: answer with the headers immediately and keep the connection warm with SSE
+  // comment lines while the prompt is being processed (prefill can take a minute)
   snprintf(r.id, sizeof r.id, "chatcmpl-%lx%04x", (unsigned long)time(NULL), (unsigned)(rand() & 0xffff));
   r.created = time(NULL);
   sb_puts(&r.content, "");
   sb_puts(&r.reasoning, "");
+  ReplySink sink = {.text = srv_text, .ctx = &r, .max_gen = max_gen, .stop = r.failed};
+  volatile int hb_stop = 0, hb_failed = 0;
+  SrvHb hb = {.fd = fd, .stop = &hb_stop, .failed = &hb_failed};
+  pthread_t hbt;
+  int hb_on = 0;
   if (r.stream) {
     const char *hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
                       "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
@@ -487,14 +570,50 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, SrvCache *C, i
     sb_puts(&b, ", \"choices\": [{\"index\": 0, \"delta\": {\"role\": \"assistant\", \"content\": \"\"}, \"finish_reason\": null}]}\n\n");
     srv_write(&r, b.buf, b.len);
     free(b.buf);
+    if (!r.failed) {
+      hb_on = 1;
+      r.hb_stop = &hb_stop;
+      pthread_create(&hbt, NULL, srv_heartbeat, &hb);
+    }
   }
-  ReplySink sink = {.text = srv_text, .ctx = &r, .max_gen = max_gen, .stop = r.failed};
+
+  // reuse the longest common prefix of the session's token history (GLM and other recurrent
+  // models can only resume where the state stands: the end of the history, the snapshot, or 0)
+  long t0 = time_in_ms();
+  int lcp = 0;
+  while (lcp < S->n && lcp < np && S->tok[lcp] == P[lcp]) lcp++;
+  int reuse;
+  RunState *s = &tr->state;
+  if (!RECURRENT(&tr->config)) {
+    reuse = lcp < np ? lcp : np - 1; // at least one token is fed to get the logits
+  } else if (lcp == S->n && S->n < np) {
+    reuse = S->n; // the state is exactly at the end of the shared prefix
+  } else if (s->snap_S && s->snap_pos > 0 && s->snap_pos <= lcp && s->snap_pos < np && hybrid_restore(tr, s->snap_pos)) {
+    reuse = s->snap_pos; // back to the end of the previous prompt
+  } else {
+    reuse = 0;
+  }
+  if (DRAFT_POS > reuse) DRAFT_POS = reuse;
+  ChatHistory h = {.tok = S->tok, .n = reuse, .cap = ctx, .sys_len = 0, .turn = NULL, .n_turns = 0};
+  // recurrent: save the state one token before the end of the prompt, so that the same prompt again
+  // (a retry, a regenerate) or any continuation of it can start from there
+  if (RECURRENT(&tr->config) && np - 1 > reuse) chat_feed(tr, &h, P + reuse, np - 1 - reuse);
+  if (RECURRENT(&tr->config) && h.n == np - 1) hybrid_snapshot(tr);
+  float *logits = chat_feed(tr, &h, P + h.n, np - h.n);
+  long t1 = time_in_ms();
+
   g_sink = &sink;
   JNode *calls[MAX_CALLS_PER_REPLY];
   int ended = 0, gen = 0, n_calls = 0;
   if (!r.failed) n_calls = chat_reply(tr, tk, sp, &h, logits, &ended, &gen, calls);
   g_sink = NULL;
-  C->n = h.n;
+  if (hb_on) {
+    hb_stop = 1;
+    pthread_join(hbt, NULL);
+    r.hb_stop = NULL;
+    if (hb_failed) r.failed = 1;
+  }
+  S->n = h.n;
   long t2 = time_in_ms();
   if (r.stop_hit) { // the reply was cut inside the text: no calls
     for (int i = 0; i < n_calls; i++) json_free(calls[i]);
@@ -576,6 +695,14 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, SrvCache *C, i
   fprintf(stderr, "[server] prompt %d tok (cached %d) %.0f tok/s | reply %d tok %.1f tok/s | %s%s%s\n", np, reuse,
           (np - reuse) * 1000.0 / (t1 - t0 > 0 ? t1 - t0 : 1), gen, gen * 1000.0 / (t2 - t1 > 0 ? t2 - t1 : 1), finish,
           r.stream ? ", stream" : "", r.failed ? ", client disconnected" : "");
+  if (S != &g_fallback && r.content.buf) { // durable record + restorable state (best effort)
+    srv_journal(S, body, np, gen, reuse, finish);
+    // a state dump costs seconds on a big session: throttle it, write it after the connection closes
+    long now = time(NULL);
+    if (SRV_SESS_DIR && S->n > 0 &&
+        (S->last_dump == 0 || S->n - S->dumped_n >= 2048 || now - S->last_dump >= 30))
+      g_pending_dump = S;
+  }
   free(tcj.buf);
 done:
   free(r.content.buf);
@@ -589,8 +716,9 @@ done:
   json_free(req);
 }
 
-// read one HTTP request; returns 0 on a malformed / oversized request (already answered)
-static int srv_read(int fd, char *method, char *path, char **body, int *authorized) {
+// read one HTTP request; returns 0 on a malformed / oversized request (already answered);
+// *sess (optional) receives the client's session header
+static int srv_read(int fd, char *method, char *path, char **body, int *authorized, char *sess, size_t sesslen) {
   SBuf b = {0};
   char chunk[65536];
   char *hend = NULL;
@@ -607,6 +735,7 @@ static int srv_read(int fd, char *method, char *path, char **body, int *authoriz
   long clen = 0;
   int expect = 0;
   *authorized = SRV_KEY == NULL;
+  if (sess) sess[0] = '\0';
   for (char *line = strstr(b.buf, "\r\n"); line; line = strstr(line, "\r\n")) {
     line += 2;
     if (!strncasecmp(line, "Content-Length:", 15)) clen = atol(line + 15);
@@ -617,6 +746,18 @@ static int srv_read(int fd, char *method, char *path, char **body, int *authoriz
       if (!strncasecmp(v, "Bearer ", 7)) v += 7;
       size_t kl = strlen(SRV_KEY);
       if (!strncmp(v, SRV_KEY, kl) && (v[kl] == '\r' || v[kl] == '\0')) *authorized = 1;
+    } else if (sess && sess[0] == '\0') {
+      const char *sh = NULL;
+      if (!strncasecmp(line, "x-opencode-session-id:", 22)) sh = line + 22;
+      else if (!strncasecmp(line, "x-session-id:", 13)) sh = line + 13;
+      else if (!strncasecmp(line, "x-conversation-id:", 18)) sh = line + 18;
+      if (sh) {
+        while (*sh == ' ') sh++;
+        size_t n = strcspn(sh, "\r\n");
+        if (n >= sesslen) n = sesslen - 1;
+        memcpy(sess, sh, n);
+        sess[n] = '\0';
+      }
     }
   }
   if (clen < 0 || clen > SRV_MAX_BODY) { srv_error(fd, 413, "invalid_request_error", "request body too large"); free(b.buf); return 0; }
@@ -648,7 +789,22 @@ static void server(Transformer *tr, Tokenizer *tk, Sampler *sp) {
     fprintf(stderr, "cannot listen on %s:%d: %s\n", SRV_HOST, SRV_PORT, strerror(errno));
     exit(EXIT_FAILURE);
   }
-  SrvCache C = {.tok = malloc((size_t)tr->config.seq_len * sizeof(int)), .n = 0, .cap = tr->config.seq_len};
+  g_fallback.id[0] = '\0';
+  g_fallback.cap = tr->config.seq_len;
+  g_fallback.tok = malloc((size_t)tr->config.seq_len * sizeof(int));
+  if (SRV_SESS_DIR && SRV_SESS_DIR[0]) { // make the sessions directory, list what is on disk
+    if (mkdir(SRV_SESS_DIR, 0755) != 0 && errno != EEXIST)
+      fprintf(stderr, "[server] warning: cannot create %s: %s\n", SRV_SESS_DIR, strerror(errno));
+    DIR *d = opendir(SRV_SESS_DIR);
+    int nfiles = 0;
+    if (d) {
+      struct dirent *e;
+      while ((e = readdir(d)))
+        if (strstr(e->d_name, ".bin")) nfiles++;
+      closedir(d);
+    }
+    fprintf(stderr, "[server] sessions in %s: %d state file%s on disk\n", SRV_SESS_DIR, nfiles, nfiles == 1 ? "" : "s");
+  }
   fprintf(stderr, "[server] model %s, context %d, listening on http://%s:%d/v1%s\n", SRV_MODEL, tr->config.seq_len, SRV_HOST,
           SRV_PORT, SRV_KEY ? " (API key required)" : "");
   for (;;) {
@@ -657,9 +813,9 @@ static void server(Transformer *tr, Tokenizer *tk, Sampler *sp) {
     struct timeval tv = {.tv_sec = 60};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-    char method[16], path[512], *body = NULL;
+    char method[16], path[512], *body = NULL, shead[80];
     int authorized = 0;
-    if (srv_read(fd, method, path, &body, &authorized)) {
+    if (srv_read(fd, method, path, &body, &authorized, shead, sizeof shead)) {
       char *q = strchr(path, '?');
       if (q) *q = '\0';
       if (!strcmp(method, "OPTIONS")) {
@@ -681,8 +837,45 @@ static void server(Transformer *tr, Tokenizer *tk, Sampler *sp) {
         sb_puts(&b, t);
         srv_respond(fd, 200, "application/json", b.buf);
         free(b.buf);
+      } else if (!strcmp(method, "GET") && !strcmp(path, "/v1/sessions")) { // known sessions + what is on disk
+        SBuf b = {0};
+        sb_puts(&b, "{\"object\": \"list\", \"data\": [");
+        int first = 1;
+        for (int i = 0; i < g_nsessions; i++) {
+          if (!first) sb_puts(&b, ", ");
+          sb_puts(&b, "{\"id\": ");
+          json_write_string(&b, g_sessions[i].id);
+          char it[64];
+          snprintf(it, sizeof it, ", \"tokens\": %d, \"live\": %s}", g_sessions[i].n, g_sessions[i].live ? "true" : "false");
+          sb_puts(&b, it);
+          first = 0;
+        }
+        if (SRV_SESS_DIR) {
+          DIR *d = opendir(SRV_SESS_DIR);
+          if (d) {
+            struct dirent *e;
+            while ((e = readdir(d))) {
+              char *dot = strstr(e->d_name, ".bin");
+              if (!dot || dot[4] != '\0') continue;
+              char id[72];
+              snprintf(id, sizeof id, "%.*s", (int)(dot - e->d_name), e->d_name);
+              int known = 0;
+              for (int i = 0; i < g_nsessions; i++) known |= !strcmp(g_sessions[i].id, id);
+              if (known) continue;
+              if (!first) sb_puts(&b, ", ");
+              sb_puts(&b, "{\"id\": ");
+              json_write_string(&b, id);
+              sb_puts(&b, ", \"tokens\": 0, \"live\": false, \"on_disk\": true}");
+              first = 0;
+            }
+            closedir(d);
+          }
+        }
+        sb_puts(&b, "]}");
+        srv_respond(fd, 200, "application/json", b.buf);
+        free(b.buf);
       } else if (!strcmp(method, "POST") && (!strcmp(path, "/v1/chat/completions") || !strcmp(path, "/chat/completions"))) {
-        srv_chat(tr, tk, sp, &C, fd, body);
+        srv_chat(tr, tk, sp, shead, fd, body);
       } else {
         srv_error(fd, 404, "invalid_request_error", "unknown endpoint");
       }
@@ -690,5 +883,24 @@ static void server(Transformer *tr, Tokenizer *tk, Sampler *sp) {
     free(body);
     shutdown(fd, SHUT_WR);
     close(fd);
+    if (g_pending_dump) { // the client is gone: now spend the seconds a state dump takes
+      SrvSession *S = g_pending_dump;
+      g_pending_dump = NULL;
+      char path[1200];
+      snprintf(path, sizeof path, "%s/%s.bin", SRV_SESS_DIR, S->id);
+      struct statvfs vfs;
+      int low = statvfs(SRV_SESS_DIR, &vfs) == 0 &&
+                (uint64_t)vfs.f_bavail * vfs.f_frsize < sess_dump_bytes(tr, S->n) * 5 / 4;
+      if (low) {
+        fprintf(stderr, "[server] session %s: %.1f GB dump skipped (disk full)\n", S->id, sess_dump_bytes(tr, S->n) / 1e9);
+      } else {
+        long d0 = time_in_ms();
+        int okw = sess_write(tr, S->tok, S->n, path);
+        S->last_dump = time(NULL);
+        S->dumped_n = okw ? S->n : 0;
+        fprintf(stderr, "[server] session %s: state %d tok%s in %.2fs\n", S->id, S->n, okw ? " saved" : " NOT saved",
+                (time_in_ms() - d0) / 1000.0);
+      }
+    }
   }
 }

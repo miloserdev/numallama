@@ -5296,6 +5296,221 @@ __attribute__((unused)) static void imatrix(Transformer* t, Tokenizer* tk, const
 
 #ifndef TESTING
 
+static const char *SRV_HOST = "127.0.0.1";
+static int SRV_PORT = 8080;
+static const char *SRV_KEY = NULL;     // -A: required "Authorization: Bearer <key>"
+static const char *SRV_MODEL = "numallama";
+static const char *SRV_SESS_DIR = NULL; // -W: session journal / state dumps (default: workspace/sessions)
+
+// Server session persistence (enabled by default in server mode, -W <dir>): per session an
+// append-only JSONL journal of the requests plus a binary state dump (prompt tokens + KV cache /
+// recurrent state + GLM caches). After a server restart a reconnecting client resumes from the
+// dump: only the tokens it added since the dump are processed. Writes go to "<path>.tmp" + rename.
+
+#define SESS_MAGIC "NASESS01"
+#define SESS_VER 1
+
+static int w_blk(FILE *f, const void *p, size_t bytes) { return bytes == 0 || fwrite(p, 1, bytes, f) == bytes; }
+static int r_blk(FILE *f, void *p, size_t bytes) { return bytes == 0 || fread(p, 1, bytes, f) == bytes; }
+
+// contiguous staging buffer for the strided per-layer cache rows (the server is single-threaded)
+static float *sess_stage;
+static size_t sess_stage_floats;
+
+static float *sess_stage_for(size_t floats) {
+  if (floats > sess_stage_floats) {
+    free(sess_stage);
+    sess_stage_floats = 0;
+    sess_stage = malloc(floats * sizeof(float));
+    if (!sess_stage) return NULL;
+    sess_stage_floats = floats;
+  }
+  return sess_stage;
+}
+
+// upper bound of the dump for n tokens (for the free-space check)
+static size_t sess_dump_bytes(const Transformer *t, int n) {
+  const Config *p = &t->config;
+  size_t b = 8 + 7 * 4 + 64 + 4 + (size_t)n * sizeof(int);
+  if (RECURRENT(p)) b += 4 + (hyb_state_floats(p) + hyb_conv_floats(p)) * sizeof(float);
+  if (!p->glm) b += (size_t)p->n_attn * n * p->kv_dim * 2 * sizeof(float);
+  else b += (size_t)p->n_attn * n * (p->g_kvl + 2 * p->g_ih) * sizeof(float) +
+            (size_t)p->n_attn * (n / p->g_kpool + 1) * p->g_ih * sizeof(float);
+  if (RECURRENT(p) && t->state.snap_S && t->state.snap_pos > 0) b += 4 + (hyb_state_floats(p) + hyb_conv_floats(p)) * sizeof(float);
+  return b;
+}
+
+// write the state that corresponds to tok[0..n); 1 = ok (dump complete and renamed)
+static int sess_write(const Transformer *t, const int *tok, int n, const char *path) {
+  const Config *p = &t->config;
+  const RunState *s = &t->state;
+  size_t linf = RECURRENT(p) ? hyb_state_floats(p) : 0;
+  size_t convf = RECURRENT(p) ? hyb_conv_floats(p) : 0;
+  int snap = RECURRENT(p) && s->snap_S && s->snap_pos > 0;
+  char tmp[1210];
+  snprintf(tmp, sizeof tmp, "%s.tmp", path);
+  FILE *f = fopen(tmp, "wb");
+  if (!f) return 0;
+  int ok = 1;
+  ok &= w_blk(f, SESS_MAGIC, 8);
+  uint32_t hdr[7] = {SESS_VER, (RECURRENT(p) ? 1u : 0u) | (snap ? 2u : 0u), (uint32_t)p->vocab_size,
+                     (uint32_t)p->dim, (uint32_t)p->n_layers, (uint32_t)p->n_attn, (uint32_t)ARCH};
+  ok &= w_blk(f, hdr, sizeof hdr);
+  char model[64] = {0};
+  snprintf(model, sizeof model, "%s", SRV_MODEL);
+  ok &= w_blk(f, model, sizeof model);
+  uint32_t nn = (uint32_t)n;
+  ok &= w_blk(f, &nn, 4);
+  ok &= w_blk(f, tok, (size_t)n * sizeof(int));
+  if (RECURRENT(p)) {
+    uint32_t np = (uint32_t)s->next_pos;
+    ok &= w_blk(f, &np, 4);
+    ok &= w_blk(f, s->lin_S, linf * sizeof(float));
+    ok &= w_blk(f, s->conv_state, convf * sizeof(float));
+  }
+  if (!p->glm) { // attention (and hybrid attention layers): K rows [0..n), then V rows, per layer
+    size_t row = (size_t)n * p->kv_dim;
+    float *st = sess_stage_for(row);
+    ok &= st != NULL;
+    for (int la = 0; ok && la < p->n_attn; la++) {
+      const float *k = s->key_cache + (size_t)la * p->seq_len * p->kv_dim;
+      const float *v = s->value_cache + (size_t)la * p->seq_len * p->kv_dim;
+      for (int i = 0; i < n; i++) memcpy(st + (size_t)i * p->kv_dim, k + (size_t)i * p->kv_dim, p->kv_dim * sizeof(float));
+      ok &= w_blk(f, st, row * sizeof(float));
+      for (int i = 0; i < n; i++) memcpy(st + (size_t)i * p->kv_dim, v + (size_t)i * p->kv_dim, p->kv_dim * sizeof(float));
+      ok &= w_blk(f, st, row * sizeof(float));
+    }
+  } else { // GLM: MLA latent cache, indexer keys / gates / pooled keys (lat[0]; the per-node copies are identical)
+    const GlmState *g = s->glm;
+    const size_t kvl = p->g_kvl, ih = p->g_ih;
+    size_t row = (size_t)n * kvl;
+    float *st = sess_stage_for(row > (size_t)n * ih ? row : (size_t)n * ih);
+    ok &= st != NULL;
+    for (int la = 0; ok && la < p->n_attn; la++) {
+      const float *base = g->lat[0] + (size_t)la * p->seq_len * kvl;
+      for (int i = 0; ok && i < n; i++) memcpy(st + (size_t)i * kvl, base + (size_t)i * kvl, kvl * sizeof(float));
+      ok &= w_blk(f, st, row * sizeof(float));
+    }
+    for (int la = 0; ok && la < p->n_attn; la++) {
+      const float *base = g->ikey + (size_t)la * p->seq_len * ih;
+      for (int i = 0; ok && i < n; i++) memcpy(st + (size_t)i * ih, base + (size_t)i * ih, ih * sizeof(float));
+      ok &= w_blk(f, st, (size_t)n * ih * sizeof(float));
+    }
+    for (int la = 0; ok && la < p->n_attn; la++) {
+      const float *base = g->igate + (size_t)la * p->seq_len * ih;
+      for (int i = 0; ok && i < n; i++) memcpy(st + (size_t)i * ih, base + (size_t)i * ih, ih * sizeof(float));
+      ok &= w_blk(f, st, (size_t)n * ih * sizeof(float));
+    }
+    int npool = n / p->g_kpool + 1;
+    for (int la = 0; ok && la < p->n_attn; la++) {
+      const float *base = g->ipool + (size_t)la * (p->seq_len / p->g_kpool + 1) * ih;
+      ok &= w_blk(f, base, (size_t)npool * ih * sizeof(float)); // contiguous: rows are never rewritten
+    }
+  }
+  if (snap) {
+    uint32_t sp = (uint32_t)s->snap_pos;
+    ok &= w_blk(f, &sp, 4);
+    ok &= w_blk(f, s->snap_S, linf * sizeof(float));
+    ok &= w_blk(f, s->snap_conv, convf * sizeof(float));
+  }
+  ok &= fclose(f) == 0;
+  if (!ok) { remove(tmp); return 0; }
+  if (rename(tmp, path) != 0) { remove(tmp); return 0; }
+  return 1;
+}
+
+// load a dump written by sess_write: validates it against the loaded model, fills tok[0..n) (cap
+// entries max) and restores the model state to it. Returns the token count, 0 = no usable dump.
+static int sess_read(Transformer *t, int *tok, int cap, const char *path) {
+  const Config *p = &t->config;
+  RunState *s = &t->state;
+  FILE *f = fopen(path, "rb");
+  if (!f) return 0;
+  int n = 0, ok = 1;
+  char magic[8];
+  ok &= r_blk(f, magic, 8) && !memcmp(magic, SESS_MAGIC, 8);
+  uint32_t hdr[7] = {0};
+  ok &= r_blk(f, hdr, sizeof hdr);
+  ok &= ok && hdr[0] == SESS_VER && (hdr[1] & 1) == (RECURRENT(p) ? 1u : 0u) && hdr[2] == (uint32_t)p->vocab_size &&
+         hdr[3] == (uint32_t)p->dim && hdr[4] == (uint32_t)p->n_layers && hdr[5] == (uint32_t)p->n_attn && hdr[6] == (uint32_t)ARCH;
+  char model[64] = {0};
+  ok &= r_blk(f, model, sizeof model) && !strcmp(model, SRV_MODEL);
+  uint32_t nn = 0;
+  ok &= r_blk(f, &nn, 4);
+  n = (int)nn;
+  ok &= ok && n > 0 && n <= cap && n <= p->seq_len;
+  if (ok) {
+    int *tt = malloc((size_t)n * sizeof(int));
+    if (!tt || !r_blk(f, tt, (size_t)n * sizeof(int))) ok = 0;
+    else memcpy(tok, tt, (size_t)n * sizeof(int));
+    free(tt);
+  }
+  if (ok && RECURRENT(p)) {
+    uint32_t np = 0;
+    ok &= r_blk(f, &np, 4);
+    ok &= r_blk(f, s->lin_S, hyb_state_floats(p) * sizeof(float));
+    ok &= r_blk(f, s->conv_state, hyb_conv_floats(p) * sizeof(float));
+    s->next_pos = (int)np;
+  }
+  if (ok && !p->glm) {
+    size_t row = (size_t)n * p->kv_dim;
+    float *st = sess_stage_for(row);
+    ok &= st != NULL;
+    for (int la = 0; ok && la < p->n_attn; la++) {
+      float *k = s->key_cache + (size_t)la * p->seq_len * p->kv_dim;
+      float *v = s->value_cache + (size_t)la * p->seq_len * p->kv_dim;
+      ok &= r_blk(f, st, row * sizeof(float));
+      for (int i = 0; ok && i < n; i++) memcpy(k + (size_t)i * p->kv_dim, st + (size_t)i * p->kv_dim, p->kv_dim * sizeof(float));
+      ok &= r_blk(f, st, row * sizeof(float));
+      for (int i = 0; ok && i < n; i++) memcpy(v + (size_t)i * p->kv_dim, st + (size_t)i * p->kv_dim, p->kv_dim * sizeof(float));
+    }
+  }
+  if (ok && p->glm) {
+    GlmState *g = s->glm;
+    const size_t kvl = p->g_kvl, ih = p->g_ih;
+    size_t row = (size_t)n * kvl;
+    float *st = sess_stage_for(row > (size_t)n * ih ? row : (size_t)n * ih);
+    ok &= st != NULL;
+    for (int la = 0; ok && la < p->n_attn; la++) {
+      float *base = g->lat[0] + (size_t)la * p->seq_len * kvl;
+      ok &= r_blk(f, st, row * sizeof(float));
+      for (int i = 0; ok && i < n; i++) memcpy(base + (size_t)i * kvl, st + (size_t)i * kvl, kvl * sizeof(float));
+    }
+    for (int la = 0; ok && la < p->n_attn; la++) {
+      float *base = g->ikey + (size_t)la * p->seq_len * ih;
+      ok &= r_blk(f, st, (size_t)n * ih * sizeof(float));
+      for (int i = 0; ok && i < n; i++) memcpy(base + (size_t)i * ih, st + (size_t)i * ih, ih * sizeof(float));
+    }
+    for (int la = 0; ok && la < p->n_attn; la++) {
+      float *base = g->igate + (size_t)la * p->seq_len * ih;
+      ok &= r_blk(f, st, (size_t)n * ih * sizeof(float));
+      for (int i = 0; ok && i < n; i++) memcpy(base + (size_t)i * ih, st + (size_t)i * ih, ih * sizeof(float));
+    }
+    int npool = n / p->g_kpool + 1;
+    for (int la = 0; ok && la < p->n_attn; la++) {
+      float *base = g->ipool + (size_t)la * (p->seq_len / p->g_kpool + 1) * ih;
+      ok &= r_blk(f, base, (size_t)npool * ih * sizeof(float));
+    }
+    for (int k2 = 1; ok && k2 < NN; k2++) // the per-node latent copies are identical: rebuild them from lat[0]
+      for (int la = 0; la < p->n_attn; la++)
+        memcpy(g->lat[k2] + (size_t)la * p->seq_len * kvl, g->lat[0] + (size_t)la * p->seq_len * kvl, (size_t)n * kvl * sizeof(float));
+  }
+  if (ok && RECURRENT(p) && (hdr[1] & 2)) {
+    if (!s->snap_S) {
+      s->snap_S = malloc(hyb_state_floats(p) * sizeof(float));
+      s->snap_conv = malloc(hyb_conv_floats(p) * sizeof(float));
+    }
+    uint32_t sp = 0;
+    ok &= s->snap_S && s->snap_conv;
+    ok &= r_blk(f, &sp, 4);
+    ok &= r_blk(f, s->snap_S, hyb_state_floats(p) * sizeof(float));
+    ok &= r_blk(f, s->snap_conv, hyb_conv_floats(p) * sizeof(float));
+    s->snap_pos = (int)sp;
+  }
+  fclose(f);
+  return ok ? n : 0;
+}
+
 #include "server.h"
 
 void error_usage() {
@@ -5313,6 +5528,7 @@ void error_usage() {
   fprintf(stderr, "  -H <string> server: address to listen on, default 127.0.0.1 (0.0.0.0 = all interfaces)\n");
   fprintf(stderr, "  -P <int>    server: port, default 8080\n");
   fprintf(stderr, "  -A <string> server: API key the clients must send (Authorization: Bearer ...)\n");
+  fprintf(stderr, "  -W <dir>    server: sessions directory (journal + state dumps; \"none\" disables, default workspace/sessions)\n");
   fprintf(stderr, "              imatrix: -i <text file> -o <out.imx> collects Q4 importance statistics\n");
   fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
   fprintf(stderr, "  -T <int>    number of threads, default 0 = auto (placed on the most idle CPUs; RUNQ_PIN=1 keeps them pinned, RUNQ_PIN=0 disables placement)\n");
@@ -5399,6 +5615,8 @@ int main(int argc, char *argv[]) {
       SRV_PORT = atoi(argv[i + 1]);
     } else if (argv[i][1] == 'A') {
       SRV_KEY = argv[i + 1];
+    } else if (argv[i][1] == 'W') {
+      SRV_SESS_DIR = argv[i + 1];
     } else {
       error_usage();
     }
@@ -5477,6 +5695,8 @@ int main(int argc, char *argv[]) {
     char *name = strdup(base), *dot = strrchr(name, '.');
     if (dot && !strcmp(dot, ".bin")) *dot = '\0';
     SRV_MODEL = name;
+    if (!SRV_SESS_DIR) SRV_SESS_DIR = "workspace/sessions"; // sessions survive a restart: "-W none" disables
+    if (!strcmp(SRV_SESS_DIR, "none")) SRV_SESS_DIR = NULL;
     server(&transformer, &tokenizer, &sampler);
   } else if (strcmp(mode, "imatrix") == 0) {
     if (!prompt || !out_path) error_usage();
