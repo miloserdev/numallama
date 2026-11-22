@@ -3,6 +3,10 @@
   "timeout_sec": 10,
   "max_output": 3000,
   "tools": [
+    {"name":"shell","description":"Execute shell commands, pipelines and scripts","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]},"command":["bash","-lc","{command}"]},
+    {"name":"read_file","description":"Read file contents","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]},"command":["cat","--","{path}"]},
+    {"name":"write_file","description":"Write or overwrite file using stdin","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]},"command":["tee","{path}"]},
+    {"name":"append_file","description":"Append stdin to file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]},"command":["tee","-a","{path}"]},
     {
       "name": "ls",
       "description": "List the files in a directory of the workspace, with sizes and dates.",

@@ -5101,7 +5101,7 @@ static int chat_reply(Transformer *tr, Tokenizer *tk, Sampler *sp, ChatHistory *
 void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *cli_user_prompt, char *cli_system_prompt, int steps) {
   const int ctx = transformer->config.seq_len;
   const int BUF = 1 << 16;
-  const int MAX_ROUNDS = 8; // tool-call rounds per user message
+  const int MAX_ROUNDS = 16; // tool-call rounds per user message
   char *text = malloc(BUF);
   int *msg = malloc((4 * BUF + 64) * sizeof(int));
   ChatHistory h = {.tok = malloc(ctx * sizeof(int)), .n = 0, .cap = ctx, .sys_len = 0, .turn = malloc(ctx * sizeof(int)), .n_turns = 0};
