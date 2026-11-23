@@ -3651,12 +3651,16 @@ float* forward_all(Transformer* transformer, const int* tokens, int n, int pos0)
     return SPEC_LOGITS;
 }
 
-float* forward_batch(Transformer* transformer, const int* tokens, int n, int pos0) {
+static volatile int g_srv_abort; // defined below with the other server globals
+
+float* forward_batch(Transformer* transformer, const int* tokens, int n, int pos0, int* done_out) {
     use_model(transformer);
     if (transformer->config.hybrid || transformer->config.glm) {
         if (!HYB_BATCH) { // token by token
             float* l = NULL;
-            for (int i = 0; i < n; i++) l = forward(transformer, tokens[i], pos0 + i);
+            int i = 0;
+            for (; i < n && !g_srv_abort; i++) l = forward(transformer, tokens[i], pos0 + i);
+            if (done_out) *done_out = i;
             return l;
         }
         if (pos0 != 0 && pos0 != transformer->state.next_pos) {
@@ -3667,7 +3671,8 @@ float* forward_batch(Transformer* transformer, const int* tokens, int n, int pos
     }
 
     float* logits = NULL;
-    for (int done = 0; done < n;) {
+    int done = 0;
+    for (done = 0; done < n && !g_srv_abort;) {
         int B = n - done < BATCH_MAX ? n - done : BATCH_MAX;
         if (B == 1) {
             logits = forward(transformer, tokens[done], pos0 + done);
@@ -3685,6 +3690,7 @@ float* forward_batch(Transformer* transformer, const int* tokens, int n, int pos
         }
         done += B;
     }
+    if (done_out) *done_out = done;
     return logits;
 }
 
@@ -4460,10 +4466,11 @@ static float *chat_feed(Transformer *t, ChatHistory *h, const int *toks, int n) 
     n = h->cap - h->n;
   }
   if (n <= 0) return t->state.logits;
-  float *logits = forward_batch(t, toks, n, h->n);
-  memcpy(h->tok + h->n, toks, n * sizeof(int));
-  h->n += n;
-  return logits;
+  int fed = 0;
+  float *logits = forward_batch(t, toks, n, h->n, &fed);
+  memcpy(h->tok + h->n, toks, (size_t)fed * sizeof(int));
+  h->n += fed;
+  return fed < n ? NULL : logits; // NULL: aborted mid-feed (g_srv_abort, the client went away)
 }
 
 // make room for `need` more tokens by dropping the oldest turns, then re-prefill
@@ -4901,7 +4908,8 @@ static int draft_model_tokens(const int *hist, int n, int next, int *out, int km
   Transformer *d = g_draft;
   if (DRAFT_POS > n) DRAFT_POS = n;
   if (DRAFT_POS < n) {
-    forward_batch(d, hist + DRAFT_POS, n - DRAFT_POS, DRAFT_POS);
+    int fed = 0;
+    forward_batch(d, hist + DRAFT_POS, n - DRAFT_POS, DRAFT_POS, &fed);
     DRAFT_POS = n;
   }
   const int V = d->config.vocab_size;
@@ -4938,6 +4946,7 @@ typedef struct {
   int stop;    // set by text(): end the reply now
 } ReplySink;
 static ReplySink *g_sink = NULL; // NULL: print to stdout
+static volatile int g_srv_abort = 0; // server: the client went away (heartbeat): stop the prefill
 static void out_text(const char *s, int reasoning) {
   if (g_sink) { g_sink->text(g_sink->ctx, s, reasoning); return; }
   printf("%s", s);
@@ -5269,7 +5278,7 @@ __attribute__((unused)) static void imatrix(Transformer* t, Tokenizer* tk, const
         int chunk[CH];
         chunk[0] = BOS_ID;
         memcpy(chunk + 1, ids + c, len * sizeof(int));
-        forward_batch(t, chunk, len + 1, 0);
+        forward_batch(t, chunk, len + 1, 0, &(int){0});
         IMX.ntok += len + 1;
         fprintf(stderr, "\r[imatrix] %lld / %d tokens", IMX.ntok, nt);
     }

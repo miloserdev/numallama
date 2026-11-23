@@ -147,6 +147,7 @@ static void *srv_heartbeat(void *arg) {
     if (*hb->stop) break;
     if (send(hb->fd, ": keep-alive\n\n", 14, MSG_NOSIGNAL) != 14) {
       *hb->failed = 1;
+      g_srv_abort = 1; // stop the prefill: the client is gone
       if (g_sink) g_sink->stop = 1;
       break;
     }
@@ -532,6 +533,15 @@ static SrvSys *srv_sys_slot(void) {
   g_sys_next = (g_sys_next + 1) % SRV_MAX_SYS;
   return v;
 }
+// file name identity of a prefix: FNV-1a over its tokens
+static unsigned srv_tok_hash(const int *tok, int n) {
+  unsigned h = 2166136261u;
+  for (int i = 0; i < n; i++) {
+    h ^= (unsigned)tok[i];
+    h *= 16777619u;
+  }
+  return h;
+}
 
 static SrvSession *srv_session(const char *id, int cap) {
   for (int i = 0; i < g_nsessions; i++)
@@ -760,19 +770,32 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
   }
   // recurrent: save the state one token before the end of the prompt, so that the same prompt again
   // (a retry, a regenerate) or any continuation of it can start from there; a new system prefix is
-  // captured at its end on the way (a copy of the full state, so feeding on cannot corrupt it)
+  // captured at its end on the way (a copy of the full state, so feeding on cannot corrupt it).
+  // g_srv_abort (set by the keep-alive thread when the client goes away) stops the prefill between
+  // blocks: the session keeps the processed prefix, a retry feeds only the rest.
+  g_srv_abort = 0;
   if (rec && np - 1 > reuse) {
     if (cap_slot && reuse < sys_len) {
-      chat_feed(tr, &h, P + reuse, sys_len - reuse);
-      srv_snap_take(tr, &cap_slot->snap, sys_len);
+      if (chat_feed(tr, &h, P + reuse, sys_len - reuse)) {
+        if (srv_snap_take(tr, &cap_slot->snap, sys_len) && SRV_SESS_DIR) { // keep the prefix warm across restarts
+          char path[1200];
+          snprintf(path, sizeof path, "%s/.sys-%08x.bin", SRV_SESS_DIR, srv_tok_hash(P, sys_len));
+          sess_write(tr, P, sys_len, path); // best effort
+        }
+      }
       chat_feed(tr, &h, P + sys_len, np - 1 - sys_len);
     } else {
       chat_feed(tr, &h, P + reuse, np - 1 - reuse);
     }
   }
-  if (RECURRENT(&tr->config) && h.n == np - 1) hybrid_snapshot(tr);
-  float *logits = chat_feed(tr, &h, P + h.n, np - h.n);
+  if (rec && !g_srv_abort && h.n == np - 1) hybrid_snapshot(tr);
+  float *logits = g_srv_abort ? NULL : chat_feed(tr, &h, P + h.n, np - h.n);
   long t1 = time_in_ms();
+  if (!logits) { // client gone mid-prefill: keep the processed prefix (the snapshot below), skip the reply
+    fprintf(stderr, "[server] prompt %d tok: client gone at %d tok, prefill aborted\n", np, h.n);
+    S->n = h.n;
+    r.failed = 1;
+  }
 
   g_sink = &sink;
   JNode *calls[MAX_CALLS_PER_REPLY];
@@ -868,7 +891,7 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
           (np - reuse) * 1000.0 / (t1 - t0 > 0 ? t1 - t0 : 1), gen, gen * 1000.0 / (t2 - t1 > 0 ? t2 - t1 : 1), finish,
           r.stream ? ", stream" : "", r.failed ? ", client disconnected" : "");
   if (S != &g_fallback && r.content.buf) { // durable record + restorable state (best effort)
-    srv_journal(S, body, np, gen, reuse, finish);
+    if (!r.failed) srv_journal(S, body, np, gen, reuse, finish);
     // a snapshot costs seconds on a big session: throttle it; the memory snapshot makes the next
     // session swap a memcpy, the on-disk dump (written after the connection closes) survives restarts
     long now = time(NULL);
@@ -974,8 +997,26 @@ static void server(Transformer *tr, Tokenizer *tk, Sampler *sp) {
     int nfiles = 0;
     if (d) {
       struct dirent *e;
-      while ((e = readdir(d)))
-        if (strstr(e->d_name, ".bin")) nfiles++;
+      while ((e = readdir(d))) {
+        if (strstr(e->d_name, ".bin") && strncmp(e->d_name, ".sys-", 5)) nfiles++;
+        if (!strncmp(e->d_name, ".sys-", 5) && g_nsessions < SRV_MAX_SESS + SRV_MAX_SYS) {
+          char path[1200];
+          snprintf(path, sizeof path, "%s/%s", SRV_SESS_DIR, e->d_name);
+          int *tok = malloc((size_t)tr->config.seq_len * sizeof(int));
+          int n = sess_read(tr, tok, tr->config.seq_len, path); // a persisted system prefix
+          if (n > 1) {
+            SrvSys *slot = srv_sys_slot();
+            srv_snap_free(&slot->snap);
+            free(slot->tok);
+            slot->tok = tok;
+            slot->n = n;
+            srv_snap_take(tr, &slot->snap, n);
+            fprintf(stderr, "[server] system prefix: %d tokens loaded from %s\n", n, e->d_name);
+            tok = NULL;
+          }
+          free(tok);
+        }
+      }
       closedir(d);
     }
     fprintf(stderr, "[server] sessions in %s: %d state file%s on disk\n", SRV_SESS_DIR, nfiles, nfiles == 1 ? "" : "s");
@@ -1030,6 +1071,7 @@ static void server(Transformer *tr, Tokenizer *tk, Sampler *sp) {
           if (d) {
             struct dirent *e;
             while ((e = readdir(d))) {
+              if (strncmp(e->d_name, ".sys-", 5) == 0) continue; // system-prefix slots are not sessions
               char *dot = strstr(e->d_name, ".bin");
               if (!dot || dot[4] != '\0') continue;
               char id[72];
