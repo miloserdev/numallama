@@ -722,15 +722,21 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
   if (S->n > 0 && reuse < S->n) {
     // the request does not continue this session's history (a stray client reused the id, or the
     // history was edited): the session restarts from this request (the shared KV prefix is reused,
-    // the new branch overwrites the tail), so keep the previous state on disk under ".fork" instead
-    // of letting the next dump silently overwrite it; restore it by renaming the file back
-    if (SRV_SESS_DIR && S != &g_fallback) {
+    // the new branch overwrites the tail). Keep the previous state on disk under ".fork" — but only
+    // when a meaningful part of the history matched: opencode sends its title request and its agent
+    // request under one session id with different system prompts (they share ~10 tokens), and that
+    // throwaway state is not worth a fork file on every session start
+    int keep_fork = lcp >= 256 || lcp * 4 >= S->n;
+    if (keep_fork && SRV_SESS_DIR && S != &g_fallback) {
       char old[1208], fork[1216];
       snprintf(old, sizeof old, "%s/%s.bin", SRV_SESS_DIR, S->id);
       snprintf(fork, sizeof fork, "%s/%s.fork.bin", SRV_SESS_DIR, S->id);
       if (rename(old, fork) == 0)
         fprintf(stderr, "[server] session %s: diverging request (shared %d of %d tok), the session restarts; "
                 "previous state kept at %s.fork.bin\n", S->id, lcp, S->n, S->id);
+    } else if (!keep_fork) {
+      fprintf(stderr, "[server] session %s: diverging request (shared %d of %d tok), the session restarts\n",
+              S->id, lcp, S->n);
     }
   }
   if (reuse == sys_len && S->n < sys_len)
