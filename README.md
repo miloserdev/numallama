@@ -146,16 +146,23 @@ print(r.choices[0].message.content)
   new messages (`usage.prompt_tokens_details.cached_tokens`). Hybrid models (Qwen3.5 / 3.8, GLM)
   can only resume from the end of the previous prompt (or the start).
 - **Sessions survive a restart.** Every conversation is journaled to `<session_dir>/<id>.jsonl`
-  (with the full request bodies) and its token history + KV cache / recurrent state are dumped to
-  `<session_dir>/<id>.bin` (throttled: on growth by 2048 tokens or 30 s) so a reconnect after a
-  server restart resumes without re-processing the history. The session id comes from the request's
-  `session_id` / `conversation_id` field or the `x-opencode-session-id` (also `x-session-id`,
-  `x-conversation-id`) header; without one, a single `default` session is used. `-W <dir>` sets the
+  (with the full request bodies) and its token history + model state (KV cache / recurrent state +
+  the GLM latent / indexer caches) are dumped to `<session_dir>/<id>.bin` (throttled: on growth by
+  2048 tokens or 30 s) so a reconnect after a server restart resumes without re-processing the
+  history. The session id comes from the request's `session_id` / `conversation_id` field or the
+  `x-opencode-session-id` (also `x-session-id`, `x-conversation-id`) header; without one, a single
+  `default` session is used. Sessions also keep an in-memory snapshot: switching between
+  conversations (and resuming a dumped one) is a memory copy, not a re-prefill. `-W <dir>` sets the
   session directory (default `workspace/sessions`, `-W none` disables). `GET /v1/sessions` lists
-  the known sessions. Clients like opencode send their session header automatically, so an
-  opencode conversation can be resumed after restarting the server. Streaming responses send the
-  headers immediately and keep-alive comments during prefill, so slow first tokens don't hit
-  client timeouts.
+  the known sessions. Clients like opencode send their session header automatically, so an opencode
+  conversation can be resumed after restarting the server. Streaming responses send the headers
+  immediately and keep-alive comments during prefill, so slow first tokens don't hit client
+  timeouts.
+- **The system prompt is processed once.** Agent clients send the same fat system prompt (tools +
+  instructions, often >10k tokens) in every session. The server captures the model state at the end
+  of that prefix (up to 8 distinct prefixes) and restores it for any session sharing it, so the
+  first request of a new opencode session processes only its own tail — a ~5-minute prefill of an
+  11k-token system prompt becomes a sub-second state load.
 - The client runs the tools; the `-f` sandbox is used only by the CLI chat.
 - Not supported: `/v1/completions`, `/v1/embeddings`, images and audio, `n` > 1, `logprobs`,
   `response_format` (JSON mode), forcing a call with `tool_choice: "required"`.

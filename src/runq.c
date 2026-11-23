@@ -5328,14 +5328,101 @@ static float *sess_stage_for(size_t floats) {
   return sess_stage;
 }
 
+// the position-indexed caches for tokens [0..n) as one contiguous blob, layer-major; the same
+// layout backs the on-disk dumps, the in-memory session snapshots and the system-prefix slots:
+// attention / hybrid: per layer K rows [0..n) then V rows; GLM: per layer latent, indexer keys,
+// indexer gates, then the pooled indexer keys
+static size_t sess_region_floats(const Config *p, int n) {
+  if (p->glm) return (size_t)p->n_attn * n * (p->g_kvl + 2 * p->g_ih) +
+                     (size_t)p->n_attn * (n / p->g_kpool + 1) * p->g_ih;
+  return (size_t)p->n_attn * n * p->kv_dim * 2;
+}
+static void sess_region_save(const Transformer *t, int n, float *dst) {
+  const Config *p = &t->config;
+  const RunState *s = &t->state;
+  if (!p->glm) {
+    for (int la = 0; la < p->n_attn; la++) {
+      const float *k = s->key_cache + (size_t)la * p->seq_len * p->kv_dim;
+      const float *v = s->value_cache + (size_t)la * p->seq_len * p->kv_dim;
+      for (int i = 0; i < n; i++) memcpy(dst + (size_t)i * p->kv_dim, k + (size_t)i * p->kv_dim, p->kv_dim * sizeof(float));
+      dst += (size_t)n * p->kv_dim;
+      for (int i = 0; i < n; i++) memcpy(dst + (size_t)i * p->kv_dim, v + (size_t)i * p->kv_dim, p->kv_dim * sizeof(float));
+      dst += (size_t)n * p->kv_dim;
+    }
+  } else {
+    const GlmState *g = s->glm;
+    const size_t kvl = p->g_kvl, ih = p->g_ih;
+    for (int la = 0; la < p->n_attn; la++) {
+      const float *base = g->lat[0] + (size_t)la * p->seq_len * kvl;
+      for (int i = 0; i < n; i++) memcpy(dst + (size_t)i * kvl, base + (size_t)i * kvl, kvl * sizeof(float));
+      dst += (size_t)n * kvl;
+    }
+    for (int la = 0; la < p->n_attn; la++) {
+      const float *base = g->ikey + (size_t)la * p->seq_len * ih;
+      for (int i = 0; i < n; i++) memcpy(dst + (size_t)i * ih, base + (size_t)i * ih, ih * sizeof(float));
+      dst += (size_t)n * ih;
+    }
+    for (int la = 0; la < p->n_attn; la++) {
+      const float *base = g->igate + (size_t)la * p->seq_len * ih;
+      for (int i = 0; i < n; i++) memcpy(dst + (size_t)i * ih, base + (size_t)i * ih, ih * sizeof(float));
+      dst += (size_t)n * ih;
+    }
+    int npool = n / p->g_kpool + 1;
+    for (int la = 0; la < p->n_attn; la++) {
+      const float *base = g->ipool + (size_t)la * (p->seq_len / p->g_kpool + 1) * ih;
+      memcpy(dst, base, (size_t)npool * ih * sizeof(float)); // contiguous: pool rows are never rewritten
+      dst += (size_t)npool * ih;
+    }
+  }
+}
+static void sess_region_load(Transformer *t, int n, const float *src) {
+  const Config *p = &t->config;
+  RunState *s = &t->state;
+  if (!p->glm) {
+    for (int la = 0; la < p->n_attn; la++) {
+      float *k = s->key_cache + (size_t)la * p->seq_len * p->kv_dim;
+      float *v = s->value_cache + (size_t)la * p->seq_len * p->kv_dim;
+      for (int i = 0; i < n; i++) memcpy(k + (size_t)i * p->kv_dim, src + (size_t)i * p->kv_dim, p->kv_dim * sizeof(float));
+      src += (size_t)n * p->kv_dim;
+      for (int i = 0; i < n; i++) memcpy(v + (size_t)i * p->kv_dim, src + (size_t)i * p->kv_dim, p->kv_dim * sizeof(float));
+      src += (size_t)n * p->kv_dim;
+    }
+  } else {
+    GlmState *g = s->glm;
+    const size_t kvl = p->g_kvl, ih = p->g_ih;
+    for (int la = 0; la < p->n_attn; la++) {
+      float *base = g->lat[0] + (size_t)la * p->seq_len * kvl;
+      for (int i = 0; i < n; i++) memcpy(base + (size_t)i * kvl, src + (size_t)i * kvl, kvl * sizeof(float));
+      src += (size_t)n * kvl;
+    }
+    for (int la = 0; la < p->n_attn; la++) {
+      float *base = g->ikey + (size_t)la * p->seq_len * ih;
+      for (int i = 0; i < n; i++) memcpy(base + (size_t)i * ih, src + (size_t)i * ih, ih * sizeof(float));
+      src += (size_t)n * ih;
+    }
+    for (int la = 0; la < p->n_attn; la++) {
+      float *base = g->igate + (size_t)la * p->seq_len * ih;
+      for (int i = 0; i < n; i++) memcpy(base + (size_t)i * ih, src + (size_t)i * ih, ih * sizeof(float));
+      src += (size_t)n * ih;
+    }
+    int npool = n / p->g_kpool + 1;
+    for (int la = 0; la < p->n_attn; la++) {
+      float *base = g->ipool + (size_t)la * (p->seq_len / p->g_kpool + 1) * ih;
+      memcpy(base, src, (size_t)npool * ih * sizeof(float));
+      src += (size_t)npool * ih;
+    }
+    for (int k2 = 1; k2 < NN; k2++) // the per-node latent copies are identical: rebuild them from lat[0]
+      for (int la = 0; la < p->n_attn; la++)
+        memcpy(g->lat[k2] + (size_t)la * p->seq_len * kvl, g->lat[0] + (size_t)la * p->seq_len * kvl, (size_t)n * kvl * sizeof(float));
+  }
+}
+
 // upper bound of the dump for n tokens (for the free-space check)
 static size_t sess_dump_bytes(const Transformer *t, int n) {
   const Config *p = &t->config;
   size_t b = 8 + 7 * 4 + 64 + 4 + (size_t)n * sizeof(int);
   if (RECURRENT(p)) b += 4 + (hyb_state_floats(p) + hyb_conv_floats(p)) * sizeof(float);
-  if (!p->glm) b += (size_t)p->n_attn * n * p->kv_dim * 2 * sizeof(float);
-  else b += (size_t)p->n_attn * n * (p->g_kvl + 2 * p->g_ih) * sizeof(float) +
-            (size_t)p->n_attn * (n / p->g_kpool + 1) * p->g_ih * sizeof(float);
+  b += sess_region_floats(p, n) * sizeof(float);
   if (RECURRENT(p) && t->state.snap_S && t->state.snap_pos > 0) b += 4 + (hyb_state_floats(p) + hyb_conv_floats(p)) * sizeof(float);
   return b;
 }
@@ -5368,45 +5455,11 @@ static int sess_write(const Transformer *t, const int *tok, int n, const char *p
     ok &= w_blk(f, s->lin_S, linf * sizeof(float));
     ok &= w_blk(f, s->conv_state, convf * sizeof(float));
   }
-  if (!p->glm) { // attention (and hybrid attention layers): K rows [0..n), then V rows, per layer
-    size_t row = (size_t)n * p->kv_dim;
-    float *st = sess_stage_for(row);
-    ok &= st != NULL;
-    for (int la = 0; ok && la < p->n_attn; la++) {
-      const float *k = s->key_cache + (size_t)la * p->seq_len * p->kv_dim;
-      const float *v = s->value_cache + (size_t)la * p->seq_len * p->kv_dim;
-      for (int i = 0; i < n; i++) memcpy(st + (size_t)i * p->kv_dim, k + (size_t)i * p->kv_dim, p->kv_dim * sizeof(float));
-      ok &= w_blk(f, st, row * sizeof(float));
-      for (int i = 0; i < n; i++) memcpy(st + (size_t)i * p->kv_dim, v + (size_t)i * p->kv_dim, p->kv_dim * sizeof(float));
-      ok &= w_blk(f, st, row * sizeof(float));
-    }
-  } else { // GLM: MLA latent cache, indexer keys / gates / pooled keys (lat[0]; the per-node copies are identical)
-    const GlmState *g = s->glm;
-    const size_t kvl = p->g_kvl, ih = p->g_ih;
-    size_t row = (size_t)n * kvl;
-    float *st = sess_stage_for(row > (size_t)n * ih ? row : (size_t)n * ih);
-    ok &= st != NULL;
-    for (int la = 0; ok && la < p->n_attn; la++) {
-      const float *base = g->lat[0] + (size_t)la * p->seq_len * kvl;
-      for (int i = 0; ok && i < n; i++) memcpy(st + (size_t)i * kvl, base + (size_t)i * kvl, kvl * sizeof(float));
-      ok &= w_blk(f, st, row * sizeof(float));
-    }
-    for (int la = 0; ok && la < p->n_attn; la++) {
-      const float *base = g->ikey + (size_t)la * p->seq_len * ih;
-      for (int i = 0; ok && i < n; i++) memcpy(st + (size_t)i * ih, base + (size_t)i * ih, ih * sizeof(float));
-      ok &= w_blk(f, st, (size_t)n * ih * sizeof(float));
-    }
-    for (int la = 0; ok && la < p->n_attn; la++) {
-      const float *base = g->igate + (size_t)la * p->seq_len * ih;
-      for (int i = 0; ok && i < n; i++) memcpy(st + (size_t)i * ih, base + (size_t)i * ih, ih * sizeof(float));
-      ok &= w_blk(f, st, (size_t)n * ih * sizeof(float));
-    }
-    int npool = n / p->g_kpool + 1;
-    for (int la = 0; ok && la < p->n_attn; la++) {
-      const float *base = g->ipool + (size_t)la * (p->seq_len / p->g_kpool + 1) * ih;
-      ok &= w_blk(f, base, (size_t)npool * ih * sizeof(float)); // contiguous: rows are never rewritten
-    }
-  }
+  size_t rf = sess_region_floats(p, n);
+  float *rb = sess_stage_for(rf);
+  ok &= rb != NULL;
+  if (ok) sess_region_save(t, n, rb);
+  ok &= w_blk(f, rb, rf * sizeof(float));
   if (snap) {
     uint32_t sp = (uint32_t)s->snap_pos;
     ok &= w_blk(f, &sp, 4);
@@ -5452,49 +5505,11 @@ static int sess_read(Transformer *t, int *tok, int cap, const char *path) {
     ok &= r_blk(f, s->conv_state, hyb_conv_floats(p) * sizeof(float));
     s->next_pos = (int)np;
   }
-  if (ok && !p->glm) {
-    size_t row = (size_t)n * p->kv_dim;
-    float *st = sess_stage_for(row);
-    ok &= st != NULL;
-    for (int la = 0; ok && la < p->n_attn; la++) {
-      float *k = s->key_cache + (size_t)la * p->seq_len * p->kv_dim;
-      float *v = s->value_cache + (size_t)la * p->seq_len * p->kv_dim;
-      ok &= r_blk(f, st, row * sizeof(float));
-      for (int i = 0; ok && i < n; i++) memcpy(k + (size_t)i * p->kv_dim, st + (size_t)i * p->kv_dim, p->kv_dim * sizeof(float));
-      ok &= r_blk(f, st, row * sizeof(float));
-      for (int i = 0; ok && i < n; i++) memcpy(v + (size_t)i * p->kv_dim, st + (size_t)i * p->kv_dim, p->kv_dim * sizeof(float));
-    }
-  }
-  if (ok && p->glm) {
-    GlmState *g = s->glm;
-    const size_t kvl = p->g_kvl, ih = p->g_ih;
-    size_t row = (size_t)n * kvl;
-    float *st = sess_stage_for(row > (size_t)n * ih ? row : (size_t)n * ih);
-    ok &= st != NULL;
-    for (int la = 0; ok && la < p->n_attn; la++) {
-      float *base = g->lat[0] + (size_t)la * p->seq_len * kvl;
-      ok &= r_blk(f, st, row * sizeof(float));
-      for (int i = 0; ok && i < n; i++) memcpy(base + (size_t)i * kvl, st + (size_t)i * kvl, kvl * sizeof(float));
-    }
-    for (int la = 0; ok && la < p->n_attn; la++) {
-      float *base = g->ikey + (size_t)la * p->seq_len * ih;
-      ok &= r_blk(f, st, (size_t)n * ih * sizeof(float));
-      for (int i = 0; ok && i < n; i++) memcpy(base + (size_t)i * ih, st + (size_t)i * ih, ih * sizeof(float));
-    }
-    for (int la = 0; ok && la < p->n_attn; la++) {
-      float *base = g->igate + (size_t)la * p->seq_len * ih;
-      ok &= r_blk(f, st, (size_t)n * ih * sizeof(float));
-      for (int i = 0; ok && i < n; i++) memcpy(base + (size_t)i * ih, st + (size_t)i * ih, ih * sizeof(float));
-    }
-    int npool = n / p->g_kpool + 1;
-    for (int la = 0; ok && la < p->n_attn; la++) {
-      float *base = g->ipool + (size_t)la * (p->seq_len / p->g_kpool + 1) * ih;
-      ok &= r_blk(f, base, (size_t)npool * ih * sizeof(float));
-    }
-    for (int k2 = 1; ok && k2 < NN; k2++) // the per-node latent copies are identical: rebuild them from lat[0]
-      for (int la = 0; la < p->n_attn; la++)
-        memcpy(g->lat[k2] + (size_t)la * p->seq_len * kvl, g->lat[0] + (size_t)la * p->seq_len * kvl, (size_t)n * kvl * sizeof(float));
-  }
+  size_t rf = sess_region_floats(p, n);
+  float *rb = sess_stage_for(rf);
+  ok &= rb != NULL;
+  ok &= r_blk(f, rb, rf * sizeof(float));
+  if (ok) sess_region_load(t, n, rb);
   if (ok && RECURRENT(p) && (hdr[1] & 2)) {
     if (!s->snap_S) {
       s->snap_S = malloc(hyb_state_floats(p) * sizeof(float));

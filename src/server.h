@@ -263,8 +263,10 @@ static void render_calls(SBuf *b, JNode *calls, int had_text) {
   }
 }
 
-// the whole conversation as prompt tokens, ending with the assistant header. -1 + err on bad input
-static int render_chat(Tokenizer *tk, JNode *messages, int *out, char *err, size_t errlen) {
+// the whole conversation as prompt tokens, ending with the assistant header. -1 + err on bad input.
+// *sys_out (optional) receives the length of the system prefix (tools + system text): identical
+// across the sessions of agent clients, so the server reuses its KV / state (see srv_chat).
+static int render_chat(Tokenizer *tk, JNode *messages, int *out, char *err, size_t errlen, int *sys_out) {
   SBuf sys = {0}, t = {0};
   sb_puts(&sys, "");
   for (JNode *m = messages->child; m; m = m->next) { // every system / developer message goes first
@@ -281,6 +283,7 @@ static int render_chat(Tokenizer *tk, JNode *messages, int *out, char *err, size
   size_t sl = strlen(st);
   while (sl > 0 && isspace((unsigned char)st[sl - 1])) st[--sl] = '\0';
   int n = build_system(tk, st, out, 0);
+  if (sys_out) *sys_out = n;
   free(sys.buf);
   const int glm = ARCH == ARCH_GLM5, qwen = ARCH_IS_QWEN;
   int in_tools = 0; // Qwen: consecutive tool messages share one user message (GLM: one <|observation|>)
@@ -407,16 +410,69 @@ static int request_tools(JNode *tools, Tools *out) {
   return arr->child != NULL;
 }
 
+// an in-memory model-state snapshot for tokens [0..n): the position-indexed cache region plus, for
+// recurrent models, the recurrent state. Sessions keep one (so swapping the model between sessions
+// is a memcpy, and the throttled on-disk dump stays just persistence); system-prefix slots own one
+// each (so several prefixes coexist no matter what the physical caches currently hold).
+typedef struct {
+  int n;           // tokens covered (0: none)
+  float *region;   // sess_region_floats(model, n)
+  float *S, *conv; // recurrent models: lin_S / conv_state at n
+} SrvSnap;
+
+// fill the snapshot from the model state (it must stand at n); allocates/grows the buffers
+static int srv_snap_take(Transformer *tr, SrvSnap *sp, int n) {
+  const Config *p = &tr->config;
+  size_t rf = sess_region_floats(p, n);
+  if (sp->n < n || !sp->region) {
+    free(sp->region);
+    sp->region = malloc(rf * sizeof(float));
+  }
+  if (!sp->region) { sp->n = 0; return 0; }
+  sess_region_save(tr, n, sp->region);
+  if (RECURRENT(p)) {
+    size_t sf = hyb_state_floats(p) * sizeof(float), cf = hyb_conv_floats(p) * sizeof(float);
+    if (!sp->S) {
+      sp->S = malloc(sf);
+      sp->conv = malloc(cf);
+    }
+    if (!sp->S) { sp->n = 0; return 0; }
+    memcpy(sp->S, tr->state.lin_S, sf);
+    memcpy(sp->conv, tr->state.conv_state, cf);
+  }
+  sp->n = n;
+  return 1;
+}
+// restore the model state from the snapshot: afterwards the state stands at sp->n
+static void srv_snap_load(Transformer *tr, const SrvSnap *sp) {
+  const Config *p = &tr->config;
+  sess_region_load(tr, sp->n, sp->region);
+  if (RECURRENT(p)) {
+    memcpy(tr->state.lin_S, sp->S, hyb_state_floats(p) * sizeof(float));
+    memcpy(tr->state.conv_state, sp->conv, hyb_conv_floats(p) * sizeof(float));
+    tr->state.next_pos = sp->n;
+  }
+}
+static void srv_snap_free(SrvSnap *sp) {
+  free(sp->region);
+  free(sp->S);
+  free(sp->conv);
+  memset(sp, 0, sizeof *sp);
+}
+
 // A named conversation: the rendered token history (tok[0..n)) whose KV / state is valid in the
 // model. The session whose state currently sits in the model is "live"; any other session is
-// swapped in from its dump on demand. "default" is the anonymous session.
+// swapped in from its snapshot (memory, else the on-disk dump) on demand. "default" is the
+// anonymous session.
 typedef struct {
   char id[72];
   int *tok;
   int n, cap;
   int live; // the model state matches tok[0..n)
-  long last_dump; // throttling: the state dump is expensive on a big session
+  long last_dump; // throttling: the on-disk state dump is expensive on a big session
   int dumped_n;
+  long last_use;
+  SrvSnap snap; // in-memory state snapshot for a fast swap-back (n == this->n when fresh)
 } SrvSession;
 
 #define SRV_MAX_SESS 64
@@ -425,6 +481,57 @@ static int g_nsessions;
 static SrvSession *g_live;
 static SrvSession *g_pending_dump; // set by srv_chat, written to disk after the connection closes
 static SrvSession g_fallback; // registry full / persistence off: one anonymous in-memory session
+
+// cap the total in-memory snapshot bytes: free the least recently used snapshots (never keep1/2)
+#define SRV_SNAP_BUDGET ((size_t)24 << 30)
+static void srv_snap_budget(Transformer *tr, SrvSession *keep1, SrvSession *keep2) {
+  const Config *p = &tr->config;
+  for (;;) {
+    size_t total = 0;
+    SrvSession *old = NULL;
+    for (int i = 0; i < g_nsessions; i++) {
+      SrvSession *s = &g_sessions[i];
+      if (s->snap.n > 0) {
+        total += sess_region_floats(p, s->snap.n) * sizeof(float);
+        if (RECURRENT(p)) total += (hyb_state_floats(p) + hyb_conv_floats(p)) * sizeof(float);
+        if (s != keep1 && s != keep2 && (!old || s->last_use < old->last_use)) old = s;
+      }
+    }
+    if (total <= SRV_SNAP_BUDGET || !old) return;
+    srv_snap_free(&old->snap);
+  }
+}
+
+// Agent clients (opencode and the like) send the same fat system prompt (tools + instructions) in
+// every session. Its tokens are the prefix of every rendered prompt, so the full model state at its
+// end is captured once and restored for any session that shares it: the first request of a new
+// session then only processes its own tail instead of the whole system prompt. Slots own their
+// state copies, so they coexist regardless of what the physical caches currently hold.
+#define SRV_MAX_SYS 8
+typedef struct {
+  int n;        // prefix length in tokens (0: empty slot)
+  int *tok;     // the rendered prefix tokens
+  SrvSnap snap; // the full state at n (valid when snap.n == n)
+} SrvSys;
+static SrvSys g_sys[SRV_MAX_SYS];
+static int g_sys_next; // circular hand for eviction
+
+// the slot whose tokens match P[0..sys_len) with a complete state, or NULL
+static SrvSys *srv_sys_find(const int *P, int sys_len) {
+  for (int i = 0; i < SRV_MAX_SYS; i++)
+    if (g_sys[i].n == sys_len && g_sys[i].snap.n == sys_len && g_sys[i].tok &&
+        !memcmp(P, g_sys[i].tok, (size_t)sys_len * sizeof(int)))
+      return &g_sys[i];
+  return NULL;
+}
+// a slot for a new prefix: an empty one, else the circular victim
+static SrvSys *srv_sys_slot(void) {
+  for (int i = 0; i < SRV_MAX_SYS; i++)
+    if (g_sys[i].n == 0) return &g_sys[i];
+  SrvSys *v = &g_sys[g_sys_next];
+  g_sys_next = (g_sys_next + 1) % SRV_MAX_SYS;
+  return v;
+}
 
 static SrvSession *srv_session(const char *id, int cap) {
   for (int i = 0; i < g_nsessions; i++)
@@ -488,15 +595,22 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
   else if (sess_hdr && sess_hdr[0]) snprintf(sid, sizeof sid, "%s", sess_hdr);
   srv_sanitize_id(sid);
   SrvSession *S = srv_session(sid, tr->config.seq_len);
-  if (S != g_live) { // the model holds another session's state: swap ours in from its dump
-    int loaded = 0;
-    if (SRV_SESS_DIR && S != &g_fallback) {
+  S->last_use = time(NULL);
+  if (S != g_live) { // the model holds another session's state: swap ours in
+    if (g_live && g_live != &g_fallback && g_live->n > 0) // keep the outgoing state for a fast swap-back
+      srv_snap_take(tr, &g_live->snap, g_live->n);
+    int loaded = 0, from_mem = 0;
+    if (S->snap.n == S->n && S->n > 0) { // fresh in-memory snapshot: a memcpy swap
+      srv_snap_load(tr, &S->snap);
+      loaded = S->n;
+      from_mem = 1;
+    } else if (SRV_SESS_DIR && S != &g_fallback) {
       char path[1200];
       snprintf(path, sizeof path, "%s/%s.bin", SRV_SESS_DIR, S->id);
       loaded = sess_read(tr, S->tok, S->cap, path);
     }
     if (loaded > 0) {
-      fprintf(stderr, "[server] session %s: restored %d tokens from disk\n", S->id, loaded);
+      fprintf(stderr, "[server] session %s: restored %d tokens from %s\n", S->id, loaded, from_mem ? "memory" : "disk");
       S->n = loaded;
       S->live = 1;
     } else {
@@ -540,7 +654,8 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
 
   char err[256];
   int *P = malloc(((size_t)strlen(body) + 65536) * sizeof(int));
-  int np = render_chat(tk, messages, P, err, sizeof err);
+  int sys_len = 0;
+  int np = render_chat(tk, messages, P, err, sizeof err, &sys_len);
   int status = 0;
   if (np < 0) { srv_error(fd, 400, "invalid_request_error", err); status = 1; }
   else if (np + 1 >= ctx) {
@@ -578,26 +693,77 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
   }
 
   // reuse the longest common prefix of the session's token history (GLM and other recurrent
-  // models can only resume where the state stands: the end of the history, the snapshot, or 0)
+  // models can only resume where the state stands: the end of the history, the snapshot, or 0);
+  // the shared system prefix of agent clients is reused across sessions (state restore / KV)
   long t0 = time_in_ms();
   int lcp = 0;
   while (lcp < S->n && lcp < np && S->tok[lcp] == P[lcp]) lcp++;
+  const int rec = RECURRENT(&tr->config);
+  SrvSys *sys_slot = sys_len > 1 && sys_len < np ? srv_sys_find(P, sys_len) : NULL;
+  int sys_cap = sys_len > 1 && sys_len < np && !sys_slot; // a new distinct system prefix
   int reuse;
-  RunState *s = &tr->state;
-  if (!RECURRENT(&tr->config)) {
+  if (!rec) {
     reuse = lcp < np ? lcp : np - 1; // at least one token is fed to get the logits
+    if (sys_slot && reuse < sys_len) reuse = sys_len; // the slot restores the shared prefix's caches
+  } else if (sys_slot && S->n < sys_len) {
+    srv_snap_load(tr, &sys_slot->snap); // state stands at sys_len now
+    reuse = sys_len; // a fresh session with the shared system prefix resumes right after it
   } else if (lcp == S->n && S->n < np) {
     reuse = S->n; // the state is exactly at the end of the shared prefix
-  } else if (s->snap_S && s->snap_pos > 0 && s->snap_pos <= lcp && s->snap_pos < np && hybrid_restore(tr, s->snap_pos)) {
-    reuse = s->snap_pos; // back to the end of the previous prompt
+  } else if (tr->state.snap_S && tr->state.snap_pos > 0 && tr->state.snap_pos <= lcp &&
+             tr->state.snap_pos < np && hybrid_restore(tr, tr->state.snap_pos)) {
+    reuse = tr->state.snap_pos; // back to the end of the previous prompt
+  } else if (sys_slot) {
+    srv_snap_load(tr, &sys_slot->snap);
+    reuse = sys_len; // a diverged session with the same system prefix still beats a full re-feed
   } else {
     reuse = 0;
   }
+  if (S->n > 0 && reuse < S->n) {
+    // the request does not continue this session's history (a stray client reused the id, or the
+    // history was edited): the session restarts from this request (the shared KV prefix is reused,
+    // the new branch overwrites the tail), so keep the previous state on disk under ".fork" instead
+    // of letting the next dump silently overwrite it; restore it by renaming the file back
+    if (SRV_SESS_DIR && S != &g_fallback) {
+      char old[1208], fork[1216];
+      snprintf(old, sizeof old, "%s/%s.bin", SRV_SESS_DIR, S->id);
+      snprintf(fork, sizeof fork, "%s/%s.fork.bin", SRV_SESS_DIR, S->id);
+      if (rename(old, fork) == 0)
+        fprintf(stderr, "[server] session %s: diverging request (shared %d of %d tok), the session restarts; "
+                "previous state kept at %s.fork.bin\n", S->id, lcp, S->n, S->id);
+    }
+  }
+  if (reuse == sys_len && S->n < sys_len)
+    memcpy(S->tok, P, (size_t)sys_len * sizeof(int)); // the session inherits the shared system prefix
   if (DRAFT_POS > reuse) DRAFT_POS = reuse;
   ChatHistory h = {.tok = S->tok, .n = reuse, .cap = ctx, .sys_len = 0, .turn = NULL, .n_turns = 0};
+  SrvSys *cap_slot = NULL;
+  if (sys_cap) { // remember the new system prefix (its full state is captured during the feed below)
+    cap_slot = srv_sys_slot();
+    if (cap_slot->n < sys_len) {
+      free(cap_slot->tok);
+      cap_slot->tok = malloc((size_t)sys_len * sizeof(int));
+    }
+    if (cap_slot->tok) {
+      memcpy(cap_slot->tok, P, (size_t)sys_len * sizeof(int));
+      cap_slot->n = sys_len;
+      cap_slot->snap.n = 0;
+    } else {
+      cap_slot = NULL;
+    }
+  }
   // recurrent: save the state one token before the end of the prompt, so that the same prompt again
-  // (a retry, a regenerate) or any continuation of it can start from there
-  if (RECURRENT(&tr->config) && np - 1 > reuse) chat_feed(tr, &h, P + reuse, np - 1 - reuse);
+  // (a retry, a regenerate) or any continuation of it can start from there; a new system prefix is
+  // captured at its end on the way (a copy of the full state, so feeding on cannot corrupt it)
+  if (rec && np - 1 > reuse) {
+    if (cap_slot && reuse < sys_len) {
+      chat_feed(tr, &h, P + reuse, sys_len - reuse);
+      srv_snap_take(tr, &cap_slot->snap, sys_len);
+      chat_feed(tr, &h, P + sys_len, np - 1 - sys_len);
+    } else {
+      chat_feed(tr, &h, P + reuse, np - 1 - reuse);
+    }
+  }
   if (RECURRENT(&tr->config) && h.n == np - 1) hybrid_snapshot(tr);
   float *logits = chat_feed(tr, &h, P + h.n, np - h.n);
   long t1 = time_in_ms();
@@ -697,11 +863,14 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
           r.stream ? ", stream" : "", r.failed ? ", client disconnected" : "");
   if (S != &g_fallback && r.content.buf) { // durable record + restorable state (best effort)
     srv_journal(S, body, np, gen, reuse, finish);
-    // a state dump costs seconds on a big session: throttle it, write it after the connection closes
+    // a snapshot costs seconds on a big session: throttle it; the memory snapshot makes the next
+    // session swap a memcpy, the on-disk dump (written after the connection closes) survives restarts
     long now = time(NULL);
-    if (SRV_SESS_DIR && S->n > 0 &&
-        (S->last_dump == 0 || S->n - S->dumped_n >= 2048 || now - S->last_dump >= 30))
-      g_pending_dump = S;
+    if (S->n > 0 && (S->last_dump == 0 || S->n - S->dumped_n >= 2048 || now - S->last_dump >= 30)) {
+      srv_snap_take(tr, &S->snap, S->n);
+      srv_snap_budget(tr, S, g_live);
+      if (SRV_SESS_DIR) g_pending_dump = S;
+    }
   }
   free(tcj.buf);
 done:
