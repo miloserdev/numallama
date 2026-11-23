@@ -714,7 +714,10 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
   int reuse;
   if (!rec) {
     reuse = lcp < np ? lcp : np - 1; // at least one token is fed to get the logits
-    if (sys_slot && reuse < sys_len) reuse = sys_len; // the slot restores the shared prefix's caches
+    if (sys_slot && reuse < sys_len) {
+      srv_snap_load(tr, &sys_slot->snap); // restore the shared prefix's caches (state stands at sys_len)
+      reuse = sys_len;
+    }
   } else if (sys_slot && S->n < sys_len) {
     srv_snap_load(tr, &sys_slot->snap); // state stands at sys_len now
     reuse = sys_len; // a fresh session with the shared system prefix resumes right after it
@@ -795,6 +798,13 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
     fprintf(stderr, "[server] prompt %d tok: client gone at %d tok, prefill aborted\n", np, h.n);
     S->n = h.n;
     r.failed = 1;
+  } else if (cap_slot && !rec && cap_slot->snap.n != sys_len) {
+    // attention models feed the whole prompt in one pass: capture the prefix state now
+    if (srv_snap_take(tr, &cap_slot->snap, sys_len) && SRV_SESS_DIR) { // keep it warm across restarts
+      char path[1200];
+      snprintf(path, sizeof path, "%s/.sys-%08x.bin", SRV_SESS_DIR, srv_tok_hash(P, sys_len));
+      sess_write(tr, P, sys_len, path); // best effort
+    }
   }
 
   g_sink = &sink;
