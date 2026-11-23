@@ -88,12 +88,10 @@ if calls:
         if ch.choices and ch.choices[0].delta.tool_calls: got = ch.choices[0].delta.tool_calls[0]
     check("stream tool call", got and got.function.name == "get_weather" and got.id, got)
 
-# 8. errors
-try:
-    client.chat.completions.create(model=model, messages=[{"role": "user", "content": "x " * 200000}])
-    check("too long -> 400", False)
-except BadRequestError as e:
-    check("too long -> 400", "context" in str(e), str(e)[:80])
+# 8. errors: a conversation past the window is trimmed (its oldest tokens drop), not rejected;
+#    only a prompt that cannot fit at all (after trimming) is a 400
+r = client.chat.completions.create(model=model, messages=[{"role": "user", "content": "x " * 200000}], max_tokens=5)
+check("too long -> trimmed", r.usage.prompt_tokens < 32000, r.usage.prompt_tokens)
 try:
     client.chat.completions.create(model=model, messages=[])
     check("empty -> 400", False)

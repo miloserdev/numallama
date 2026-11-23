@@ -668,7 +668,19 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
   int np = render_chat(tk, messages, P, err, sizeof err, &sys_len);
   int status = 0;
   if (np < 0) { srv_error(fd, 400, "invalid_request_error", err); status = 1; }
-  else if (np + 1 >= ctx) {
+  if (!status && np + 1 >= ctx) { // the conversation outgrew the window: drop its oldest tokens
+    // (the system prefix and the newest turns stay; agent clients handle a shortened history far
+    // better than a permanent error; recurrent models pay a re-prefill of the kept tail)
+    int keep = ctx - sys_len - 2048; // ...and room for the reply
+    if (keep < 256) keep = 256;
+    if (sys_len + keep < np) {
+      memmove(P + sys_len, P + np - keep, (size_t)keep * sizeof(int));
+      fprintf(stderr, "[server] context window full: dropped %d old tokens (kept the system prefix and the last %d)\n",
+              np - sys_len - keep, keep);
+      np = sys_len + keep;
+    }
+  }
+  if (!status && np + 1 >= ctx) {
     snprintf(err, sizeof err, "the prompt is %d tokens, the context window is %d (-c)", np, ctx);
     srv_error(fd, 400, "context_length_exceeded", err);
     status = 1;
