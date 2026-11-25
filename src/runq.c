@@ -3641,24 +3641,24 @@ float* forward_all(Transformer* transformer, const int* tokens, int n, int pos0)
     use_model(transformer);
     int V = transformer->config.vocab_size;
     if (!SPEC_LOGITS) SPEC_LOGITS = malloc((size_t)SPEC_MAX * V * sizeof(float));
-    if (n == 1 || (RECURRENT(&transformer->config) && !(transformer->config.hybrid && HYB_BATCH))) { // GLM: no per-position logits in the batch path yet
+    if (n == 1 || (RECURRENT(&transformer->config) && !HYB_BATCH)) { // no per-position logits without the batch path
         for (int i = 0; i < n; i++) memcpy(SPEC_LOGITS + (size_t)i * V, forward(transformer, tokens[i], pos0 + i), V * sizeof(float));
         return SPEC_LOGITS;
     }
-    if (transformer->config.hybrid) { // one batched pass: the weights are read once, the recurrent state advances n tokens
+    if (RECURRENT(&transformer->config)) { // one batched pass: the weights are read once, the recurrent state advances n tokens
         if (pos0 != transformer->state.next_pos) {
             fprintf(stderr, "hybrid model: position %d out of order (state at %d)\n", pos0, transformer->state.next_pos);
             exit(EXIT_FAILURE);
         }
         Config* hp = &transformer->config;
-        if (!SPEC_IN) SPEC_IN = malloc((size_t)(hp->n_layers - hp->n_attn) * SPEC_MAX * hp->lin_in * sizeof(float));
+        if (hp->hybrid && !SPEC_IN) SPEC_IN = malloc((size_t)(hp->n_layers - hp->n_attn) * SPEC_MAX * hp->lin_in * sizeof(float));
         P.t = transformer;
         P.mode = 1;
         BT.B = n;
         BT.pos0 = pos0;
         BT.tok = tokens;
         BT.logits_all = SPEC_LOGITS;
-        BT.save_in = SPEC_IN;
+        BT.save_in = hp->hybrid ? SPEC_IN : NULL; // GLM: no saved inputs, a partial accept replays through forward_batch
         wake_workers();
         forward_batch_thread(0);
         P.mode = 0;
@@ -5728,6 +5728,7 @@ int main(int argc, char *argv[]) {
   char *tools_path = NULL;         // tools.json for tool calling in chat mode
   char *out_path = NULL;           // -o: output file (imatrix mode)
   char *draft_path = NULL;         // draft model for speculative decoding
+  int spec_k_set = 0;              // -k was given explicitly
 
   // poor man's C argparse so we can override the defaults above from the command line
   if (argc >= 2) {
@@ -5771,6 +5772,7 @@ int main(int argc, char *argv[]) {
       draft_path = argv[i + 1];
     } else if (argv[i][1] == 'k') {
       SPEC_K = atoi(argv[i + 1]);
+      spec_k_set = 1;
     } else if (argv[i][1] == 'N') {
       NODES_REQ = atoi(argv[i + 1]);
     } else if (argv[i][1] == 'f') {
@@ -5820,9 +5822,8 @@ int main(int argc, char *argv[]) {
 #endif
   build_transformer(&transformer, checkpoint_path, ctx);
   init_pool(&transformer, nthreads);
-  if (transformer.config.glm && SPEC_K > 0) { // GLM: the batch path has no per-position logits yet
+  if (transformer.config.glm && !spec_k_set) // GLM is MoE: the verify pass reads the union of the routed experts, measured no gain
     SPEC_K = 0;
-  }
   if (RECURRENT(&transformer.config) && draft_path) { // draft-model cache rollback is not implemented for recurrent targets
     draft_path = NULL;
   }

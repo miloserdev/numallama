@@ -674,6 +674,28 @@ static void forward_glm_batch_thread(int tid) {
             }
         }
     }
+    if (BT.logits_all) { // speculative verification: the logits of every position (same math as the last-token head)
+        const int ngd = D / GS;
+        for (int b = n0; b < n1; b++) {
+            const float* x = GB.hs + (size_t)b * N;
+            float* xm = tb->xb;
+            float ss = 0.0f;
+            for (int i = 0; i < D; i++) {
+                float v = 0.0f;
+                for (int n = 0; n < hc; n++) v += x[(size_t)n * D + i];
+                xm[i] = v / hc;
+                ss += xm[i] * xm[i];
+            }
+            const float inv = 1.0f / sqrtf(ss / D + NORM_EPS);
+            for (int i = 0; i < D; i++) xm[i] = w->final_norm[i] * (xm[i] * inv);
+            quantize_vec(XQ + (size_t)b * D, XS + (size_t)b * ngd, xm, D);
+        }
+        barrier(tb);
+        part_range_node(p->vocab_size, tb, &r0, &r1);
+        matmul_rows_batch(BT.logits_all, p->vocab_size, XQ, XS, B, w->lm_head, D, r0, r1);
+        barrier(tb);
+        return;
+    }
     // logits of the last token: mean of its streams, RMSNorm, classifier
     {
         const float* x = GB.hs + (size_t)(B - 1) * N;
