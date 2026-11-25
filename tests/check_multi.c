@@ -8,8 +8,11 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 43; i++) forward(&t, 1000 + i, i);
     static float ref[16][128256];
     for (int B = 2; B <= 8; B++) {
+        hybrid_spec_snapshot(&t); // recurrent state at 43 (no-op for dense models)
         for (int i = 0; i < B; i++) memcpy(ref[i], forward(&t, toks[i], 43 + i), V * 4);
+        hybrid_spec_restore(&t); // back to 43: forward_all re-runs the same tokens batched
         float* L = forward_all(&t, toks, B, 43);
+        hybrid_spec_restore(&t); // and back to 43 for the next B
         int ok = 0, nan = 0; for (int i = 0; i < B; i++) { ok += amax(ref[i], V) == amax(L + (size_t)i * V, V); for (int j = 0; j < V; j++) if (L[(size_t)i*V+j] != L[(size_t)i*V+j]) { nan++; break; } }
         printf("B=%d argmax agree %d/%d, rows with NaN %d\n", B, ok, B, nan);
     }

@@ -9,6 +9,6 @@ int main(int argc, char** argv) {
     FILE* o = fopen(argv[4], "wb");
     for (int i = 0; i < n; i++) { printf("%d ", ids[i]); float* l = forward(&t, ids[i], i); fwrite(l, 4, t.config.vocab_size, o); }
     printf("\n"); fclose(o);
-    if (argc > 6) { float* l = forward_batch(&t, ids, n, 0); FILE* o2 = fopen(argv[6], "wb"); fwrite(l, 4, t.config.vocab_size, o2); fclose(o2); }
+    if (argc > 6) { float* l = forward_batch(&t, ids, n, 0, NULL); FILE* o2 = fopen(argv[6], "wb"); fwrite(l, 4, t.config.vocab_size, o2); fclose(o2); }
     return 0;
 }

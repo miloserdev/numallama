@@ -8,10 +8,10 @@ int main(int argc, char** argv) {
     int V = t.config.vocab_size;
     int hist[2048], n = 0; for (int i = 0; i < 43; i++) hist[n++] = (i == 0) ? 128000 : 1000 + i * 37;
     // reference: pure greedy with single-token forward
-    int ref[200]; { forward_batch(&t, hist, n, 0); int pos = n; float* l = forward(&t, hist[n - 1], n - 1); int tok = amax(l, V);
+    int ref[200]; { forward_batch(&t, hist, n, 0, NULL); int pos = n; float* l = forward(&t, hist[n - 1], n - 1); int tok = amax(l, V);
       for (int i = 0; i < 60; i++) { ref[i] = tok; l = forward(&t, tok, pos++); tok = amax(l, V); } }
     // speculative with draft (same loop shape as chat_reply, greedy)
-    forward_batch(&t, hist, n - 1, 0); float own[128256]; memcpy(own, forward(&t, hist[n - 1], n - 1), V * 4);
+    forward_batch(&t, hist, n - 1, 0, NULL); float own[128256]; memcpy(own, forward(&t, hist[n - 1], n - 1), V * 4);
     int out[200], no = 0, pending = -1; g_draft = &d; DRAFT_POS = 0;
     while (no < 60) {
         int next = pending >= 0 ? pending : amax(own, V); pending = -1;
