@@ -158,6 +158,8 @@ typedef struct {
   int next_pos;       // hybrid: the position the recurrent state is at (it can only advance)
   float *snap_S, *snap_conv; // hybrid: a saved copy of the recurrent / conv states ...
   int snap_pos;              // ... at this position (-1: none), e.g. right after the system prompt
+  float *spec_S, *spec_conv; // hybrid: a second snapshot slot, taken right before a speculative verify pass
+  int spec_pos;              // ... at this position
   float *key_cache;   // (layer, seq_len, dim)
   float *value_cache; // (layer, seq_len, dim)
   struct GlmState *glm; // GLM-5.3-Flash buffers, or NULL
@@ -214,6 +216,8 @@ void malloc_run_state(RunState *s, Config *p) {
   s->next_pos = 0;
   s->snap_S = s->snap_conv = NULL;
   s->snap_pos = -1;
+  s->spec_S = s->spec_conv = NULL;
+  s->spec_pos = -1;
   if (p->glm) {
     int nlin = p->n_layers - p->n_attn;
     s->lin_S = malloc((size_t)nlin * p->lin_nv * p->lin_dv * p->lin_dk * sizeof(float)); // first touched by its threads
@@ -254,6 +258,7 @@ void free_run_state(RunState *s) {
   free(s->value_cache);
   free(s->gate); free(s->lin); free(s->lin_o); free(s->lin_S); free(s->conv_state);
   free(s->snap_S); free(s->snap_conv);
+  free(s->spec_S); free(s->spec_conv);
 }
 
 // ----------------------------------------------------------------------------
@@ -2260,6 +2265,8 @@ static inline void wake_workers(void) {
 }
 
 static void sample_thread(int tid);
+static void copy_thread(int tid);
+static void commit_thread(int tid);
 // RUNQ_BARBENCH=1: measure the synchronization primitives alone (us per barrier)
 static double now_us(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e6 + ts.tv_nsec * 1e-3; }
 static void barrier_bench_thread(int tid) {
@@ -2282,6 +2289,8 @@ static void* pool_worker(void* arg) {
         seen = wait_for_work(seen);
         if (atomic_load_explicit(&P.quit, memory_order_acquire)) break;
         if (P.mode == 4) sample_thread(tid);
+        else if (P.mode == 5) copy_thread(tid);
+        else if (P.mode == 6) commit_thread(tid);
         else if (P.mode == 3) barrier_bench_thread(tid);
         else if (P.mode == 1) forward_batch_thread(tid);
         else if (P.mode == 2) forward_multi_thread(tid);
@@ -2530,6 +2539,8 @@ typedef struct {
     float* mpart;     // multi-token step: attention partials (token, head, context chunk, head_size + 2)
     size_t mpart_n;   // its capacity in floats
     float* logits_all; // when set: (B, vocab) logits of every position (speculative verification)
+    float* save_in;    // when set: (n_lin, SPEC_MAX_TOK, lin_in) copy of every linear layer's fused input,
+                       // so the accepted prefix of a speculative verify can be committed without a second weight read
     // MoE prefill (sized for BATCH_MAX tokens x n_active slots)
     float* router;     // (B, n_experts)
     int *moe_sel, *moe_cnt, *moe_fill, *moe_tok;
@@ -2543,6 +2554,8 @@ typedef struct {
 } Batch;
 
 static Batch BT;
+
+static float* SPEC_IN = NULL; // (n_lin, SPEC_MAX_TOK, lin_in) saved fused inputs of a speculative verify pass
 
 // out[b*ldo + i] = W[i,:] . x_b for rows i in [r0, r1) and tokens b in [0, B)
 static void matmul_rows_batch(float* out, int ldo, const int8_t* xq, const float* xs, int B,
@@ -2920,6 +2933,11 @@ static void forward_hybrid_batch_thread(int tid) {
             const int li = hyb_lidx(p, l);
             matmul_batch_node(BT.lin, LI, XQ, XS, B, w->w_in + li, dim, LI, tb, NULL, NULL, NULL, NULL);
             barrier(tb);
+            if (BT.save_in) { // speculative verify: keep the fused inputs for a weightless commit of the accepted prefix
+                size_t tot = (size_t)B * LI, i0 = tot * tid / nth, i1 = tot * (tid + 1) / nth;
+                memcpy(BT.save_in + (size_t)li * SPEC_MAX_TOK * LI + i0, BT.lin + i0, (i1 - i0) * sizeof(float));
+                barrier(tb);
+            }
             { // conv / activations: channels split among all threads, tokens in order
                 int c0, c1;
                 tok_range(LI, tid, nth, &c0, &c1);
@@ -3623,8 +3641,30 @@ float* forward_all(Transformer* transformer, const int* tokens, int n, int pos0)
     use_model(transformer);
     int V = transformer->config.vocab_size;
     if (!SPEC_LOGITS) SPEC_LOGITS = malloc((size_t)SPEC_MAX * V * sizeof(float));
-    if (n == 1 || RECURRENT(&transformer->config)) { // hybrid: no multi-token step (the state cannot roll back)
+    if (n == 1 || (RECURRENT(&transformer->config) && !(transformer->config.hybrid && HYB_BATCH))) { // GLM: no per-position logits in the batch path yet
         for (int i = 0; i < n; i++) memcpy(SPEC_LOGITS + (size_t)i * V, forward(transformer, tokens[i], pos0 + i), V * sizeof(float));
+        return SPEC_LOGITS;
+    }
+    if (transformer->config.hybrid) { // one batched pass: the weights are read once, the recurrent state advances n tokens
+        if (pos0 != transformer->state.next_pos) {
+            fprintf(stderr, "hybrid model: position %d out of order (state at %d)\n", pos0, transformer->state.next_pos);
+            exit(EXIT_FAILURE);
+        }
+        Config* hp = &transformer->config;
+        if (!SPEC_IN) SPEC_IN = malloc((size_t)(hp->n_layers - hp->n_attn) * SPEC_MAX * hp->lin_in * sizeof(float));
+        P.t = transformer;
+        P.mode = 1;
+        BT.B = n;
+        BT.pos0 = pos0;
+        BT.tok = tokens;
+        BT.logits_all = SPEC_LOGITS;
+        BT.save_in = SPEC_IN;
+        wake_workers();
+        forward_batch_thread(0);
+        P.mode = 0;
+        BT.logits_all = NULL;
+        BT.save_in = NULL;
+        transformer->state.next_pos = pos0 + n;
         return SPEC_LOGITS;
     }
     Config* p = &transformer->config;
@@ -4120,6 +4160,77 @@ static struct {
   int *cand;    // candidate indices, thread t writes from the start of its slice
   float M, Z;
 } SP;
+
+/* Parallel memcpy on the thread pool: a serial 150 MB state snapshot cost ~25 ms (one core's
+ * bandwidth), striped over the pool it takes ~1 ms. Each thread copies its slice. */
+static struct {
+  char *dst;
+  const char *src;
+  size_t n;
+} CP;
+static void copy_thread(int tid) {
+  ThreadBuf *tb = &P.tb[tid];
+  const size_t i0 = CP.n * tid / P.nth, i1 = CP.n * (tid + 1) / P.nth;
+  memcpy(CP.dst + i0, CP.src + i0, i1 - i0);
+  barrier(tb);
+}
+static void parallel_copy(void *dst, const void *src, size_t n) {
+  if (P.nth <= 1 || n < (1 << 20)) {
+    memcpy(dst, src, n);
+    return;
+  }
+  CP.dst = dst;
+  CP.src = src;
+  CP.n = n;
+  P.mode = 5;
+  wake_workers();
+  copy_thread(0);
+  P.mode = 0;
+}
+
+/* Commit the accepted prefix of a speculative verify pass without a second weight read: the pass
+ * saved every linear layer's fused input (BT.save_in -> SPEC_IN), and the state updates are a
+ * fixed function of those inputs, so the recurrent / conv states are rebuilt from the snapshot
+ * by replaying only the state updates (the recurrence output itself is discarded). */
+static struct {
+  int ntok;
+  float *out; // (nth, nv dv) per-thread scratch for the discarded recurrence output
+} SC;
+static float *SPEC_OUT = NULL;
+static void commit_thread(int tid) {
+  Transformer *t = P.t;
+  Config *p = &t->config;
+  RunState *s = &t->state;
+  ThreadBuf *tb = &P.tb[tid];
+  const int LI = p->lin_in, nlin = p->n_layers - p->n_attn, nv = p->lin_nv, vd = nv * p->lin_dv;
+  const int ntok = SC.ntok, nth = P.nth;
+  float *out = SC.out + (size_t)tid * vd;
+  for (int it = tid; it < nlin * LI; it += nth) { // conv + activations: (layer, channel) items, tokens in order
+    int li = it / LI, r = it % LI;
+    float *row = SPEC_IN + (size_t)li * SPEC_MAX * LI + r;
+    for (int b = 0; b < ntok; b++) hyb_in_row(p, &t->weights, s->conv_state, li, r, row + (size_t)b * LI);
+  }
+  barrier(tb);
+  const int ipb = (p->lin_dv + HYB_ROWS - 1) / HYB_ROWS;
+  for (int it = tid; it < nlin * nv * ipb; it += nth) { // delta rule: (layer, head, row block) items
+    int li = it / (nv * ipb), h = (it / ipb) % nv, c0 = (it % ipb) * HYB_ROWS;
+    float *S = hyb_state(p, s, li, h, c0);
+    for (int b = 0; b < ntok; b++) hyb_delta(p, S, SPEC_IN + (size_t)li * SPEC_MAX * LI + (size_t)b * LI, h, c0, out);
+  }
+  barrier(tb);
+}
+static void hybrid_spec_commit(Transformer *t, int ntok) { // state: spec_pos -> spec_pos + ntok, no weight reads
+  if (!SPEC_OUT) SPEC_OUT = malloc((size_t)P.nth * t->config.lin_nv * t->config.lin_dv * sizeof(float));
+  P.t = t;
+  SC.ntok = ntok;
+  SC.out = SPEC_OUT;
+  P.mode = 6;
+  wake_workers();
+  commit_thread(0);
+  P.mode = 0;
+  t->state.next_pos += ntok;
+}
+
 static void sample_thread(int tid) {
   ThreadBuf *tb = &P.tb[tid];
   const int n = SP.n, nth = P.nth;
@@ -4458,6 +4569,28 @@ static int hybrid_restore(Transformer *t, int pos) { // 1 if the state now stand
   memcpy(s->conv_state, s->snap_conv, hyb_conv_floats(&t->config) * sizeof(float));
   s->next_pos = pos;
   return 1;
+}
+
+/* Speculative verification on hybrid models: the batched pass advances the recurrent state past
+ * rejected drafts, so the state is saved before the pass and restored (then the accepted prefix
+ * is replayed) on a partial accept. A separate slot from the system-prompt anchor above. */
+static void hybrid_spec_snapshot(Transformer *t) {
+  RunState *s = &t->state;
+  if (!RECURRENT(&t->config)) return;
+  if (!s->spec_S) {
+    s->spec_S = malloc(hyb_state_floats(&t->config) * sizeof(float));
+    s->spec_conv = malloc(hyb_conv_floats(&t->config) * sizeof(float));
+  }
+  parallel_copy(s->spec_S, s->lin_S, hyb_state_floats(&t->config) * sizeof(float));
+  parallel_copy(s->spec_conv, s->conv_state, hyb_conv_floats(&t->config) * sizeof(float));
+  s->spec_pos = s->next_pos;
+}
+static void hybrid_spec_restore(Transformer *t) { // back to the state saved before the verify pass
+  RunState *s = &t->state;
+  if (!RECURRENT(&t->config) || !s->spec_S) return;
+  parallel_copy(s->lin_S, s->spec_S, hyb_state_floats(&t->config) * sizeof(float));
+  parallel_copy(s->conv_state, s->spec_conv, hyb_conv_floats(&t->config) * sizeof(float));
+  s->next_pos = s->spec_pos;
 }
 
 static float *chat_feed(Transformer *t, ChatHistory *h, const int *toks, int n) {
@@ -4926,7 +5059,7 @@ static int draft_model_tokens(const int *hist, int n, int next, int *out, int km
   }
   return k;
 }
-static long SPEC_DRAFTED = 0, SPEC_ACCEPTED = 0;
+static long SPEC_DRAFTED = 0, SPEC_ACCEPTED = 0, SPEC_STEPS = 0;
 
 typedef struct {   // streaming state of one assistant message
   SBuf buf;        // Llama: the undecided/buffered message; ChatML: the current <tool_call> body
@@ -5072,10 +5205,13 @@ static int chat_reply(Transformer *tr, Tokenizer *tk, Sampler *sp, ChatHistory *
     }
     // verify [next, d1..dk] in one pass; row i = distribution after seq[i]
     int base = h->n;
+    const int rec = RECURRENT(&tr->config);
+    if (rec) hybrid_spec_snapshot(tr); // the pass advances the recurrent state past rejected drafts
     float *L = forward_all(tr, seq, k + 1, base);
     memcpy(h->tok + base, seq, (k + 1) * sizeof(int));
     int acc = 0, stop = 0;
     SPEC_DRAFTED += k;
+    SPEC_STEPS++;
     for (int i = 0; i < k; i++) {
       int y = sample_draft(sp, L + (size_t)i * V, seq[i + 1]);
       if (y != seq[i + 1]) { pending = y; break; }
@@ -5086,13 +5222,22 @@ static int chat_reply(Transformer *tr, Tokenizer *tk, Sampler *sp, ChatHistory *
       if (sink_done(*gen)) { stop = 1; break; }
     }
     SPEC_ACCEPTED += acc;
-    if (!from_model && moe) { // MoE: a verification step costs ~1.4x (2 tokens) .. 2.5x (8): adapt the draft length
+    if (!from_model && rec && !moe) { // dense hybrid: a verify pass costs the same at any k (the weights are read once per pass)
+      // and a rejected draft only costs a snapshot + a state-only commit: keep the draft length, cool down after misses
+      if (acc == 0) { spec_cool = spec_cool ? (spec_cool * 2 < 32 ? spec_cool * 2 : 32) : 2; spec_wait = spec_cool; }
+      else spec_cool = 0;
+    } else if (!from_model && moe) { // MoE: a verification step costs ~1.4x (2 tokens) .. 2.5x (8): adapt the draft length
       if (acc == k) spec_len = spec_len * 2 < SPEC_K ? spec_len * 2 : SPEC_K;
       else spec_len = acc + 1 > 2 ? acc + 1 : 2;
       if (acc == 0) { spec_cool = spec_cool ? (spec_cool * 2 < 32 ? spec_cool * 2 : 32) : 2; spec_wait = spec_cool; }
       else spec_cool = 0;
     }
     h->n = base + 1 + acc; // positions after this hold rejected drafts: they get overwritten
+    if (rec && acc < k) { // rewind the recurrent state to the snapshot and replay the accepted prefix
+      hybrid_spec_restore(tr);
+      if (tr->config.hybrid) hybrid_spec_commit(tr, acc + 1); // state-only replay from the saved fused inputs
+      else forward_batch(tr, seq, acc + 1, base, NULL);
+    }
     if (from_model) DRAFT_POS = base + 1 + (acc < k - 1 ? acc : k - 1); // draft cache: next, accepted drafts
     if (stop) break;
     if (pending < 0) memcpy(own, L + (size_t)k * V, (size_t)V * sizeof(float)); // all accepted
@@ -5234,10 +5379,10 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char
     }
     printf("\n");
     fflush(stdout);
-    fprintf(stderr, "[prompt %d tok %.1f tok/s | reply %d tok %.1f tok/s | context %d/%d | draft accepted %ld/%ld]\n", prompt_tok,
+    fprintf(stderr, "[prompt %d tok %.1f tok/s | reply %d tok %.1f tok/s | context %d/%d | draft accepted %ld/%ld in %ld steps]\n", prompt_tok,
             prompt_tok * 1000.0 / (prompt_ms > 0 ? prompt_ms : 1), gen, gen * 1000.0 / (gen_ms > 0 ? gen_ms : 1), h.n, ctx,
-            SPEC_ACCEPTED, SPEC_DRAFTED);
-    SPEC_ACCEPTED = SPEC_DRAFTED = 0;
+            SPEC_ACCEPTED, SPEC_DRAFTED, SPEC_STEPS);
+    SPEC_ACCEPTED = SPEC_DRAFTED = SPEC_STEPS = 0;
   }
   free(prefix.buf);
   free(text);
@@ -5674,8 +5819,10 @@ int main(int argc, char *argv[]) {
 #endif
   build_transformer(&transformer, checkpoint_path, ctx);
   init_pool(&transformer, nthreads);
-  if (RECURRENT(&transformer.config) && (SPEC_K > 0 || draft_path)) { // a recurrent state cannot drop rejected drafts
+  if (transformer.config.glm && SPEC_K > 0) { // GLM: the batch path has no per-position logits yet
     SPEC_K = 0;
+  }
+  if (RECURRENT(&transformer.config) && draft_path) { // draft-model cache rollback is not implemented for recurrent targets
     draft_path = NULL;
   }
   Transformer draft;
