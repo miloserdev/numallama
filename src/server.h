@@ -661,6 +661,8 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
   JNode *tc = json_get(req, "tool_choice");
   int use_tools = !(tc && tc->type == J_STR && !strcmp(tc->str, "none"));
   g_tools = use_tools && request_tools(json_get(req, "tools"), &rt) ? &rt : NULL;
+  if (!g_tools && use_tools && SRV_TOOLS) g_tools = SRV_TOOLS; // -f tools.json: tools the server runs itself
+  const int own_tools = SRV_TOOLS && g_tools == SRV_TOOLS;
 
   char err[256];
   int *P = malloc(((size_t)strlen(body) + 65536) * sizeof(int));
@@ -788,6 +790,9 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
   // captured at its end on the way (a copy of the full state, so feeding on cannot corrupt it).
   // g_srv_abort (set by the keep-alive thread when the client goes away) stops the prefill between
   // blocks: the session keeps the processed prefix, a retry feeds only the rest.
+  if (np - reuse > 512) // a long prefill is the hot phase (minutes at full load): log that it starts
+    fprintf(stderr, "[server] prefill start: %d tok to process (%d of %d cached), session %s\n", np - reuse, reuse, np,
+            S->id[0] ? S->id : "-");
   g_srv_abort = 0;
   if (rec && np - 1 > reuse) {
     if (cap_slot && reuse < sys_len) {
@@ -823,6 +828,38 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
   JNode *calls[MAX_CALLS_PER_REPLY];
   int ended = 0, gen = 0, n_calls = 0;
   if (!r.failed) n_calls = chat_reply(tr, tk, sp, &h, logits, &ended, &gen, calls);
+  if (own_tools) { // server-side tools: run the calls here, the client sees only the text (no tool_calls)
+    SBuf prefix = {0}; // template text owed after each reply (end of turn markers)
+    sb_puts(&prefix, "");
+    for (int round = 0; n_calls > 0 && !r.failed && !r.stop_hit && round < 16; round++) {
+      if (!ended) sb_puts(&prefix, end_text());
+      sb_puts(&prefix, after_end());
+      int nc = n_calls;
+      char *outs[MAX_CALLS_PER_REPLY];
+      for (int i = 0; i < nc; i++) {
+        char *shown = NULL;
+        outs[i] = tools_run(g_tools, calls[i], &shown, 1);
+        fprintf(stderr, "[server] tool %s -> %zu bytes\n", json_get(calls[i], "name")->str, strlen(outs[i]));
+        free(shown);
+        json_free(calls[i]);
+      }
+      n_calls = 0;
+      int m = build_tool_results(tk, prefix.buf, outs, nc, P, 0); // P is scratch after the prefill
+      for (int i = 0; i < nc; i++) free(outs[i]);
+      prefix.len = 0;
+      prefix.buf[0] = '\0';
+      if (h.n + m + 512 >= h.cap) { // no turn dropping here: the client owns the history
+        fprintf(stderr, "[server] tool output does not fit the context window (%d tokens)\n", h.cap);
+        break;
+      }
+      logits = chat_feed(tr, &h, P, m);
+      if (!logits) { r.failed = 1; break; } // client gone mid-feed
+      n_calls = chat_reply(tr, tk, sp, &h, logits, &ended, &gen, calls);
+    }
+    for (int i = 0; i < n_calls; i++) json_free(calls[i]); // unfinished calls (limit / no room): the text stands
+    n_calls = 0;
+    free(prefix.buf);
+  }
   g_sink = NULL;
   if (hb_on) {
     hb_stop = 1;

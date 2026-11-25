@@ -5455,6 +5455,7 @@ static int SRV_PORT = 8080;
 static const char *SRV_KEY = NULL;     // -A: required "Authorization: Bearer <key>"
 static const char *SRV_MODEL = "numallama";
 static const char *SRV_SESS_DIR = NULL; // -W: session journal / state dumps (default: workspace/sessions)
+static Tools *SRV_TOOLS = NULL;         // -f tools.json: tools the server executes itself when the request has none
 
 // Server session persistence (enabled by default in server mode, -W <dir>): per session an
 // append-only JSONL journal of the requests plus a binary state dump (prompt tokens + KV cache /
@@ -5842,6 +5843,7 @@ int main(int argc, char *argv[]) {
   if (tools_path) {
     if (!tools_load(&tools, tools_path)) exit(EXIT_FAILURE);
     g_tools = &tools;
+    SRV_TOOLS = &tools; // server mode: the fallback tool set for requests without tools
     fprintf(stderr, "[tools from %s, workspace %s]\n", tools_path, tools.workdir);
   }
   if (steps == 0 || steps > transformer.config.seq_len)
