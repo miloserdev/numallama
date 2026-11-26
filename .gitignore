@@ -17,3 +17,9 @@ models/
 /tests/check_batch
 /tests/check_multi
 /tests/check_draft
+# local runtime artifacts
+/workspace/
+/.opencode/
+/opencode.json
+/monitor-gpu.sh
+/{path}
