@@ -19,6 +19,11 @@ Highlights:
   (single token and 4x8 batched kernels). Q4 is asymmetric (groups of 32, fp16 scale + min) and
   quantized with an importance matrix collected by the engine itself: on Llama 3.2 3B its KL to
   full precision is 0.013 (llama.cpp Q4_K_M: 0.015).
+- **KV cache int8 by default** (`-K f32` for full precision): int8 K/V and per-head queries with
+  per-64 group scales, scored with int8 `sdot`. It quarters the cache (Qwen3.8-27B at 131k:
+  16 GB -> 4 GB) and measured +6-28% decode and +5-26% prefill at 8k-30k prompts; the logits move
+  by ~0.005 KL against the f32 cache. Session dumps and shared system-prefix slots shrink the
+  same way.
 - **Multi-socket NUMA**: every weight matrix and the KV cache are split between the sockets
   (`mbind`), each socket's threads compute only its rows, per-node work counters and per-node
   activation buffers keep cross-socket traffic minimal; attention and the MoE router synchronize
@@ -149,7 +154,9 @@ print(r.choices[0].message.content)
   (with the full request bodies) and its token history + model state (KV cache / recurrent state +
   the GLM latent / indexer caches) are dumped to `<session_dir>/<id>.bin` (throttled: on growth by
   2048 tokens or 30 s) so a reconnect after a server restart resumes without re-processing the
-  history. The session id comes from the request's `session_id` / `conversation_id` field or the
+  history. The dump is head-major and records the KV format: int8 (the default) keeps the cache
+  part 4x smaller (a Qwen3.8-27B session at 131k tokens: 16 GB -> 4 GB). Dumps written by an older
+  build (format v1) are ignored and rebuilt. The session id comes from the request's `session_id` / `conversation_id` field or the
   `x-opencode-session-id` (also `x-session-id`, `x-conversation-id`) header; without one, a single
   `default` session is used. Sessions also keep an in-memory snapshot: switching between
   conversations (and resuming a dumped one) is a memory copy, not a re-prefill. `-W <dir>` sets the
@@ -172,7 +179,7 @@ print(r.choices[0].message.content)
 
 | Path | Contents |
 |---|---|
-| `src/runq.c` | the engine: model loading, NUMA placement, thread pool, kernels, forward passes, tokenizer, sampler, chat |
+| `src/runq.c` + `src/*.h` | the engine as one translation unit: model loading, NUMA placement, thread pool, kernels, forward passes, chat, server (`AGENTS.md` maps the headers) |
 | `src/tools.h` | tool calling: minimal JSON parser, `tools.json` loading, sandboxed command execution |
 | `src/server.h` | OpenAI-compatible HTTP server (`-m server`) |
 | `scripts/export_hf_q8.py` | Hugging Face safetensors → `.bin` (Q8 / Q4, optional SmoothQuant, numpy only) |
@@ -257,6 +264,7 @@ are refused: re-export them.
 | `-T <n>` | threads (default 0 = all idle CPUs of the used NUMA nodes, at most 96 per node) |
 | `-N <n>` | NUMA nodes to use (default 0 = all); weights are split between them |
 | `-c <n>` | context window (KV cache size), default 8192 |
+| `-K i8\|f32` | KV cache format: `int8` (default) with per-64 group scales and int8 dot products, or `f32` (full precision, ~4x more memory) |
 | `-k <n>` | max prompt-lookup draft length, default 8, `0` = off (adaptive for MoE models; off for hybrid models: a recurrent state cannot drop rejected drafts) |
 | `-m server`, `-H`, `-P`, `-A`, `-W` | OpenAI-compatible API server, listen address (default 127.0.0.1), port (default 8080), API key, sessions directory |
 | `-r <0\|1>` | Qwen3.5 / 3.8: `1` = reasoning (thinking shown dimmed), default `0` = answer directly |

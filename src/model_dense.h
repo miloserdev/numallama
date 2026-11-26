@@ -49,12 +49,13 @@ static void forward_thread(int tid) {
         tb->rope_s[j] = (float)sin(val);
     }
 
+    const int kvi8 = s->kv_type == KV_I8;
     for (int l = 0; l < p->n_layers; l++) {
         const float* xin = (l == 0) ? emb : x; // residual stream input of this layer
         size_t loff = (size_t)l * p->seq_len * kv_dim;
         // kv cache layout: (layer, kv_head, seq_len, head_size), so every head is one contiguous stream
-        float* kc = s->key_cache + loff + (size_t)pos * head_size;
-        float* vc = s->value_cache + loff + (size_t)pos * head_size;
+        float* kc = kvi8 ? NULL : s->key_cache + loff + (size_t)pos * head_size;
+        float* vc = kvi8 ? NULL : s->value_cache + loff + (size_t)pos * head_size;
 
         PROF(tid, PH_NORM);
         // attention rmsnorm + quantize (cooperative, per node)
@@ -82,12 +83,12 @@ static void forward_thread(int tid) {
                 s->k[i]     = v0 * tb->rope_c[j] - v1 * tb->rope_s[j];
                 s->k[i + 1] = v0 * tb->rope_s[j] + v1 * tb->rope_c[j];
             }
-            if (!qkn) for (int i = r0; i < r1; i++) { kc[(size_t)(i / head_size) * p->seq_len * head_size + i % head_size] = s->k[i]; }
+            if (!qkn && !kvi8) for (int i = r0; i < r1; i++) { kc[(size_t)(i / head_size) * p->seq_len * head_size + i % head_size] = s->k[i]; }
         }
         while (grab_rows(WORK_PHASES * l + 2, kv_dim, tb, &r0, &r1)) {
             matmul_rows(s->v, nq, ns, w->wv + l, dim, r0, r1);
             if (w->bv) for (int i = r0; i < r1; i++) s->v[i] += w->bv[(size_t)l * kv_dim + i];
-            for (int i = r0; i < r1; i++) { vc[(size_t)(i / head_size) * p->seq_len * head_size + i % head_size] = s->v[i]; }
+            if (!kvi8) for (int i = r0; i < r1; i++) { vc[(size_t)(i / head_size) * p->seq_len * head_size + i % head_size] = s->v[i]; }
         }
         if (hl) node_barrier(tb); else barrier(tb);
         if (qkn) { // per-head q/k RMSNorm + RoPE (needs whole heads), k into the cache
@@ -101,8 +102,17 @@ static void forward_thread(int tid) {
                     int g = (hl ? g0 : 0) + task - tq;
                     float* kv = s->k + (size_t)g * head_size;
                     head_norm_rope(kv, w->k_norm + (size_t)l * head_size, head_size, tb->rope_c, tb->rope_s);
-                    memcpy(kc + (size_t)g * p->seq_len * head_size, kv, head_size * sizeof(float));
+                    if (!kvi8) memcpy(kc + (size_t)g * p->seq_len * head_size, kv, head_size * sizeof(float));
                 }
+            }
+            if (hl) node_barrier(tb); else barrier(tb);
+        }
+        if (kvi8) { // quantize this position's K/V rows (the whole head is ready here)
+            int qa = hl ? g0 : 0, qb = hl ? g1 : p->n_kv_heads;
+            int me = hl ? tb->ltid : tid, nme = hl ? tb->nthn : P.nth;
+            for (int g = qa + me; g < qb; g += nme) {
+                kv_store_row(kv_k_i8(s, p, l, g, pos), kv_ks(s, p, l, g, pos), s->k + (size_t)g * head_size, head_size);
+                kv_store_row(kv_v_i8(s, p, l, g, pos), kv_vs(s, p, l, g, pos), s->v + (size_t)g * head_size, head_size);
             }
             if (hl) node_barrier(tb); else barrier(tb);
         }
@@ -118,20 +128,45 @@ static void forward_thread(int tid) {
         for (int item = tb->ltid; item < (g1 - g0) * C * HS; item += tb->nthn) {
             int g = g0 + item / (C * HS), c = (item / HS) % C, hsub = item % HS;
             int t0 = (int)((long)T * c / C), t1 = (int)((long)T * (c + 1) / C);
-            const float* kb = s->key_cache + loff + (size_t)g * p->seq_len * head_size;
-            const float* vb = s->value_cache + loff + (size_t)g * p->seq_len * head_size;
+            const int ng = head_size / GS;
+            const size_t kof = (size_t)g * p->seq_len * head_size;
+            const float* kb = kvi8 ? NULL : s->key_cache + loff + kof;
+            const float* vb = kvi8 ? NULL : s->value_cache + loff + kof;
+            const int8_t* kbq = kvi8 ? s->key_cache_q + loff + kof : NULL;
+            const int8_t* vbq = kvi8 ? s->value_cache_q + loff + kof : NULL;
+            const float* kbs = kvi8 ? s->key_cache_s + (loff + kof) / GS : NULL;
+            const float* vbs = kvi8 ? s->value_cache_s + (loff + kof) / GS : NULL;
             float m[KV_MUL_MAX], sum[KV_MUL_MAX];
             for (int r = 0; r < hper; r++) m[r] = -FLT_MAX;
-            for (int t = t0; t < t1; t++) {
-                const float* k = kb + (size_t)t * head_size;
+            if (kvi8) {
+                int8_t qq[KV_MUL_MAX * head_size];
+                float qsc[KV_MUL_MAX * (head_size / GS)];
                 for (int r = 0; r < hper; r++) {
                     int h = g * kv_mul + hsub * hper + r;
-                    const float* q = s->q + h * head_size;
-                    float score = 0.0f;
-                    for (int i = 0; i < head_size; i++) { score += q[i] * k[i]; }
-                    score *= att_scale;
-                    s->att[(size_t)h * p->seq_len + t] = score;
-                    m[r] = score > m[r] ? score : m[r];
+                    quantize_vec(qq + r * head_size, qsc + r * ng, s->q + (size_t)h * head_size, head_size);
+                }
+                for (int t = t0; t < t1; t++) {
+                    const int8_t* k = kbq + (size_t)t * head_size;
+                    const float* ks = kbs + (size_t)t * ng;
+                    for (int r = 0; r < hper; r++) {
+                        int h = g * kv_mul + hsub * hper + r;
+                        float score = kv_dot_q8(qq + r * head_size, qsc + r * ng, k, ks, head_size) * att_scale;
+                        s->att[(size_t)h * p->seq_len + t] = score;
+                        m[r] = score > m[r] ? score : m[r];
+                    }
+                }
+            } else {
+                for (int t = t0; t < t1; t++) {
+                    const float* k = kb + (size_t)t * head_size;
+                    for (int r = 0; r < hper; r++) {
+                        int h = g * kv_mul + hsub * hper + r;
+                        const float* q = s->q + (size_t)h * head_size;
+                        float score = 0.0f;
+                        for (int i = 0; i < head_size; i++) { score += q[i] * k[i]; }
+                        score *= att_scale;
+                        s->att[(size_t)h * p->seq_len + t] = score;
+                        m[r] = score > m[r] ? score : m[r];
+                    }
                 }
             }
             for (int r = 0; r < hper; r++) {
@@ -142,13 +177,26 @@ static void forward_thread(int tid) {
                 sum[r] = sm;
                 memset(P.part + ((size_t)h * C + c) * (head_size + 2) + 2, 0, head_size * sizeof(float));
             }
-            for (int t = t0; t < t1; t++) {
-                const float* v = vb + (size_t)t * head_size;
-                for (int r = 0; r < hper; r++) {
-                    int h = g * kv_mul + hsub * hper + r;
-                    float e = s->att[(size_t)h * p->seq_len + t];
-                    float* acc = P.part + ((size_t)h * C + c) * (head_size + 2) + 2;
-                    for (int i = 0; i < head_size; i++) { acc[i] += e * v[i]; }
+            if (kvi8) {
+                float vf[head_size];
+                for (int t = t0; t < t1; t++) {
+                    kv_dequant_row(vf, vbq + (size_t)t * head_size, vbs + (size_t)t * ng, head_size);
+                    for (int r = 0; r < hper; r++) {
+                        int h = g * kv_mul + hsub * hper + r;
+                        float e = s->att[(size_t)h * p->seq_len + t];
+                        float* acc = P.part + ((size_t)h * C + c) * (head_size + 2) + 2;
+                        for (int i = 0; i < head_size; i++) acc[i] += e * vf[i];
+                    }
+                }
+            } else {
+                for (int t = t0; t < t1; t++) {
+                    const float* v = vb + (size_t)t * head_size;
+                    for (int r = 0; r < hper; r++) {
+                        int h = g * kv_mul + hsub * hper + r;
+                        float e = s->att[(size_t)h * p->seq_len + t];
+                        float* acc = P.part + ((size_t)h * C + c) * (head_size + 2) + 2;
+                        for (int i = 0; i < head_size; i++) { acc[i] += e * v[i]; }
+                    }
                 }
             }
             for (int r = 0; r < hper; r++) {

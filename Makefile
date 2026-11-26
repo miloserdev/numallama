@@ -2,7 +2,7 @@
 CC      ?= gcc
 CFLAGS  ?= -Ofast -mcpu=native -pthread -Wall
 LDLIBS  = -lm
-TESTS   = tests/dump_logits tests/encode tests/check_batch tests/check_multi tests/check_draft
+TESTS   = tests/dump_logits tests/encode tests/check_batch tests/check_multi tests/check_draft tests/check_kv
 
 .PHONY: all prof tests clean
 

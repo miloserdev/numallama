@@ -4,6 +4,7 @@
  *   weights.h       NUMA placement and repacking of the weights
  *   pool.h          thread pool, barriers, per-node reduction, rmsnorm, profiling
  *   quant.h         int8/int4 quantization and the NEON matmul kernels (single + batched)
+ *   kv.h            KV cache formats (f32 / int8 with per-group scales), store/dot/axpy
  *   model_hybrid.h  Qwen3.5/3.8 decode step (Gated DeltaNet + full attention)
  *   glm.h           GLM-5.3 decode step
  *   model_dense.h   dense Llama/Qwen decode step
@@ -21,6 +22,7 @@
 #include "weights.h"
 #include "pool.h"
 #include "quant.h"
+#include "kv.h"
 #include "model_hybrid.h"
 #include "glm.h"
 #include "model_dense.h"
@@ -48,108 +50,127 @@ static Tools *SRV_TOOLS = NULL;         // -f tools.json: tools the server execu
 // dump: only the tokens it added since the dump are processed. Writes go to "<path>.tmp" + rename.
 
 #define SESS_MAGIC "NASESS01"
-#define SESS_VER 1
+#define SESS_VER 2 // 2: head-major rows, kv_type + group size in the header (1: legacy f32 dump)
 
 static int w_blk(FILE *f, const void *p, size_t bytes) { return bytes == 0 || fwrite(p, 1, bytes, f) == bytes; }
 static int r_blk(FILE *f, void *p, size_t bytes) { return bytes == 0 || fread(p, 1, bytes, f) == bytes; }
 
 // contiguous staging buffer for the strided per-layer cache rows (the server is single-threaded)
-static float *sess_stage;
-static size_t sess_stage_floats;
+static void *sess_stage;
+static size_t sess_stage_bytes;
 
-static float *sess_stage_for(size_t floats) {
-  if (floats > sess_stage_floats) {
+static void *sess_stage_for(size_t bytes) {
+  if (bytes > sess_stage_bytes) {
     free(sess_stage);
-    sess_stage_floats = 0;
-    sess_stage = malloc(floats * sizeof(float));
+    sess_stage_bytes = 0;
+    sess_stage = malloc(bytes);
     if (!sess_stage) return NULL;
-    sess_stage_floats = floats;
+    sess_stage_bytes = bytes;
   }
   return sess_stage;
 }
 
-// the position-indexed caches for tokens [0..n) as one contiguous blob, layer-major; the same
-// layout backs the on-disk dumps, the in-memory session snapshots and the system-prefix slots:
-// attention / hybrid: per layer K rows [0..n) then V rows; GLM: per layer latent, indexer keys,
-// indexer gates, then the pooled indexer keys
-static size_t sess_region_floats(const Config *p, int n) {
-  if (p->glm) return (size_t)p->n_attn * n * (p->g_kvl + 2 * p->g_ih) +
-                     (size_t)p->n_attn * (n / p->g_kpool + 1) * p->g_ih;
-  return (size_t)p->n_attn * n * p->kv_dim * 2;
+// the position-indexed caches for tokens [0..n) as one contiguous blob; the same layout backs the
+// on-disk dumps, the in-memory session snapshots and the system-prefix slots. Attention / hybrid:
+// per layer the K rows of every kv head [0..n), then V (head-major, the same order as in memory),
+// then the scales; GLM (always f32): latent, indexer keys, indexer gates, pooled indexer keys.
+static size_t sess_region_bytes(const Config *p, int n, int kv_type) {
+  if (p->glm)
+    return ((size_t)p->n_attn * n * (p->g_kvl + 2 * p->g_ih) +
+            (size_t)p->n_attn * (n / p->g_kpool + 1) * p->g_ih) * sizeof(float);
+  size_t vals = (size_t)p->n_attn * n * p->kv_dim * 2;
+  if (kv_type == KV_I8) return vals + vals / GS * sizeof(float);
+  return vals * sizeof(float);
 }
-static void sess_region_save(const Transformer *t, int n, float *dst) {
+
+static void sess_region_save(const Transformer *t, int n, void *dst) {
   const Config *p = &t->config;
   const RunState *s = &t->state;
+  uint8_t *d = dst;
   if (!p->glm) {
+    const int hs = p->head_dim, nk = p->n_kv_heads;
+    const size_t rb = (size_t)n * hs * (s->kv_type == KV_I8 ? 1 : 4);
+    const size_t sb = s->kv_type == KV_I8 ? (size_t)n * hs / GS * sizeof(float) : 0;
     for (int la = 0; la < p->n_attn; la++) {
-      const float *k = s->key_cache + (size_t)la * p->seq_len * p->kv_dim;
-      const float *v = s->value_cache + (size_t)la * p->seq_len * p->kv_dim;
-      for (int i = 0; i < n; i++) memcpy(dst + (size_t)i * p->kv_dim, k + (size_t)i * p->kv_dim, p->kv_dim * sizeof(float));
-      dst += (size_t)n * p->kv_dim;
-      for (int i = 0; i < n; i++) memcpy(dst + (size_t)i * p->kv_dim, v + (size_t)i * p->kv_dim, p->kv_dim * sizeof(float));
-      dst += (size_t)n * p->kv_dim;
+      if (s->kv_type == KV_I8) {
+        for (int g = 0; g < nk; g++) { memcpy(d, s->key_cache_q + kv_row_off(p, la, g, 0), rb); d += rb; }
+        for (int g = 0; g < nk; g++) { memcpy(d, s->value_cache_q + kv_row_off(p, la, g, 0), rb); d += rb; }
+        for (int g = 0; g < nk; g++) { memcpy(d, s->key_cache_s + kv_sc_off(p, la, g, 0), sb); d += sb; }
+        for (int g = 0; g < nk; g++) { memcpy(d, s->value_cache_s + kv_sc_off(p, la, g, 0), sb); d += sb; }
+      } else {
+        for (int g = 0; g < nk; g++) { memcpy(d, s->key_cache + kv_row_off(p, la, g, 0), rb); d += rb; }
+        for (int g = 0; g < nk; g++) { memcpy(d, s->value_cache + kv_row_off(p, la, g, 0), rb); d += rb; }
+      }
     }
   } else {
     const GlmState *g = s->glm;
     const size_t kvl = p->g_kvl, ih = p->g_ih;
     for (int la = 0; la < p->n_attn; la++) {
       const float *base = g->lat[0] + (size_t)la * p->seq_len * kvl;
-      for (int i = 0; i < n; i++) memcpy(dst + (size_t)i * kvl, base + (size_t)i * kvl, kvl * sizeof(float));
-      dst += (size_t)n * kvl;
+      memcpy(d, base, (size_t)n * kvl * sizeof(float));
+      d += (size_t)n * kvl * sizeof(float);
     }
     for (int la = 0; la < p->n_attn; la++) {
       const float *base = g->ikey + (size_t)la * p->seq_len * ih;
-      for (int i = 0; i < n; i++) memcpy(dst + (size_t)i * ih, base + (size_t)i * ih, ih * sizeof(float));
-      dst += (size_t)n * ih;
+      memcpy(d, base, (size_t)n * ih * sizeof(float));
+      d += (size_t)n * ih * sizeof(float);
     }
     for (int la = 0; la < p->n_attn; la++) {
       const float *base = g->igate + (size_t)la * p->seq_len * ih;
-      for (int i = 0; i < n; i++) memcpy(dst + (size_t)i * ih, base + (size_t)i * ih, ih * sizeof(float));
-      dst += (size_t)n * ih;
+      memcpy(d, base, (size_t)n * ih * sizeof(float));
+      d += (size_t)n * ih * sizeof(float);
     }
     int npool = n / p->g_kpool + 1;
     for (int la = 0; la < p->n_attn; la++) {
       const float *base = g->ipool + (size_t)la * (p->seq_len / p->g_kpool + 1) * ih;
-      memcpy(dst, base, (size_t)npool * ih * sizeof(float)); // contiguous: pool rows are never rewritten
-      dst += (size_t)npool * ih;
+      memcpy(d, base, (size_t)npool * ih * sizeof(float)); // contiguous: pool rows are never rewritten
+      d += (size_t)npool * ih * sizeof(float);
     }
   }
 }
-static void sess_region_load(Transformer *t, int n, const float *src) {
+
+static void sess_region_load(Transformer *t, int n, const void *src) {
   const Config *p = &t->config;
   RunState *s = &t->state;
+  const uint8_t *d = src;
   if (!p->glm) {
+    const int hs = p->head_dim, nk = p->n_kv_heads;
+    const size_t rb = (size_t)n * hs * (s->kv_type == KV_I8 ? 1 : 4);
+    const size_t sb = s->kv_type == KV_I8 ? (size_t)n * hs / GS * sizeof(float) : 0;
     for (int la = 0; la < p->n_attn; la++) {
-      float *k = s->key_cache + (size_t)la * p->seq_len * p->kv_dim;
-      float *v = s->value_cache + (size_t)la * p->seq_len * p->kv_dim;
-      for (int i = 0; i < n; i++) memcpy(k + (size_t)i * p->kv_dim, src + (size_t)i * p->kv_dim, p->kv_dim * sizeof(float));
-      src += (size_t)n * p->kv_dim;
-      for (int i = 0; i < n; i++) memcpy(v + (size_t)i * p->kv_dim, src + (size_t)i * p->kv_dim, p->kv_dim * sizeof(float));
-      src += (size_t)n * p->kv_dim;
+      if (s->kv_type == KV_I8) {
+        for (int g = 0; g < nk; g++) { memcpy(s->key_cache_q + kv_row_off(p, la, g, 0), d, rb); d += rb; }
+        for (int g = 0; g < nk; g++) { memcpy(s->value_cache_q + kv_row_off(p, la, g, 0), d, rb); d += rb; }
+        for (int g = 0; g < nk; g++) { memcpy(s->key_cache_s + kv_sc_off(p, la, g, 0), d, sb); d += sb; }
+        for (int g = 0; g < nk; g++) { memcpy(s->value_cache_s + kv_sc_off(p, la, g, 0), d, sb); d += sb; }
+      } else {
+        for (int g = 0; g < nk; g++) { memcpy(s->key_cache + kv_row_off(p, la, g, 0), d, rb); d += rb; }
+        for (int g = 0; g < nk; g++) { memcpy(s->value_cache + kv_row_off(p, la, g, 0), d, rb); d += rb; }
+      }
     }
   } else {
     GlmState *g = s->glm;
     const size_t kvl = p->g_kvl, ih = p->g_ih;
     for (int la = 0; la < p->n_attn; la++) {
       float *base = g->lat[0] + (size_t)la * p->seq_len * kvl;
-      for (int i = 0; i < n; i++) memcpy(base + (size_t)i * kvl, src + (size_t)i * kvl, kvl * sizeof(float));
-      src += (size_t)n * kvl;
+      memcpy(base, d, (size_t)n * kvl * sizeof(float));
+      d += (size_t)n * kvl * sizeof(float);
     }
     for (int la = 0; la < p->n_attn; la++) {
       float *base = g->ikey + (size_t)la * p->seq_len * ih;
-      for (int i = 0; i < n; i++) memcpy(base + (size_t)i * ih, src + (size_t)i * ih, ih * sizeof(float));
-      src += (size_t)n * ih;
+      memcpy(base, d, (size_t)n * ih * sizeof(float));
+      d += (size_t)n * ih * sizeof(float);
     }
     for (int la = 0; la < p->n_attn; la++) {
       float *base = g->igate + (size_t)la * p->seq_len * ih;
-      for (int i = 0; i < n; i++) memcpy(base + (size_t)i * ih, src + (size_t)i * ih, ih * sizeof(float));
-      src += (size_t)n * ih;
+      memcpy(base, d, (size_t)n * ih * sizeof(float));
+      d += (size_t)n * ih * sizeof(float);
     }
     int npool = n / p->g_kpool + 1;
     for (int la = 0; la < p->n_attn; la++) {
       float *base = g->ipool + (size_t)la * (p->seq_len / p->g_kpool + 1) * ih;
-      memcpy(base, src, (size_t)npool * ih * sizeof(float));
-      src += (size_t)npool * ih;
+      memcpy(base, d, (size_t)npool * ih * sizeof(float));
+      d += (size_t)npool * ih * sizeof(float);
     }
     for (int k2 = 1; k2 < NN; k2++) // the per-node latent copies are identical: rebuild them from lat[0]
       for (int la = 0; la < p->n_attn; la++)
@@ -160,9 +181,9 @@ static void sess_region_load(Transformer *t, int n, const float *src) {
 // upper bound of the dump for n tokens (for the free-space check)
 static size_t sess_dump_bytes(const Transformer *t, int n) {
   const Config *p = &t->config;
-  size_t b = 8 + 7 * 4 + 64 + 4 + (size_t)n * sizeof(int);
+  size_t b = 8 + 9 * 4 + 64 + 4 + (size_t)n * sizeof(int);
   if (RECURRENT(p)) b += 4 + (hyb_state_floats(p) + hyb_conv_floats(p)) * sizeof(float);
-  b += sess_region_floats(p, n) * sizeof(float);
+  b += sess_region_bytes(p, n, t->state.kv_type);
   if (RECURRENT(p) && t->state.snap_S && t->state.snap_pos > 0) b += 4 + (hyb_state_floats(p) + hyb_conv_floats(p)) * sizeof(float);
   return b;
 }
@@ -180,8 +201,9 @@ static int sess_write(const Transformer *t, const int *tok, int n, const char *p
   if (!f) return 0;
   int ok = 1;
   ok &= w_blk(f, SESS_MAGIC, 8);
-  uint32_t hdr[7] = {SESS_VER, (RECURRENT(p) ? 1u : 0u) | (snap ? 2u : 0u), (uint32_t)p->vocab_size,
-                     (uint32_t)p->dim, (uint32_t)p->n_layers, (uint32_t)p->n_attn, (uint32_t)ARCH};
+  uint32_t hdr[9] = {SESS_VER, (RECURRENT(p) ? 1u : 0u) | (snap ? 2u : 0u), (uint32_t)p->vocab_size,
+                     (uint32_t)p->dim, (uint32_t)p->n_layers, (uint32_t)p->n_attn, (uint32_t)ARCH,
+                     (uint32_t)s->kv_type, (uint32_t)GS};
   ok &= w_blk(f, hdr, sizeof hdr);
   char model[64] = {0};
   snprintf(model, sizeof model, "%s", SRV_MODEL);
@@ -195,11 +217,11 @@ static int sess_write(const Transformer *t, const int *tok, int n, const char *p
     ok &= w_blk(f, s->lin_S, linf * sizeof(float));
     ok &= w_blk(f, s->conv_state, convf * sizeof(float));
   }
-  size_t rf = sess_region_floats(p, n);
-  float *rb = sess_stage_for(rf);
+  size_t rf = sess_region_bytes(p, n, s->kv_type);
+  void *rb = sess_stage_for(rf);
   ok &= rb != NULL;
   if (ok) sess_region_save(t, n, rb);
-  ok &= w_blk(f, rb, rf * sizeof(float));
+  ok &= w_blk(f, rb, rf);
   if (snap) {
     uint32_t sp = (uint32_t)s->snap_pos;
     ok &= w_blk(f, &sp, 4);
@@ -222,10 +244,11 @@ static int sess_read(Transformer *t, int *tok, int cap, const char *path) {
   int n = 0, ok = 1;
   char magic[8];
   ok &= r_blk(f, magic, 8) && !memcmp(magic, SESS_MAGIC, 8);
-  uint32_t hdr[7] = {0};
+  uint32_t hdr[9] = {0};
   ok &= r_blk(f, hdr, sizeof hdr);
   ok &= ok && hdr[0] == SESS_VER && (hdr[1] & 1) == (RECURRENT(p) ? 1u : 0u) && hdr[2] == (uint32_t)p->vocab_size &&
-         hdr[3] == (uint32_t)p->dim && hdr[4] == (uint32_t)p->n_layers && hdr[5] == (uint32_t)p->n_attn && hdr[6] == (uint32_t)ARCH;
+         hdr[3] == (uint32_t)p->dim && hdr[4] == (uint32_t)p->n_layers && hdr[5] == (uint32_t)p->n_attn &&
+         hdr[6] == (uint32_t)ARCH && hdr[7] == (uint32_t)s->kv_type && hdr[8] == (uint32_t)GS;
   char model[64] = {0};
   ok &= r_blk(f, model, sizeof model) && !strcmp(model, SRV_MODEL);
   uint32_t nn = 0;
@@ -245,10 +268,10 @@ static int sess_read(Transformer *t, int *tok, int cap, const char *path) {
     ok &= r_blk(f, s->conv_state, hyb_conv_floats(p) * sizeof(float));
     s->next_pos = (int)np;
   }
-  size_t rf = sess_region_floats(p, n);
-  float *rb = sess_stage_for(rf);
+  size_t rf = sess_region_bytes(p, n, s->kv_type);
+  void *rb = sess_stage_for(rf);
   ok &= rb != NULL;
-  ok &= r_blk(f, rb, rf * sizeof(float));
+  ok &= r_blk(f, rb, rf);
   if (ok) sess_region_load(t, n, rb);
   if (ok && RECURRENT(p) && (hdr[1] & 2)) {
     if (!s->snap_S) {
@@ -288,6 +311,7 @@ void error_usage() {
   fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
   fprintf(stderr, "  -T <int>    number of threads, default 0 = auto (placed on the most idle CPUs; RUNQ_PIN=1 keeps them pinned, RUNQ_PIN=0 disables placement)\n");
   fprintf(stderr, "  -c <int>    context window in tokens (KV cache size), default 8192\n");
+  fprintf(stderr, "  -K <string> KV cache type: i8|f32, default i8 (f32 = full precision, 4x more memory)\n");
   fprintf(stderr, "  -f <string> tools.json: enables tool calling in chat mode\n");
   fprintf(stderr, "  -d <string> draft model (same tokenizer, smaller) for speculative decoding in chat\n");
   fprintf(stderr, "  -k <int>    max draft length of prompt-lookup speculative decoding in chat, default 8, 0 = off\n");
@@ -353,6 +377,9 @@ int main(int argc, char *argv[]) {
       nthreads = atoi(argv[i + 1]);
     } else if (argv[i][1] == 'c') {
       ctx = atoi(argv[i + 1]);
+    } else if (argv[i][1] == 'K') {
+      KV_REQ = kv_type_parse(argv[i + 1]);
+      if (KV_REQ < 0) error_usage();
     } else if (argv[i][1] == 'd') {
       draft_path = argv[i + 1];
     } else if (argv[i][1] == 'k') {
@@ -407,6 +434,7 @@ int main(int argc, char *argv[]) {
 #endif
   build_transformer(&transformer, checkpoint_path, ctx);
   init_pool(&transformer, nthreads);
+  fprintf(stderr, "[kv cache: %s]\n", kv_type_name(transformer.state.kv_type));
   if (transformer.config.glm && !spec_k_set) // GLM is MoE: the verify pass reads the union of the routed experts, measured no gain
     SPEC_K = 0;
   if (RECURRENT(&transformer.config) && draft_path) { // draft-model cache rollback is not implemented for recurrent targets

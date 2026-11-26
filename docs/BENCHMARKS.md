@@ -138,3 +138,34 @@ chunks (online-softmax merge): at 1.6k context, 3B, B=2 costs 1.05x instead of 2
 Decode is memory-bound: ~155–180 GB/s of weights per socket, IPC ~0.7, ~78% backend stall cycles.
 One core alone reaches ~8.5 GB/s (368 ms/token, 99.5% in matmul). Use `make prof` for a per-phase,
 per-node breakdown.
+
+## KV cache: int8 (`-K i8`), 2 sockets, 128 threads (2026-11-26)
+
+The cache is int8 by default; `-K f32` keeps it in f32. Int8 stores K and V with one scale per 64
+values (the same group size as the weights), quantizes the per-head query the same way and scores
+with `sdot`; V is dequantized once per position and FMA'd into every query head of the group. Each
+configuration was measured twice back to back (f32, then i8), 128 generated tokens, on the shared
+machine.
+
+| Model / prompt | KV | prefill tok/s | decode tok/s | cache @131k |
+|---|---|---|---|---|
+| Qwen3.8-27B, ~8.5k | f32 | 107 | 11.1 | 16 GB |
+| | i8 | **112** (+5%) | **11.8** (+6%) | **4 GB** |
+| Qwen3.8-27B, ~30k | f32 | 69 | 13.2 | |
+| | i8 | **76** (+10%) | **14.4** (+9%) | |
+| Qwen3-30B-A3B, ~8.4k | f32 | 196 | 30.0 | 24 GB |
+| | i8 | **215** (+10%) | **36.3** (+21%) | **6 GB** |
+| Qwen3-30B-A3B, ~30k | f32 | 70 | 9.6 | |
+| | i8 | **88** (+26%) | **12.3** (+28%) | |
+
+The gain grows with the context: at 30k the attention reads 3-6 GB of f32 cache per token on these
+models, i8 quarters that. Short-context decode is still dominated by the weights.
+
+Quality (Qwen3-30B-A3B Q4, 100-token text, per-position logits): mean KL to the f32 cache 0.0054
+(~+0.5% perplexity), top-1 93/100; batched-prefill last token: KL 0.0023, argmax unchanged. Greedy
+generation keeps the same answer on Qwen3.8-27B and drifts on near-ties on the 30B MoE, like any
+KV quantization. Int8 is the default; `-K f32` is the full-precision escape hatch.
+
+Session dumps, shared system-prefix slots and in-memory session snapshots use the same encoding:
+4x smaller (a Qwen3-30B session at 8k tokens: 1.6 GB -> 0.4 GB). A dump restored after a server
+restart gives the same continuation as a full re-prefill (`restored N tokens from disk`).

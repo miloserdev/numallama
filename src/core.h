@@ -162,8 +162,16 @@ typedef struct {
   int spec_pos;              // ... at this position
   float *key_cache;   // (layer, seq_len, dim)
   float *value_cache; // (layer, seq_len, dim)
+  // int8 cache (kv_type == KV_I8): the same index space as the f32 cache, values int8,
+  // scales per GS group; key_cache/value_cache stay NULL in this mode
+  int kv_type;
+  int8_t *key_cache_q, *value_cache_q;
+  float *key_cache_s, *value_cache_s;
   struct GlmState *glm; // GLM-5.3-Flash buffers, or NULL
 } RunState;
+// defined in kv.h (included after this header): allocate/free the cache in the chosen format
+static void kv_alloc(RunState *s, const Config *p);
+static void kv_free(RunState *s);
 static void glm_alloc_state(RunState *s, const Config *p, int nth);
 struct GlmWeights;
 static void glm_map_weights(TransformerWeights *tw, Config *p, void *ptr);
@@ -209,8 +217,9 @@ void malloc_run_state(RunState *s, Config *p) {
   s->v = calloc(kv_dim, sizeof(float));
   s->att = calloc((size_t)p->n_heads * p->seq_len, sizeof(float));
   s->logits = calloc(p->vocab_size, sizeof(float));
-  s->key_cache = calloc((size_t)p->n_attn * p->seq_len * kv_dim, sizeof(float));
-  s->value_cache = p->glm ? calloc(1, sizeof(float)) : calloc((size_t)p->n_attn * p->seq_len * kv_dim, sizeof(float)); // GLM: latent only
+  s->key_cache = s->value_cache = NULL;
+  s->key_cache_q = s->value_cache_q = NULL;
+  s->key_cache_s = s->value_cache_s = NULL;
   s->glm = NULL;
   s->gate = s->lin = s->lin_o = s->lin_S = s->conv_state = NULL;
   s->next_pos = 0;
@@ -218,6 +227,7 @@ void malloc_run_state(RunState *s, Config *p) {
   s->snap_pos = -1;
   s->spec_S = s->spec_conv = NULL;
   s->spec_pos = -1;
+  kv_alloc(s, p);
   if (p->glm) {
     int nlin = p->n_layers - p->n_attn;
     s->lin_S = malloc((size_t)nlin * p->lin_nv * p->lin_dv * p->lin_dk * sizeof(float)); // first touched by its threads
@@ -233,7 +243,8 @@ void malloc_run_state(RunState *s, Config *p) {
     s->conv_state = calloc((size_t)nlin * p->conv_dim * (p->conv_k - 1), sizeof(float));
   }
   // ensure all mallocs went fine
-  if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q || !s->k || !s->v || !s->att || !s->logits || !s->key_cache || !s->value_cache) {
+  if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q || !s->k || !s->v || !s->att || !s->logits ||
+      !(s->key_cache || s->key_cache_q)) {
     fprintf(stderr, "malloc failed!\n");
     exit(EXIT_FAILURE);
   }
@@ -254,8 +265,7 @@ void free_run_state(RunState *s) {
   free(s->v);
   free(s->att);
   free(s->logits);
-  free(s->key_cache);
-  free(s->value_cache);
+  kv_free(s);
   free(s->gate); free(s->lin); free(s->lin_o); free(s->lin_S); free(s->conv_state);
   free(s->snap_S); free(s->snap_conv);
   free(s->spec_S); free(s->spec_conv);

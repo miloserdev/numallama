@@ -119,6 +119,7 @@ static void forward_hybrid_thread(int tid) {
         tb->rope_s[j] = (float)sin(val);
     }
 
+    const int kvi8 = s->kv_type == KV_I8;
     for (int l = 0; l < p->n_layers; l++) {
         const float* xin = (l == 0) ? emb : x;
         PROF(tid, PH_NORM);
@@ -126,14 +127,14 @@ static void forward_hybrid_thread(int tid) {
         if (hyb_full(p, l)) {
             const int fi = hyb_fidx(p, l);
             const size_t loff = (size_t)fi * p->seq_len * kv_dim;
-            float* vc = s->value_cache + loff + (size_t)pos * hs;
+            float* vc = kvi8 ? NULL : s->value_cache + loff + (size_t)pos * hs;
             PROF(tid, PH_QKV);
             while (grab_rows(WORK_PHASES * l + 0, q_dim, tb, &r0, &r1)) matmul_rows(s->q, nq, ns, w->wq + fi, dim, r0, r1);
             while (grab_rows(WORK_PHASES * l + 6, q_dim, tb, &r0, &r1)) matmul_rows(s->gate, nq, ns, w->wgate + fi, dim, r0, r1);
             while (grab_rows(WORK_PHASES * l + 1, kv_dim, tb, &r0, &r1)) matmul_rows(s->k, nq, ns, w->wk + fi, dim, r0, r1);
             while (grab_rows(WORK_PHASES * l + 2, kv_dim, tb, &r0, &r1)) {
                 matmul_rows(s->v, nq, ns, w->wv + fi, dim, r0, r1);
-                for (int i = r0; i < r1; i++) vc[(size_t)(i / hs) * p->seq_len * hs + i % hs] = s->v[i];
+                if (!kvi8) for (int i = r0; i < r1; i++) vc[(size_t)(i / hs) * p->seq_len * hs + i % hs] = s->v[i];
             }
             barrier(tb);
             for (int task = tid; task < n_heads + p->n_kv_heads; task += P.nth) {
@@ -143,32 +144,56 @@ static void forward_hybrid_thread(int tid) {
                     int g = task - n_heads;
                     float* kv = s->k + (size_t)g * hs;
                     hyb_norm_rope(kv, w->k_norm + (size_t)fi * hs, hs, rot, tb->rope_c, tb->rope_s);
-                    memcpy(s->key_cache + loff + (size_t)g * p->seq_len * hs + (size_t)pos * hs, kv, hs * sizeof(float));
+                    if (!kvi8) memcpy(s->key_cache + loff + (size_t)g * p->seq_len * hs + (size_t)pos * hs, kv, hs * sizeof(float));
                 }
             }
             barrier(tb);
+            if (kvi8) { // quantize this position's K/V rows
+                for (int g = tid; g < p->n_kv_heads; g += P.nth) {
+                    kv_store_row(kv_k_i8(s, p, fi, g, pos), kv_ks(s, p, fi, g, pos), s->k + (size_t)g * hs, hs);
+                    kv_store_row(kv_v_i8(s, p, fi, g, pos), kv_vs(s, p, fi, g, pos), s->v + (size_t)g * hs, hs);
+                }
+                barrier(tb);
+            }
             PROF(tid, PH_ATT);
             // attention items (kv group, context chunk, query-head subset) over all threads
             int HS = 1;
             while (HS < kv_mul && p->n_kv_heads * C * HS * 2 <= P.nth && kv_mul % (HS * 2) == 0) HS *= 2;
             const int hper = kv_mul / HS;
+            const int ng = hs / GS;
             for (int item = tid; item < p->n_kv_heads * C * HS; item += P.nth) {
                 int g = item / (C * HS), c = (item / HS) % C, hsub = item % HS;
                 int t0 = (int)((long)T * c / C), t1 = (int)((long)T * (c + 1) / C);
-                const float* kb = s->key_cache + loff + (size_t)g * p->seq_len * hs;
-                const float* vb = s->value_cache + loff + (size_t)g * p->seq_len * hs;
+                const size_t kof = (size_t)g * p->seq_len * hs;
+                const float* kb = kvi8 ? NULL : s->key_cache + loff + kof;
+                const float* vb = kvi8 ? NULL : s->value_cache + loff + kof;
+                const int8_t* kbq = kvi8 ? s->key_cache_q + loff + kof : NULL;
+                const int8_t* vbq = kvi8 ? s->value_cache_q + loff + kof : NULL;
+                const float* kbs = kvi8 ? s->key_cache_s + (loff + kof) / GS : NULL;
+                const float* vbs = kvi8 ? s->value_cache_s + (loff + kof) / GS : NULL;
                 for (int r = 0; r < hper; r++) {
                     int h = g * kv_mul + hsub * hper + r;
                     const float* q = s->q + (size_t)h * hs;
+                    int8_t qq[hs];
+                    float qsc[hs / GS];
+                    if (kvi8) quantize_vec(qq, qsc, q, hs);
                     float* att = s->att + (size_t)h * p->seq_len;
                     float m = -FLT_MAX;
-                    for (int t = t0; t < t1; t++) {
-                        const float* k = kb + (size_t)t * hs;
-                        float score = 0.0f;
-                        for (int i = 0; i < hs; i++) score += q[i] * k[i];
-                        score *= att_scale;
-                        att[t] = score;
-                        m = score > m ? score : m;
+                    if (kvi8) {
+                        for (int t = t0; t < t1; t++) {
+                            float score = kv_dot_q8(qq, qsc, kbq + (size_t)t * hs, kbs + (size_t)t * ng, hs) * att_scale;
+                            att[t] = score;
+                            m = score > m ? score : m;
+                        }
+                    } else {
+                        for (int t = t0; t < t1; t++) {
+                            const float* k = kb + (size_t)t * hs;
+                            float score = 0.0f;
+                            for (int i = 0; i < hs; i++) score += q[i] * k[i];
+                            score *= att_scale;
+                            att[t] = score;
+                            m = score > m ? score : m;
+                        }
                     }
                     float* pr = P.part + ((size_t)h * C + c) * (hs + 2);
                     float sm = 0.0f;
@@ -177,8 +202,11 @@ static void forward_hybrid_thread(int tid) {
                     for (int t = t0; t < t1; t++) {
                         float e = expf(att[t] - m);
                         sm += e;
-                        const float* v = vb + (size_t)t * hs;
-                        for (int i = 0; i < hs; i++) acc[i] += e * v[i];
+                        if (kvi8) kv_axpy_i8(acc, e, vbq + (size_t)t * hs, vbs + (size_t)t * ng, hs);
+                        else {
+                            const float* v = vb + (size_t)t * hs;
+                            for (int i = 0; i < hs; i++) acc[i] += e * v[i];
+                        }
                     }
                     pr[0] = m;
                     pr[1] = sm;

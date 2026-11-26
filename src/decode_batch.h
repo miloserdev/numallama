@@ -18,6 +18,7 @@ static void forward_batch_thread(int tid) {
     const int head_size = p->head_dim;
     const int hs2 = head_size / 2;
     const int ngd = dim / GS, ngh = hidden_dim / GS, ngq = q_dim / GS;
+    const int kvi8 = s->kv_type == KV_I8;
     const float att_scale = 1.0f / sqrtf((float)head_size);
     int r0, r1, b0, b1, n0, n1;
     int8_t* XQ = BN[tb->node].xq; // the node's quantized block inputs
@@ -95,14 +96,14 @@ static void forward_batch_thread(int tid) {
                     if (qkn) continue; // per-head norm + RoPE + cache after the barrier
                     const float* rc = BT.rope_c + b * hs2;
                     const float* rs = BT.rope_s + b * hs2;
-                    float* kc = s->key_cache + loff + (size_t)(pos0 + b) * head_size;
+                    float* kc = kvi8 ? NULL : s->key_cache + loff + (size_t)(pos0 + b) * head_size;
                     for (int i = a; i < e; i += 2) {
                         int j = (i % head_size) / 2;
                         float v0 = k[i], v1 = k[i + 1];
                         k[i] = v0 * rc[j] - v1 * rs[j];
                         k[i + 1] = v0 * rs[j] + v1 * rc[j];
                     }
-                    for (int i = a; i < e; i++) { kc[(size_t)(i / head_size) * p->seq_len * head_size + i % head_size] = k[i]; }
+                    if (!kvi8) for (int i = a; i < e; i++) { kc[(size_t)(i / head_size) * p->seq_len * head_size + i % head_size] = k[i]; }
                 }
             }
             a = va; e = ve;
@@ -111,8 +112,8 @@ static void forward_batch_thread(int tid) {
                 for (int b = 0; b < B; b++) {
                     float* v = BT.v + (size_t)b * kv_dim;
                     if (w->bv) for (int i = a; i < e; i++) v[i] += w->bv[(size_t)l * kv_dim + i];
-                    float* vc = s->value_cache + loff + (size_t)(pos0 + b) * head_size;
-                    for (int i = a; i < e; i++) { vc[(size_t)(i / head_size) * p->seq_len * head_size + i % head_size] = v[i]; }
+                    float* vc = kvi8 ? NULL : s->value_cache + loff + (size_t)(pos0 + b) * head_size;
+                    if (!kvi8) for (int i = a; i < e; i++) { vc[(size_t)(i / head_size) * p->seq_len * head_size + i % head_size] = v[i]; }
                 }
             }
         }
@@ -129,10 +130,20 @@ static void forward_batch_thread(int tid) {
                     int g = h - nh;
                     float* kv = BT.k + (size_t)b * kv_dim + (size_t)g * head_size;
                     head_norm_rope(kv, w->k_norm + (size_t)l * head_size, head_size, rc, rs);
-                    memcpy(s->key_cache + loff + ((size_t)g * p->seq_len + pos0 + b) * head_size, kv, head_size * sizeof(float));
+                    if (!kvi8) memcpy(s->key_cache + loff + ((size_t)g * p->seq_len + pos0 + b) * head_size, kv, head_size * sizeof(float));
                 }
             }
             barrier(tb);
+        }
+        if (kvi8) { // quantize the K/V rows of this block (each node its own kv groups)
+            int qg0, qg1;
+            node_groups(p->n_kv_heads, tb->node, &qg0, &qg1);
+            for (int task = tb->ltid; task < (qg1 - qg0) * B; task += tb->nthn) {
+                int g = qg0 + task % (qg1 - qg0), b = task / (qg1 - qg0);
+                kv_store_row(kv_k_i8(s, p, l, g, pos0 + b), kv_ks(s, p, l, g, pos0 + b), BT.k + (size_t)b * kv_dim + (size_t)g * head_size, head_size);
+                kv_store_row(kv_v_i8(s, p, l, g, pos0 + b), kv_vs(s, p, l, g, pos0 + b), BT.v + (size_t)b * kv_dim + (size_t)g * head_size, head_size);
+            }
+            node_barrier(tb);
         }
 
         PROF(tid, PH_ATT);
@@ -152,20 +163,41 @@ static void forward_batch_thread(int tid) {
             const int base = b * H + gl * kv_mul, rb = base + kv_mul <= i1 ? kv_mul : i1 - base;
             item = base + rb;
             const int g = g0 + gl, T = pos0 + b + 1;
-            const float* kb = s->key_cache + loff + (size_t)g * p->seq_len * head_size;
-            const float* vb = s->value_cache + loff + (size_t)g * p->seq_len * head_size;
+            const size_t kof = (size_t)g * p->seq_len * head_size;
+            const float* kb = kvi8 ? NULL : s->key_cache + loff + kof;
+            const float* vb = kvi8 ? NULL : s->value_cache + loff + kof;
+            const int8_t* kbq = kvi8 ? s->key_cache_q + loff + kof : NULL;
+            const int8_t* vbq = kvi8 ? s->value_cache_q + loff + kof : NULL;
+            const float* kbs = kvi8 ? s->key_cache_s + (loff + kof) / GS : NULL;
+            const float* vbs = kvi8 ? s->value_cache_s + (loff + kof) / GS : NULL;
+            const int ng = head_size / GS;
             const float* qb = BT.q + (size_t)b * q_dim + (size_t)g * kv_mul * head_size;
             float m[KV_MUL_MAX], sum[KV_MUL_MAX];
             for (int r = ra; r < rb; r++) m[r] = -FLT_MAX;
-            for (int t = 0; t < T; t++) {
-                const float* k = kb + (size_t)t * head_size;
-                for (int r = ra; r < rb; r++) {
-                    const float* q = qb + r * head_size;
-                    float score = 0.0f;
-                    for (int i = 0; i < head_size; i++) { score += q[i] * k[i]; }
-                    score *= att_scale;
-                    att[(size_t)r * p->seq_len + t] = score;
-                    m[r] = score > m[r] ? score : m[r];
+            if (kvi8) {
+                int8_t qq[KV_MUL_MAX * head_size];
+                float qsc[KV_MUL_MAX * (head_size / GS)];
+                for (int r = ra; r < rb; r++) quantize_vec(qq + r * head_size, qsc + r * ng, qb + r * head_size, head_size);
+                for (int t = 0; t < T; t++) {
+                    const int8_t* k = kbq + (size_t)t * head_size;
+                    const float* ks = kbs + (size_t)t * ng;
+                    for (int r = ra; r < rb; r++) {
+                        float score = kv_dot_q8(qq + r * head_size, qsc + r * ng, k, ks, head_size) * att_scale;
+                        att[(size_t)r * p->seq_len + t] = score;
+                        m[r] = score > m[r] ? score : m[r];
+                    }
+                }
+            } else {
+                for (int t = 0; t < T; t++) {
+                    const float* k = kb + (size_t)t * head_size;
+                    for (int r = ra; r < rb; r++) {
+                        const float* q = qb + r * head_size;
+                        float score = 0.0f;
+                        for (int i = 0; i < head_size; i++) { score += q[i] * k[i]; }
+                        score *= att_scale;
+                        att[(size_t)r * p->seq_len + t] = score;
+                        m[r] = score > m[r] ? score : m[r];
+                    }
                 }
             }
             for (int r = ra; r < rb; r++) {
@@ -177,11 +209,21 @@ static void forward_batch_thread(int tid) {
             float* ob = BT.xb + (size_t)b * q_dim + (size_t)g * kv_mul * head_size;
             memset(ob + (size_t)ra * head_size, 0, (size_t)(rb - ra) * head_size * sizeof(float));
             for (int t = 0; t < T; t++) {
-                const float* v = vb + (size_t)t * head_size;
-                for (int r = ra; r < rb; r++) {
-                    float a = att[(size_t)r * p->seq_len + t];
-                    float* o = ob + r * head_size;
-                    for (int i = 0; i < head_size; i++) { o[i] += a * v[i]; }
+                if (kvi8) {
+                    float vf[head_size];
+                    kv_dequant_row(vf, vbq + (size_t)t * head_size, vbs + (size_t)t * ng, head_size);
+                    for (int r = ra; r < rb; r++) {
+                        float a = att[(size_t)r * p->seq_len + t];
+                        float* o = ob + r * head_size;
+                        for (int i = 0; i < head_size; i++) { o[i] += a * vf[i]; }
+                    }
+                } else {
+                    const float* v = vb + (size_t)t * head_size;
+                    for (int r = ra; r < rb; r++) {
+                        float a = att[(size_t)r * p->seq_len + t];
+                        float* o = ob + r * head_size;
+                        for (int i = 0; i < head_size; i++) { o[i] += a * v[i]; }
+                    }
                 }
             }
             for (int r = ra; r < rb; r++) {
@@ -284,6 +326,7 @@ static void forward_multi_thread(int tid) {
     const int head_size = p->head_dim, n_heads = p->n_heads;
     const int hs2 = head_size / 2;
     const int qkn = p->qk_norm;
+    const int kvi8 = s->kv_type == KV_I8;
     const float att_scale = 1.0f / sqrtf((float)head_size);
     const int8_t* nq = NB[tb->node].q;
     const float* ns = NB[tb->node].s;
@@ -321,7 +364,7 @@ static void forward_multi_thread(int tid) {
                 float* k = BT.k + (size_t)b * kv_dim;
                 const float* rc = BT.rope_c + b * hs2;
                 const float* rs = BT.rope_s + b * hs2;
-                float* kc = s->key_cache + loff + (size_t)(pos0 + b) * head_size;
+                float* kc = kvi8 ? NULL : s->key_cache + loff + (size_t)(pos0 + b) * head_size;
                 if (w->bk) for (int i = r0; i < r1; i++) k[i] += w->bk[(size_t)l * kv_dim + i];
                 if (qkn) continue; // per-head norm + RoPE below, then into the cache
                 for (int i = r0; i < r1; i += 2) {
@@ -330,16 +373,16 @@ static void forward_multi_thread(int tid) {
                     k[i] = v0 * rc[j] - v1 * rs[j];
                     k[i + 1] = v0 * rs[j] + v1 * rc[j];
                 }
-                for (int i = r0; i < r1; i++) kc[(size_t)(i / head_size) * p->seq_len * head_size + i % head_size] = k[i];
+                if (!kvi8) for (int i = r0; i < r1; i++) kc[(size_t)(i / head_size) * p->seq_len * head_size + i % head_size] = k[i];
             }
         }
         while (grab_rows(WORK_PHASES * l + 2, kv_dim, tb, &r0, &r1)) {
             matmul_rows_batch(BT.v, kv_dim, nq, ns, B, w->wv + l, dim, r0, r1);
             for (int b = 0; b < B; b++) {
                 float* v = BT.v + (size_t)b * kv_dim;
-                float* vc = s->value_cache + loff + (size_t)(pos0 + b) * head_size;
+                float* vc = kvi8 ? NULL : s->value_cache + loff + (size_t)(pos0 + b) * head_size;
                 if (w->bv) for (int i = r0; i < r1; i++) v[i] += w->bv[(size_t)l * kv_dim + i];
-                for (int i = r0; i < r1; i++) vc[(size_t)(i / head_size) * p->seq_len * head_size + i % head_size] = v[i];
+                if (!kvi8) for (int i = r0; i < r1; i++) vc[(size_t)(i / head_size) * p->seq_len * head_size + i % head_size] = v[i];
             }
         }
         barrier(tb);
@@ -355,10 +398,20 @@ static void forward_multi_thread(int tid) {
                     int g = h - n_heads;
                     float* kv = BT.k + (size_t)b * kv_dim + (size_t)g * head_size;
                     head_norm_rope(kv, w->k_norm + (size_t)l * head_size, head_size, rc, rs);
-                    memcpy(s->key_cache + loff + (size_t)g * p->seq_len * head_size + (size_t)(pos0 + b) * head_size, kv, head_size * sizeof(float));
+                    if (!kvi8) memcpy(s->key_cache + loff + (size_t)g * p->seq_len * head_size + (size_t)(pos0 + b) * head_size, kv, head_size * sizeof(float));
                 }
             }
             barrier(tb);
+        }
+        if (kvi8) { // quantize the K/V rows of this block (each node its own kv groups)
+            int qg0, qg1;
+            node_groups(p->n_kv_heads, tb->node, &qg0, &qg1);
+            for (int task = tb->ltid; task < (qg1 - qg0) * B; task += tb->nthn) {
+                int g = qg0 + task % (qg1 - qg0), b = task / (qg1 - qg0);
+                kv_store_row(kv_k_i8(s, p, l, g, pos0 + b), kv_ks(s, p, l, g, pos0 + b), BT.k + (size_t)b * kv_dim + (size_t)g * head_size, head_size);
+                kv_store_row(kv_v_i8(s, p, l, g, pos0 + b), kv_vs(s, p, l, g, pos0 + b), BT.v + (size_t)b * kv_dim + (size_t)g * head_size, head_size);
+            }
+            node_barrier(tb);
         }
 
         // causal attention: items = (kv group of this node, chunk of the context, subset of the tokens),
@@ -379,10 +432,21 @@ static void forward_multi_thread(int tid) {
         for (int item = tb->ltid; item < (g1 - g0) * C * TS; item += tb->nthn) {
             int g = g0 + item / (C * TS), c = (item / TS) % C, ts = item % TS;
             int t0 = (int)((long)Tt * c / C), t1 = (int)((long)Tt * (c + 1) / C);
-            const float* kb = s->key_cache + loff + (size_t)g * p->seq_len * head_size;
-            const float* vb = s->value_cache + loff + (size_t)g * p->seq_len * head_size;
+            const size_t kof = (size_t)g * p->seq_len * head_size;
+            const float* kb = kvi8 ? NULL : s->key_cache + loff + kof;
+            const float* vb = kvi8 ? NULL : s->value_cache + loff + kof;
+            const int8_t* kbq = kvi8 ? s->key_cache_q + loff + kof : NULL;
+            const int8_t* vbq = kvi8 ? s->value_cache_q + loff + kof : NULL;
+            const float* kbs = kvi8 ? s->key_cache_s + (loff + kof) / GS : NULL;
+            const float* vbs = kvi8 ? s->value_cache_s + (loff + kof) / GS : NULL;
+            const int ng = head_size / GS;
             for (int b = B * ts / TS; b < B * (ts + 1) / TS; b++) {
                 int te = pos0 + b + 1 < t1 ? pos0 + b + 1 : t1; // causal end for token b
+                int8_t qq[KV_MUL_MAX * head_size];
+                float qsc[KV_MUL_MAX * (head_size / GS)];
+                if (kvi8)
+                    for (int r = 0; r < kv_mul; r++)
+                        quantize_vec(qq + r * head_size, qsc + r * ng, BT.q + (size_t)b * q_dim + (size_t)(g * kv_mul + r) * head_size, head_size);
                 for (int r = 0; r < kv_mul; r++) {
                     int h = g * kv_mul + r;
                     float* pr = BT.mpart + (((size_t)b * n_heads + h) * C + c) * hp;
@@ -390,13 +454,21 @@ static void forward_multi_thread(int tid) {
                     const float* q = BT.q + (size_t)b * q_dim + (size_t)h * head_size;
                     float* ar = att + (size_t)r * p->seq_len;
                     float m = -FLT_MAX;
-                    for (int t = t0; t < te; t++) {
-                        const float* k = kb + (size_t)t * head_size;
-                        float score = 0.0f;
-                        for (int i = 0; i < head_size; i++) score += q[i] * k[i];
-                        score *= att_scale;
-                        ar[t - t0] = score;
-                        m = score > m ? score : m;
+                    if (kvi8) {
+                        for (int t = t0; t < te; t++) {
+                            float score = kv_dot_q8(qq + r * head_size, qsc + r * ng, kbq + (size_t)t * head_size, kbs + (size_t)t * ng, head_size) * att_scale;
+                            ar[t - t0] = score;
+                            m = score > m ? score : m;
+                        }
+                    } else {
+                        for (int t = t0; t < te; t++) {
+                            const float* k = kb + (size_t)t * head_size;
+                            float score = 0.0f;
+                            for (int i = 0; i < head_size; i++) score += q[i] * k[i];
+                            score *= att_scale;
+                            ar[t - t0] = score;
+                            m = score > m ? score : m;
+                        }
                     }
                     float sm = 0.0f;
                     float* o = pr + 2;
@@ -404,8 +476,11 @@ static void forward_multi_thread(int tid) {
                     for (int t = t0; t < te; t++) {
                         float e = expf(ar[t - t0] - m);
                         sm += e;
-                        const float* v = vb + (size_t)t * head_size;
-                        for (int i = 0; i < head_size; i++) o[i] += e * v[i];
+                        if (kvi8) kv_axpy_i8(o, e, vbq + (size_t)t * head_size, vbs + (size_t)t * ng, head_size);
+                        else {
+                            const float* v = vb + (size_t)t * head_size;
+                            for (int i = 0; i < head_size; i++) o[i] += e * v[i];
+                        }
                     }
                     pr[0] = m;
                     pr[1] = sm;

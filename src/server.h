@@ -417,17 +417,17 @@ static int request_tools(JNode *tools, Tools *out) {
 // each (so several prefixes coexist no matter what the physical caches currently hold).
 typedef struct {
   int n;           // tokens covered (0: none)
-  float *region;   // sess_region_floats(model, n)
+  uint8_t *region; // sess_region_bytes(model, n, kv_type)
   float *S, *conv; // recurrent models: lin_S / conv_state at n
 } SrvSnap;
 
 // fill the snapshot from the model state (it must stand at n); allocates/grows the buffers
 static int srv_snap_take(Transformer *tr, SrvSnap *sp, int n) {
   const Config *p = &tr->config;
-  size_t rf = sess_region_floats(p, n);
+  size_t rb = sess_region_bytes(p, n, tr->state.kv_type);
   if (sp->n < n || !sp->region) {
     free(sp->region);
-    sp->region = malloc(rf * sizeof(float));
+    sp->region = malloc(rb);
   }
   if (!sp->region) { sp->n = 0; return 0; }
   sess_region_save(tr, n, sp->region);
@@ -493,7 +493,7 @@ static void srv_snap_budget(Transformer *tr, SrvSession *keep1, SrvSession *keep
     for (int i = 0; i < g_nsessions; i++) {
       SrvSession *s = &g_sessions[i];
       if (s->snap.n > 0) {
-        total += sess_region_floats(p, s->snap.n) * sizeof(float);
+        total += sess_region_bytes(p, s->snap.n, tr->state.kv_type);
         if (RECURRENT(p)) total += (hyb_state_floats(p) + hyb_conv_floats(p)) * sizeof(float);
         if (s != keep1 && s != keep2 && (!old || s->last_use < old->last_use)) old = s;
       }
