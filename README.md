@@ -308,7 +308,8 @@ are refused: re-export them.
 Inkling-2-Mini uses a separate `INK2JSON` container (text backbone only; see
 `scripts/export_inkling.py`). `runq` auto-detects it for raw generation, chat and the HTTP server.
 Provenance, container sizes, the quality table and known limitations are in
-[`docs/INKLING.md`](docs/INKLING.md):
+[`docs/INKLING.md`](docs/INKLING.md); the published Q4/Q8 containers are at
+[miloserdev/Inkling-2-Mini-numallama](https://huggingface.co/miloserdev/Inkling-2-Mini-numallama):
 
 ```bash
 ./runq inkling_mini_q4.ink2 -z inkling2_tokenizer.bin -m generate -i "The capital of France is" -n 16 -t 0

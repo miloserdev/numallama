@@ -34,6 +34,10 @@ engine's 4-row SDOT layout without touching any existing `.bin` format.
 | `inkling_mini_q8.ink2` | Q8 | 27.71 GB | source dequant -> Q8 (`--experts q8`) |
 | `inkling2_tokenizer.bin` | — | 3.7 MB | 201024 entries, BPE matches `llama-tokenize` |
 
+Published for download at
+[`miloserdev/Inkling-2-Mini-numallama`](https://huggingface.co/miloserdev/Inkling-2-Mini-numallama)
+together with the model card, tokenizer, exporter scripts, checksums and validation logits.
+
 The official IQ4_NL GGUF remains useful as a runtime oracle: upstream llama.cpp with
 `inkling2_loop` support wrote `logits_oracle.bin` for "The capital of France is".
 
