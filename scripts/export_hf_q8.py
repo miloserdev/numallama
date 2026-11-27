@@ -335,10 +335,12 @@ def main():
         imatrix_path = args[i + 1]
         del args[i:i + 2]
     q4_kinds = []
+    q4_explicit = False
     if "--q4" in args:
         i = args.index("--q4")
         if i + 1 < len(args) and not args[i + 1].startswith("-") and not args[i + 1].isdigit():
             q4_kinds = args[i + 1].split(",")
+            q4_explicit = True
             del args[i:i + 2]
         else:
             q4_kinds = [k for k in KINDS if k != "wv"]   # wv (small, sensitive) stays Q8
@@ -351,7 +353,7 @@ def main():
     for f in files:
         T.update(load_safetensors(os.path.join(model_dir, f)))
     if cfg.get("model_type") == "qwen3_5":
-        if "--q4" in sys.argv and q4_kinds == [k for k in KINDS if k != "wv"]:
+        if not q4_explicit and "--q4" in sys.argv and q4_kinds == [k for k in KINDS if k != "wv"]:
             q4_kinds = [k for k in KINDS_HYB if k != "wv"]
         for k in q4_kinds:
             assert k in KINDS_HYB, f"unknown matrix kind {k}"

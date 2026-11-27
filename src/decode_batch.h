@@ -29,7 +29,7 @@ static void forward_batch_thread(int tid) {
     // embeddings and RoPE tables for this thread's share of the tokens
     tok_range(B, tid, nth, &b0, &b1);
     for (int b = b0; b < b1; b++) {
-        memcpy(BT.x + (size_t)b * dim, w->token_embedding_table + (size_t)BT.tok[b] * dim, dim * sizeof(float));
+        embed_row(w->q_tokens, BT.tok[b], BT.x + (size_t)b * dim, dim);
         for (int j = 0; j < hs2; j++) {
             double val = (double)(pos0 + b) * P.rope_freq[j];
             BT.rope_c[b * hs2 + j] = (float)cos(val);
@@ -327,6 +327,8 @@ static void forward_multi_thread(int tid) {
     const int hs2 = head_size / 2;
     const int qkn = p->qk_norm;
     const int kvi8 = s->kv_type == KV_I8;
+    const int* tpos = BT.tokpos;          // per-token positions / caches (multi-session step)
+    KVCache* const* tkv = BT.tokv;
     const float att_scale = 1.0f / sqrtf((float)head_size);
     const int8_t* nq = NB[tb->node].q;
     const float* ns = NB[tb->node].s;
@@ -364,7 +366,9 @@ static void forward_multi_thread(int tid) {
                 float* k = BT.k + (size_t)b * kv_dim;
                 const float* rc = BT.rope_c + b * hs2;
                 const float* rs = BT.rope_s + b * hs2;
-                float* kc = kvi8 ? NULL : s->key_cache + loff + (size_t)(pos0 + b) * head_size;
+                const int pb = tpos ? tpos[b] : pos0 + b;
+                float* kbase = tkv ? tkv[b]->kf : s->key_cache;
+                float* kc = kvi8 ? NULL : kbase + loff + (size_t)pb * head_size;
                 if (w->bk) for (int i = r0; i < r1; i++) k[i] += w->bk[(size_t)l * kv_dim + i];
                 if (qkn) continue; // per-head norm + RoPE below, then into the cache
                 for (int i = r0; i < r1; i += 2) {
@@ -380,7 +384,9 @@ static void forward_multi_thread(int tid) {
             matmul_rows_batch(BT.v, kv_dim, nq, ns, B, w->wv + l, dim, r0, r1);
             for (int b = 0; b < B; b++) {
                 float* v = BT.v + (size_t)b * kv_dim;
-                float* vc = kvi8 ? NULL : s->value_cache + loff + (size_t)(pos0 + b) * head_size;
+                const int pb = tpos ? tpos[b] : pos0 + b;
+                float* vbase = tkv ? tkv[b]->vf : s->value_cache;
+                float* vc = kvi8 ? NULL : vbase + loff + (size_t)pb * head_size;
                 if (w->bv) for (int i = r0; i < r1; i++) v[i] += w->bv[(size_t)l * kv_dim + i];
                 if (!kvi8) for (int i = r0; i < r1; i++) vc[(size_t)(i / head_size) * p->seq_len * head_size + i % head_size] = v[i];
             }
@@ -398,7 +404,11 @@ static void forward_multi_thread(int tid) {
                     int g = h - n_heads;
                     float* kv = BT.k + (size_t)b * kv_dim + (size_t)g * head_size;
                     head_norm_rope(kv, w->k_norm + (size_t)l * head_size, head_size, rc, rs);
-                    if (!kvi8) memcpy(s->key_cache + loff + (size_t)g * p->seq_len * head_size + (size_t)(pos0 + b) * head_size, kv, head_size * sizeof(float));
+                    if (!kvi8) {
+                        const int pb = tpos ? tpos[b] : pos0 + b;
+                        float* kbase = tkv ? tkv[b]->kf : s->key_cache;
+                        memcpy(kbase + loff + (size_t)g * p->seq_len * head_size + (size_t)pb * head_size, kv, head_size * sizeof(float));
+                    }
                 }
             }
             barrier(tb);
@@ -408,8 +418,13 @@ static void forward_multi_thread(int tid) {
             node_groups(p->n_kv_heads, tb->node, &qg0, &qg1);
             for (int task = tb->ltid; task < (qg1 - qg0) * B; task += tb->nthn) {
                 int g = qg0 + task % (qg1 - qg0), b = task / (qg1 - qg0);
-                kv_store_row(kv_k_i8(s, p, l, g, pos0 + b), kv_ks(s, p, l, g, pos0 + b), BT.k + (size_t)b * kv_dim + (size_t)g * head_size, head_size);
-                kv_store_row(kv_v_i8(s, p, l, g, pos0 + b), kv_vs(s, p, l, g, pos0 + b), BT.v + (size_t)b * kv_dim + (size_t)g * head_size, head_size);
+                const int pb = tpos ? tpos[b] : pos0 + b;
+                int8_t* kq = tkv ? tkv[b]->kq : s->key_cache_q;
+                int8_t* vq = tkv ? tkv[b]->vq : s->value_cache_q;
+                float* ks = tkv ? tkv[b]->ks : s->key_cache_s;
+                float* vs = tkv ? tkv[b]->vs : s->value_cache_s;
+                kv_store_row(kq + kv_row_off(p, l, g, pb), ks + kv_sc_off(p, l, g, pb), BT.k + (size_t)b * kv_dim + (size_t)g * head_size, head_size);
+                kv_store_row(vq + kv_row_off(p, l, g, pb), vs + kv_sc_off(p, l, g, pb), BT.v + (size_t)b * kv_dim + (size_t)g * head_size, head_size);
             }
             node_barrier(tb);
         }
@@ -420,7 +435,12 @@ static void forward_multi_thread(int tid) {
         float* att = BT.att + (size_t)tid * kv_mul * p->seq_len;
         int g0, g1;
         node_groups(p->n_kv_heads, tb->node, &g0, &g1);
-        const int Tt = pos0 + B; // positions seen by the last token
+        const int ng = head_size / GS;
+        int Tt = 0; // positions seen by the longest sequence in the step
+        for (int b = 0; b < B; b++) {
+            const int pb = tpos ? tpos[b] : pos0 + b;
+            if (pb + 1 > Tt) Tt = pb + 1;
+        }
         int C = Tt / 32 < 1 ? 1 : Tt / 32;
         int cmax = tb->nthn / (g1 - g0 > 0 ? g1 - g0 : 1);
         if (C > cmax) C = cmax > 0 ? cmax : 1;
@@ -433,15 +453,16 @@ static void forward_multi_thread(int tid) {
             int g = g0 + item / (C * TS), c = (item / TS) % C, ts = item % TS;
             int t0 = (int)((long)Tt * c / C), t1 = (int)((long)Tt * (c + 1) / C);
             const size_t kof = (size_t)g * p->seq_len * head_size;
-            const float* kb = kvi8 ? NULL : s->key_cache + loff + kof;
-            const float* vb = kvi8 ? NULL : s->value_cache + loff + kof;
-            const int8_t* kbq = kvi8 ? s->key_cache_q + loff + kof : NULL;
-            const int8_t* vbq = kvi8 ? s->value_cache_q + loff + kof : NULL;
-            const float* kbs = kvi8 ? s->key_cache_s + (loff + kof) / GS : NULL;
-            const float* vbs = kvi8 ? s->value_cache_s + (loff + kof) / GS : NULL;
-            const int ng = head_size / GS;
             for (int b = B * ts / TS; b < B * (ts + 1) / TS; b++) {
-                int te = pos0 + b + 1 < t1 ? pos0 + b + 1 : t1; // causal end for token b
+                const int pb = tpos ? tpos[b] : pos0 + b;
+                int te = pb + 1 < t1 ? pb + 1 : t1; // causal end for token b
+                KVCache* bc = tkv ? tkv[b] : NULL;
+                const float* kb = kvi8 ? NULL : (bc ? bc->kf : s->key_cache) + loff + kof;
+                const float* vb = kvi8 ? NULL : (bc ? bc->vf : s->value_cache) + loff + kof;
+                const int8_t* kbq = kvi8 ? (bc ? bc->kq : s->key_cache_q) + loff + kof : NULL;
+                const int8_t* vbq = kvi8 ? (bc ? bc->vq : s->value_cache_q) + loff + kof : NULL;
+                const float* kbs = kvi8 ? (bc ? bc->ks : s->key_cache_s) + (loff + kof) / GS : NULL;
+                const float* vbs = kvi8 ? (bc ? bc->vs : s->value_cache_s) + (loff + kof) / GS : NULL;
                 int8_t qq[KV_MUL_MAX * head_size];
                 float qsc[KV_MUL_MAX * (head_size / GS)];
                 if (kvi8)
@@ -674,7 +695,9 @@ static void init_batch(Transformer* t) {
         BT.lino = calloc(B * p->lin_nv * p->lin_dv, sizeof(float));
         HYB_BATCH = 1;
     }
-    BT.mpart_n = (size_t)SPEC_MAX_TOK * p->n_heads * (P.nth > 1 ? P.nth : 1) * (head_size + 2);
+    size_t mpart_old = (size_t)SPEC_MAX_TOK * p->n_heads * (P.nth > 1 ? P.nth : 1) * (head_size + 2);
+    size_t mpart_min = (size_t)BATCH_MAX * p->n_heads * (head_size + 2);
+    BT.mpart_n = mpart_old > mpart_min ? mpart_old : mpart_min;
     BT.mpart = calloc(BT.mpart_n, sizeof(float));
     if (p->n_experts > 0) {
         size_t S = B * p->n_active, E = p->n_experts, mh = p->moe_hidden;
@@ -743,7 +766,7 @@ float* forward_all(Transformer* transformer, const int* tokens, int n, int pos0)
     BT.tok = tokens;
     BT.logits_all = SPEC_LOGITS;
     for (int b = 0; b < n; b++) { // embeddings and RoPE tables of the step
-        memcpy(BT.x + (size_t)b * dim, transformer->weights.token_embedding_table + (size_t)tokens[b] * dim, dim * sizeof(float));
+        embed_row(transformer->weights.q_tokens, tokens[b], BT.x + (size_t)b * dim, dim);
         for (int j = 0; j < hs2; j++) {
             double val = (double)(pos0 + b) * P.rope_freq[j];
             BT.rope_c[b * hs2 + j] = (float)cos(val);
@@ -760,6 +783,51 @@ float* forward_all(Transformer* transformer, const int* tokens, int n, int pos0)
 }
 
 static volatile int g_srv_abort; // defined below with the other server globals
+
+// One decode step for up to SPEC_MAX_TOK independent dense/MoE sessions (one token each, each with
+// its own KV cache and position). The weight matmuls and the FFN/MoE phases are shared; only the
+// KV store and the attention are per token.
+typedef struct { KVCache* kv; int tok, pos; float* logits; } SrvTok;
+static float* SRV_LOGITS = NULL; // (SPEC_MAX_TOK, vocab)
+
+static int __attribute__((unused)) forward_sessions(Transformer* transformer, SrvTok* ts, int n) {
+    Config* p = &transformer->config;
+    if (n < 1 || n > SPEC_MAX_TOK || p->hybrid || p->glm) return 0;
+    use_model(transformer);
+    int V = p->vocab_size, dim = p->dim, hs2 = p->head_dim / 2;
+    if (!SRV_LOGITS) SRV_LOGITS = malloc((size_t)SPEC_MAX_TOK * V * sizeof(float));
+    if (!SRV_LOGITS) return 0;
+    int poss[SPEC_MAX_TOK];
+    KVCache* kvs[SPEC_MAX_TOK];
+    for (int b = 0; b < n; b++) { poss[b] = ts[b].pos; kvs[b] = ts[b].kv; }
+    P.t = transformer;
+    BT.B = n;
+    BT.pos0 = 0;
+    BT.tok = NULL;
+    BT.tokpos = poss;
+    BT.tokv = kvs;
+    BT.logits_all = SRV_LOGITS;
+    BT.save_in = NULL;
+    for (int b = 0; b < n; b++) { // embeddings and RoPE tables per session token
+        embed_row(transformer->weights.q_tokens, ts[b].tok, BT.x + (size_t)b * dim, dim);
+        for (int j = 0; j < hs2; j++) {
+            double val = (double)ts[b].pos * P.rope_freq[j];
+            BT.rope_c[b * hs2 + j] = (float)cos(val);
+            BT.rope_s[b * hs2 + j] = (float)sin(val);
+        }
+    }
+    P.mode = 2;
+    P.seq++;
+    wake_workers();
+    forward_multi_thread(0);
+    P.mode = 0;
+    for (int b = 0; b < n; b++)
+        if (ts[b].logits) memcpy(ts[b].logits, SRV_LOGITS + (size_t)b * V, (size_t)V * sizeof(float));
+    BT.tokpos = NULL;
+    BT.tokv = NULL;
+    BT.logits_all = NULL;
+    return 1;
+}
 
 float* forward_batch(Transformer* transformer, const int* tokens, int n, int pos0, int* done_out) {
     use_model(transformer);

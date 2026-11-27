@@ -277,8 +277,9 @@ static void forward_glm_batch_thread(int tid) {
         size_t cn = (size_t)nlin * p->conv_dim * (Kc - 1);
         memset(s->conv_state + cn * tid / nth, 0, (cn * (tid + 1) / nth - cn * tid / nth) * sizeof(float));
     }
+    float emb[D];
     for (int b = b0; b < b1; b++) {
-        const float* emb = tr->weights.token_embedding_table + (size_t)BT.tok[b] * D;
+        embed_row(tr->weights.q_tokens, BT.tok[b], emb, D);
         for (int n = 0; n < hc; n++) memcpy(GB.hs + ((size_t)b * hc + n) * D, emb, D * sizeof(float));
     }
     barrier(tb);

@@ -289,7 +289,7 @@ struct NodeSync {
 static NodeBuf NB[MAX_NODES];
 static int P_qmax = 0; // longest quantized node vector (NB slot size)
 static int P_max_layers = 0; // most layers of any loaded model (work counter reset range)
-#define SPEC_MAX_TOK 16 // tokens per multi-token decode step (speculative verification)
+#define SPEC_MAX_TOK 32 // tokens per multi-token decode step (speculative verification)
 static void quantize_vec(int8_t* q, float* s, const float* x, int n);
 
 /* Flag tree, no atomic read-modify-write: a thread publishes its epoch in its own cache line; the

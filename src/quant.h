@@ -19,6 +19,35 @@ static inline int8_t q8_at(const QuantizedTensor* w, int n, int i, int k) {
 static inline float q8_scale(const QuantizedTensor* w, int n, int i, int g) {
     return w->s[(size_t)(i / 4) * 4 * (n / GS) + g * 4 + i % 4];
 }
+
+// token embeddings are kept quantized; a row is dequantized when it is needed. When the classifier
+// shares the embedding tensor, pack_q8 repacks that tensor into 4-row blocks: read it packed then.
+static inline void embed_row(const QuantizedTensor* qx, int row, float* dst, int n) {
+    if (EMB_PACKED) {
+        for (int g = 0; g < n / GS; g++) {
+            float sc = q8_scale(qx, n, row, g);
+            for (int k = g * GS; k < (g + 1) * GS; k++) dst[k] = q8_at(qx, n, row, k) * sc;
+        }
+    } else {
+        const int8_t* src = qx->q + (size_t)row * n;
+        const float* s = qx->s + (size_t)row * (n / GS);
+        for (int i = 0; i < n; i++) dst[i] = src[i] * s[i / GS];
+    }
+}
+
+// a slice [from, from+n) of that row (the per-thread partition of the embedding copy)
+static inline void embed_row_slice(const QuantizedTensor* qx, int row, int dim, float* dst, int from, int n) {
+    if (EMB_PACKED) {
+        for (int i = 0; i < n; i++) {
+            int k = from + i;
+            dst[i] = q8_at(qx, dim, row, k) * q8_scale(qx, dim, row, k / GS);
+        }
+    } else {
+        const int8_t* src = qx->q + (size_t)row * dim + from;
+        const float* s = qx->s + (size_t)row * (dim / GS);
+        for (int i = 0; i < n; i++) dst[i] = src[i] * s[(from + i) / GS];
+    }
+}
 static void matmul_rows_q8_scalar(float* out, const int8_t* xq, const float* xs, const QuantizedTensor* w, int n, int r0, int r1) {
     for (int i = r0; i < r1; i++) {
         float val = 0.0f;
@@ -32,9 +61,9 @@ static void matmul_rows_q8_scalar(float* out, const int8_t* xq, const float* xs,
 }
 static void matmul_rows_q8(float* out, const int8_t* xq, const float* xs,
                         const QuantizedTensor* w, int n, int r0, int r1) {
-    const int ng = n / GS;
     int i = r0;
 #if defined(__ARM_FEATURE_DOTPROD)
+    const int ng = n / GS;
     if (GS % 16 == 0 && r0 % 4 == 0) {
         const int8_t* qend = w->q + (size_t)r1 * n;
         for (; i + 4 <= r1; i += 4) {

@@ -12,6 +12,10 @@ typedef struct {
   ProbIndex *probindex; // buffer used in top-p sampling
   float temperature;
   float topp;
+  float min_p; // drop tokens below min_p * max probability (0 = off)
+  float presence_penalty, frequency_penalty; // applied to tokens already generated (temperature > 0)
+  uint8_t *seen;    // vocab: token appeared in this completion
+  uint16_t *freq;   // vocab: its count (saturating)
   unsigned long long rng_state;
 } Sampler;
 
@@ -98,12 +102,33 @@ void build_sampler(Sampler *sampler, int vocab_size, float temperature, float to
   sampler->vocab_size = vocab_size;
   sampler->temperature = temperature;
   sampler->topp = topp;
+  sampler->min_p = 0.0f;
+  sampler->presence_penalty = sampler->frequency_penalty = 0.0f;
+  sampler->seen = calloc((size_t)vocab_size, 1);
+  sampler->freq = calloc((size_t)vocab_size, 2);
   sampler->rng_state = rng_seed;
   // buffer only used with nucleus sampling; may not need but it's ~small
   sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
 }
 
-void free_sampler(Sampler *sampler) { free(sampler->probindex); }
+void free_sampler(Sampler *sampler) { free(sampler->probindex); free(sampler->seen); free(sampler->freq); }
+
+// a new completion: the penalties only count the tokens generated in it
+static void sampler_reset(Sampler *s) {
+  if (s->seen) memset(s->seen, 0, (size_t)s->vocab_size);
+  if (s->freq) memset(s->freq, 0, (size_t)s->vocab_size * sizeof(uint16_t));
+}
+static void sampler_note(Sampler *s, int tok) {
+  if (!s->seen || tok < 0 || tok >= s->vocab_size) return;
+  s->seen[tok] = 1;
+  if (s->freq[tok] < 0xffff) s->freq[tok]++;
+}
+// before the softmax: subtract the penalties of the tokens already seen (greedy stays penalty-free)
+static void sampler_penalize(Sampler *s, float *logits) {
+  if (!s->seen || (s->presence_penalty == 0.0f && s->frequency_penalty == 0.0f)) return;
+  for (int i = 0; i < s->vocab_size; i++)
+    if (s->seen[i]) logits[i] -= s->presence_penalty + s->frequency_penalty * s->freq[i];
+}
 
 unsigned int random_u32(unsigned long long *state) {
   // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
@@ -125,7 +150,7 @@ float random_f32(unsigned long long *state) { // random float32 in [0,1)
 static struct {
   const float *l;
   int n;
-  float T, lnc; // temperature (0: argmax), ln of the nucleus cutoff probability
+  float T, lnc, lmin; // temperature, ln of the nucleus cutoff probability, ln(min_p)
   float *m, *z; // per-thread max / partial normalizer (stride 16: one cache line per thread)
   int *arg, *cnt;
   int *cand;    // candidate indices, thread t writes from the start of its slice
@@ -153,7 +178,12 @@ static void sample_thread(int tid) {
   float M = -FLT_MAX, Z = 0.0f;
   for (int t = 0; t < nth; t++) M = SP.m[t * 16] > M ? SP.m[t * 16] : M;
   for (int t = 0; t < nth; t++) Z += SP.z[t * 16] * expf((SP.m[t * 16] - M) / SP.T);
-  const float thr = M + SP.T * (SP.lnc + logf(Z));
+  float thr = -INFINITY;
+  if (SP.lnc > -INFINITY) thr = M + SP.T * (SP.lnc + logf(Z)); // absolute probability cutoff
+  if (SP.lmin > -INFINITY) { // min_p is relative to the most likely token: p >= min_p * p_max
+      float lm = M + SP.T * SP.lmin;
+      if (lm > thr) thr = lm;
+  }
   int c = 0;
   for (int i = i0; i < i1; i++) if (l[i] >= thr) SP.cand[i0 + c++] = i;
   SP.cnt[tid * 16] = c;
@@ -173,7 +203,10 @@ static int par_nucleus(Sampler *sp, const float *logits, ProbIndex *pi, int *las
   static int cand_n = 0;
   if (cand_n < n) { free(SP.cand); SP.cand = malloc((size_t)n * sizeof(int)); cand_n = n; }
   SP.l = logits; SP.n = n; SP.T = sp->temperature;
-  SP.lnc = logf((1.0f - sp->topp) / (n - 1));
+  // candidates: inside the top-p cutoff and above min_p * max probability
+  SP.lnc = (sp->topp > 0 && sp->topp < 1) ? logf((1.0f - sp->topp) / (n - 1)) : -INFINITY;
+  SP.lmin = sp->min_p > 0 ? logf(sp->min_p) : -INFINITY;
+  if (!isfinite(SP.lnc) && !isfinite(SP.lmin)) SP.lnc = logf(1e-6f);
   P.mode = 4;
   wake_workers();
   sample_thread(0);
@@ -192,9 +225,19 @@ static int par_nucleus(Sampler *sp, const float *logits, ProbIndex *pi, int *las
   qsort(pi, n0, sizeof(ProbIndex), compare);
   float cp = 0.0f;
   int li = n0 - 1;
-  for (int i = 0; i < n0; i++) {
-    cp += pi[i].prob;
-    if (cp > sp->topp) { li = i; break; }
+  if (sp->topp > 0 && sp->topp < 1)
+    for (int i = 0; i < n0; i++) {
+      cp += pi[i].prob;
+      if (cp > sp->topp) { li = i; break; }
+    }
+  if (sp->min_p > 0 && n0 > 0) { // min-p: relative to the most likely token
+    float pmax = pi[0].prob;
+    while (li > 0 && pi[li].prob < sp->min_p * pmax) li--;
+    cp = 0.0f;
+    for (int i = 0; i <= li; i++) cp += pi[i].prob;
+  } else if (!(sp->topp > 0 && sp->topp < 1)) {
+    cp = 0.0f;
+    for (int i = 0; i < n0; i++) cp += pi[i].prob;
   }
   *last = li;
   *cum = cp;
@@ -222,17 +265,21 @@ static inline int pool_ready(void) { return P.nth > 1 && P.tb != NULL; }
 int sample(Sampler *sampler, float *logits) {
   // sample the token given the logits and some hyperparameters
   int next;
+  if (sampler->temperature > 0.0f) sampler_penalize(sampler, logits); // greedy stays penalty-free
   if (sampler->temperature == 0.0f && pool_ready()) return par_argmax(logits, sampler->vocab_size);
-  if (sampler->temperature > 0.0f && sampler->topp > 0 && sampler->topp < 1 && pool_ready()) {
+  if (sampler->temperature > 0.0f && pool_ready() &&
+      ((sampler->topp > 0 && sampler->topp < 1) || sampler->min_p > 0)) {
     int last;
     float cum;
     par_nucleus(sampler, logits, sampler->probindex, &last, &cum);
     float r = random_f32(&sampler->rng_state) * cum, cdf = 0.0f;
     for (int i = 0; i <= last; i++) {
       cdf += sampler->probindex[i].prob;
-      if (r < cdf) return sampler->probindex[i].index;
+      if (r < cdf) { next = sampler->probindex[i].index; sampler_note(sampler, next); return next; }
     }
-    return sampler->probindex[last].index; // in case of rounding errors
+    next = sampler->probindex[last].index; // in case of rounding errors
+    sampler_note(sampler, next);
+    return next;
   }
   if (sampler->temperature == 0.0f) {
     // greedy argmax sampling: take the token with the highest probability
@@ -255,6 +302,7 @@ int sample(Sampler *sampler, float *logits) {
       next = sample_topp(logits, sampler->vocab_size, sampler->topp, sampler->probindex, coin);
     }
   }
+  if (sampler->temperature > 0.0f) sampler_note(sampler, next);
   return next;
 }
 
@@ -263,11 +311,12 @@ int sample(Sampler *sampler, float *logits) {
  * that distribution with d removed. The output is distributed exactly like sample(). Greedy: argmax. */
 int sample_draft(Sampler *sampler, float *logits, int d) {
   if (sampler->temperature == 0.0f) return pool_ready() ? par_argmax(logits, sampler->vocab_size) : sample_argmax(logits, sampler->vocab_size);
+  sampler_penalize(sampler, logits);
   int n = sampler->vocab_size;
   ProbIndex *pi = sampler->probindex;
   int n0 = 0, last;
   float cum = 0.0f;
-  if (sampler->topp > 0 && sampler->topp < 1 && pool_ready()) {
+  if (pool_ready() && ((sampler->topp > 0 && sampler->topp < 1) || sampler->min_p > 0)) {
     par_nucleus(sampler, logits, pi, &last, &cum);
   } else if (sampler->topp <= 0 || sampler->topp >= 1) {
     for (int q = 0; q < n; q++) logits[q] /= sampler->temperature;
@@ -290,7 +339,7 @@ int sample_draft(Sampler *sampler, float *logits, int d) {
   }
   float pd = 0.0f; // probability of d in the (truncated, renormalized) distribution
   for (int i = 0; i <= last; i++) if (pi[i].index == d) { pd = pi[i].prob / cum; break; }
-  if (random_f32(&sampler->rng_state) < pd) return d;
+  if (random_f32(&sampler->rng_state) < pd) { sampler_note(sampler, d); return d; }
   // rejected: sample from the distribution without d
   float rest = cum - pd * cum;
   float r = random_f32(&sampler->rng_state) * rest, cdf = 0.0f;
@@ -299,9 +348,11 @@ int sample_draft(Sampler *sampler, float *logits, int d) {
     if (pi[i].index == d) continue;
     fallback = pi[i].index;
     cdf += pi[i].prob;
-    if (r < cdf) return pi[i].index;
+    if (r < cdf) { sampler_note(sampler, pi[i].index); return pi[i].index; }
   }
-  return fallback >= 0 ? fallback : d;
+  fallback = fallback >= 0 ? fallback : d;
+  sampler_note(sampler, fallback);
+  return fallback;
 }
 
 /* Prompt lookup: find the most recent earlier occurrence of the last N tokens of hist (N = 4..2)

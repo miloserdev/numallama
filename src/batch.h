@@ -14,6 +14,8 @@ typedef struct {
     int B;            // tokens in the current block
     int pos0;         // position of the first token
     const int* tok;   // the tokens
+    const int* tokpos;        // per-token positions when set (NULL: pos0 + b)
+    KVCache* const* tokv;     // per-token KV caches when set (NULL: the model state; one cache per session)
     float* x;         // (B, dim) residual stream
     float* xb;        // (B, dim) normalized input / attention output
     float* q;         // (B, dim)
@@ -312,7 +314,7 @@ static void forward_hybrid_batch_thread(int tid) {
     tok_range(B, tid, nth, &b0, &b1);
     tok_range(B, tb->ltid, tb->nthn, &n0, &n1);
     for (int b = b0; b < b1; b++) {
-        memcpy(BT.x + (size_t)b * dim, w->token_embedding_table + (size_t)BT.tok[b] * dim, dim * sizeof(float));
+        embed_row(w->q_tokens, BT.tok[b], BT.x + (size_t)b * dim, dim);
         for (int j = 0; j < rot / 2; j++) {
             double val = (double)(pos0 + b) * P.rope_freq[j];
             BT.rope_c[b * hs2 + j] = (float)cos(val);

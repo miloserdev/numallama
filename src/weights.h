@@ -270,6 +270,7 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weigh
   weights->glm = NULL;
   if (config->glm) glm_map_weights(weights, config, weights_ptr);
   else memory_map_weights(weights, config, weights_ptr, shared_classifier); // pointers only, nothing touched yet
+  EMB_PACKED = weights->wcls == weights->q_tokens;
 #if defined(__linux__)
   if (NN > 1) { // each node gets its rows of every matrix
     if (config->glm) glm_place(config, weights->glm);
@@ -282,9 +283,8 @@ void read_checkpoint(char *checkpoint, Config *config, TransformerWeights *weigh
     exit(EXIT_FAILURE);
   }
   fclose(file);
-  dequantize(weights->q_tokens, weights->token_embedding_table, config->vocab_size * config->dim);
   if (config->glm) { glm_pack(config, weights->glm); return; }
-  pack_q8(weights, config); // after the embeddings were dequantized (the classifier may share them)
+  pack_q8(weights, config); // embeddings stay quantized: the classifier may share them
   for (int k = 0; k < NN; k++) weights->wg_node[k] = weights->wg;
 #if defined(__linux__)
   if (NN > 1 && config->n_experts > 0) { // the router is small (n_experts x dim): replicate it on every node

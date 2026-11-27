@@ -85,9 +85,10 @@ __attribute__((unused)) static int choose_cpus(int nth) {
     int threads[MAX_NODES], total = 0;
     for (int k = 0; k < NN; k++) {
         if (nth <= 0) {
-            threads[k] = idle_cnt[NODE_ID[k]] - 4;
+            // leave headroom on big nodes, but do not collapse a small board to a single worker
+            int idle = idle_cnt[NODE_ID[k]];
+            threads[k] = idle > 8 ? idle - 4 : idle > 1 ? idle - 1 : 1;
             if (threads[k] > 96) threads[k] = 96;
-            if (threads[k] < 1) threads[k] = 1;
         } else {
             threads[k] = nth / NN + (k < nth % NN);
         }

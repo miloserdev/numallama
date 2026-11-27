@@ -2,6 +2,7 @@
  * dependency order (each header uses only what the previous ones define):
  *   core.h          config, model structs, quantized tensors, file loading
  *   weights.h       NUMA placement and repacking of the weights
+ *   inkling.h       Inkling-2-Mini INK2 container loader (mmap + JSON manifest)
  *   pool.h          thread pool, barriers, per-node reduction, rmsnorm, profiling
  *   quant.h         int8/int4 quantization and the NEON matmul kernels (single + batched)
  *   kv.h            KV cache formats (f32 / int8 with per-group scales), store/dot/axpy
@@ -12,14 +13,17 @@
  *   batch.h         batched (prefill) infrastructure, MoE FFN, hybrid batched prefill
  *   glm_batch.h     GLM batched prefill
  *   decode_batch.h  dense batched prefill, multi-token decode, forward/forward_all
+ *   model_inkling.h Inkling-2-Mini text forward (48 slots, loop core, MoE, LM head)
  *   tokenizer.h     BPE tokenizer
  *   sampler.h       argmax / temperature / top-p sampling (pool-parallel)
  *   spec.h          pool-parallel memcpy and the weightless speculative commit
  *   chat.h          chat history, templates, tool calls, the reply generation loop
  *   server.h        the OpenAI-compatible HTTP server (-m server)
+ *   inkling_server.h minimal OpenAI HTTP path for .ink2 Inkling containers
  */
 #include "core.h"
 #include "weights.h"
+#include "inkling.h"
 #include "pool.h"
 #include "quant.h"
 #include "kv.h"
@@ -30,6 +34,7 @@
 #include "batch.h"
 #include "glm_batch.h"
 #include "decode_batch.h"
+#include "model_inkling.h"
 #include "tokenizer.h"
 #include "sampler.h"
 #include "spec.h"
@@ -43,6 +48,7 @@ static const char *SRV_KEY = NULL;     // -A: required "Authorization: Bearer <k
 static const char *SRV_MODEL = "numallama";
 static const char *SRV_SESS_DIR = NULL; // -W: session journal / state dumps (default: workspace/sessions)
 static Tools *SRV_TOOLS = NULL;         // -f tools.json: tools the server executes itself when the request has none
+static int SRV_J = 4;                   // -J: concurrent decode sessions (dense/MoE continuous batching)
 
 // Server session persistence (enabled by default in server mode, -W <dir>): per session an
 // append-only JSONL journal of the requests plus a binary state dump (prompt tokens + KV cache /
@@ -290,6 +296,8 @@ static int sess_read(Transformer *t, int *tok, int cap, const char *path) {
 }
 
 #include "server.h"
+#include "inkling_server.h"
+#include "serve_batch.h"
 
 void error_usage() {
   fprintf(stderr, "Usage:   run <checkpoint> [options]\n");
@@ -307,6 +315,7 @@ void error_usage() {
   fprintf(stderr, "  -P <int>    server: port, default 8080\n");
   fprintf(stderr, "  -A <string> server: API key the clients must send (Authorization: Bearer ...)\n");
   fprintf(stderr, "  -W <dir>    server: sessions directory (journal + state dumps; \"none\" disables, default workspace/sessions)\n");
+  fprintf(stderr, "  -J <int>    server: concurrent decode sessions for dense/MoE models, default 4 (1 = serial)\n");
   fprintf(stderr, "              imatrix: -i <text file> -o <out.imx> collects Q4 importance statistics\n");
   fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
   fprintf(stderr, "  -T <int>    number of threads, default 0 = auto (placed on the most idle CPUs; RUNQ_PIN=1 keeps them pinned, RUNQ_PIN=0 disables placement)\n");
@@ -318,6 +327,72 @@ void error_usage() {
   fprintf(stderr, "  -N <int>    NUMA nodes to use, default 0 = all (weights are split between the nodes)\n");
   fprintf(stderr, "  -r <int>    Qwen3.5 / 3.8: 1 = reasoning (thinking shown dimmed), default 0 = answer directly\n");
   exit(EXIT_FAILURE);
+}
+
+static int inkling_is_file(const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return 0;
+  char m[8];
+  int ok = fread(m, 1, 8, f) == 8 && !memcmp(m, "INK2JSON", 8);
+  fclose(f);
+  return ok;
+}
+
+// Text-only Inkling path: raw generation, one-turn chat template, or the OpenAI server.
+static int inkling_run(const char *model_path, const char *tok_path, const char *prompt, const char *system_prompt,
+                       int chat, int steps, float temperature, float topp, unsigned long long seed, int ctx) {
+  ARCH = ARCH_INKLING; SPECIAL_START = 199998; EOS_ID = 200006; GS = 64;
+  InklingModel m;
+  if (!inkling_load(model_path, &m)) { fprintf(stderr, "cannot load %s\n", model_path); return 1; }
+  InklingState st;
+  if (!inkling_state_alloc(&m, ctx, &st)) { fprintf(stderr, "inkling state alloc failed\n"); return 1; }
+  InklingRuntime rt;
+  if (!inkling_runtime_init(&m, &rt)) { fprintf(stderr, "inkling runtime init failed\n"); return 1; }
+  Tokenizer tk;
+  build_tokenizer(&tk, (char *)tok_path, m.vocab);
+  int ids[8192], n = 0;
+  if (chat) {
+    if (system_prompt && system_prompt[0]) {
+      n = push_tpl(&tk, "<|message_system|><|content_text|>", ids, n);
+      n = push_text(&tk, system_prompt, ids, n);
+      n = push_tpl(&tk, "<|end_message|>", ids, n);
+    }
+    n = push_tpl(&tk, "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>", ids, n);
+    n = push_tpl(&tk, "<|message_user|><|content_text|>", ids, n);
+    if (prompt) n = push_text(&tk, prompt, ids, n);
+    n = push_tpl(&tk, "<|end_message|>", ids, n);
+  } else if (prompt) encode(&tk, (char *)prompt, 0, 0, ids, &n);
+  if (n < 1) { fprintf(stderr, "an Inkling prompt is required\n"); return 1; }
+  float *logits = malloc((size_t)m.unpadded * sizeof(float));
+  for (int i = 0; i < n; i++) inkling_forward_token(&m, &st, &rt, ids[i], i, logits);
+  int b0 = 0;
+  for (int i = 1; i < m.unpadded; i++) if (logits[i] > logits[b0]) b0 = i;
+  fprintf(stderr, "[inkling prefill top-1 %d %.4f]\n", b0, logits[b0]);
+  Sampler sp;
+  build_sampler(&sp, m.unpadded, temperature, topp, seed);
+  const int id_model = find_special(&tk, "<|message_model|>");
+  const int id_text = find_special(&tk, "<|content_text|>");
+  const int id_end = find_special(&tk, "<|end_message|>");
+  const int id_think = find_special(&tk, "<|content_thinking|>");
+  const int id_begin = find_special(&tk, "<|begin_of_text|>");
+  int pos = n, prev = ids[n - 1];
+  for (int g = 0; g < steps && pos < ctx; g++) {
+    int tok = sample(&sp, logits);
+    if (tok == EOS_ID || tok == id_end) break;
+    if (!chat || (tok != id_model && tok != id_text && tok != id_think && tok != id_begin)) {
+      char *piece = decode(&tk, prev, tok);
+      safe_printf(piece);
+      fflush(stdout);
+    }
+    prev = tok;
+    inkling_forward_token(&m, &st, &rt, tok, pos, logits);
+    pos++;
+  }
+  fputc('\n', stdout);
+  fprintf(stderr, "[inkling: %d prompt tok, %d generated, ctx %d]\n", n, pos - n, ctx);
+  free(logits); free_sampler(&sp); free_tokenizer(&tk);
+  inkling_runtime_free(&rt); inkling_state_free(&st); inkling_free(&m);
+  return 0;
 }
 
 int main(int argc, char *argv[]) {
@@ -401,6 +476,9 @@ int main(int argc, char *argv[]) {
       SRV_KEY = argv[i + 1];
     } else if (argv[i][1] == 'W') {
       SRV_SESS_DIR = argv[i + 1];
+    } else if (argv[i][1] == 'J') {
+      SRV_J = atoi(argv[i + 1]);
+      if (SRV_J < 1) SRV_J = 1;
     } else {
       error_usage();
     }
@@ -415,6 +493,16 @@ int main(int argc, char *argv[]) {
     topp = 0.9;
   if (steps < 0)
     steps = 0;
+
+  if (inkling_is_file(checkpoint_path)) {
+    if (!strcmp(mode, "server"))
+      return inkling_server(checkpoint_path, tokenizer_path, ctx);
+    int chat = strcmp(mode, "chat") == 0;
+    if (!chat && strcmp(mode, "generate") != 0)
+      fprintf(stderr, "[inkling: only generate/chat/server are implemented]\n");
+    return inkling_run(checkpoint_path, tokenizer_path, prompt, system_prompt, chat, steps,
+                       temperature, topp, rng_seed, ctx);
+  }
 
   // build the Transformer via the model .bin file
   Transformer transformer;
@@ -435,6 +523,8 @@ int main(int argc, char *argv[]) {
   build_transformer(&transformer, checkpoint_path, ctx);
   init_pool(&transformer, nthreads);
   fprintf(stderr, "[kv cache: %s]\n", kv_type_name(transformer.state.kv_type));
+  if (RECURRENT(&transformer.config) || transformer.config.glm) SRV_J = 1; // serial path only
+  if (SRV_J > SPEC_MAX_TOK) SRV_J = SPEC_MAX_TOK;
   if (transformer.config.glm && !spec_k_set) // GLM is MoE: the verify pass reads the union of the routed experts, measured no gain
     SPEC_K = 0;
   if (RECURRENT(&transformer.config) && draft_path) { // draft-model cache rollback is not implemented for recurrent targets

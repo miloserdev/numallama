@@ -169,3 +169,44 @@ KV quantization. Int8 is the default; `-K f32` is the full-precision escape hatc
 Session dumps, shared system-prefix slots and in-memory session snapshots use the same encoding:
 4x smaller (a Qwen3-30B session at 8k tokens: 1.6 GB -> 0.4 GB). A dump restored after a server
 restart gives the same continuation as a full re-prefill (`restored N tokens from disk`).
+
+Server logs now carry per-request timings: `restore` (session/prefix snapshot), `prefill`, `ttft`
+and, on the serial path, `save` (in-memory snapshot; the on-disk dump has its own line). Recurrent
+models also keep a per-session **turn slot**: the state one token before the assistant reply, with
+a token hash and a 4 GB LRU budget. A retry or regenerate restores it, so the user turn is not
+re-processed (a 24-token request: prefill 725 -> 207 ms, 23 cached tokens); the slot is written to
+the session dump and survives a restart. Rewriting a branch forces the next dump, so a session is
+not lost to the 30 s / 2048-token dump throttle.
+
+## Continuous batching, Qwen3-30B-A3B Q4 (2026-11-27)
+
+2 sockets, 128 threads, i8 KV, temperature 0, 128 generated tokens per reply, 4 different prompts;
+`-J 1` serves them one at a time, `-J 4` decodes one token of every session per weight pass.
+
+| sessions | serial tok/s | batched tok/s | speedup |
+|---|---|---|---|
+| 4 | 65.1-72.9 | 103.7-109.2 | **1.5-1.6x** |
+| 2 | 64.8 | 80.2 | **1.24x** |
+
+The gain is smaller than dense-model batching would give: every token of a MoE step routes to its own
+experts, so four unrelated prompts read a union of ~32 experts per step instead of 8. The shared
+weights (attention, router, embeddings) are still read once for all sessions. Dense models should
+scale better. Outputs match the serial loop in the tests; near-ties may drift because the attention
+is computed in a different order. Each session owns a full `-c` KV cache (i8: 0.43 GiB at 8k for
+this model); the cache is dumped on completion and restored on the next turn or after a restart
+(`cached_tokens` counts the reused prefix). Prefill is blocking in v1; speculative decoding is off
+in the batched path.
+
+## Memory: quantized embeddings (2026-11-27)
+
+The token embedding table is no longer dequantized into fp32 at load; the row of the current token
+is dequantized on demand (`embed_row`). Idle RSS of the server (i8 KV):
+
+| Model | Context | Idle RSS |
+|---|---|---|
+| Qwen3.8-27B Q4 | 8192 | 17.6 GB |
+| Qwen3-30B-A3B Q4 | 8192, `-J 2` | 19.0 GB |
+
+That is 1.24 GB (Qwen3-30B) / 5.09 GB (Qwen3.8-27B) less than the materialized table would need,
+and the load no longer spends time dequantizing it. A shared classifier (tied embeddings) is read
+through the packed layout that `pack_q8` produces.

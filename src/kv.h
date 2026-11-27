@@ -36,36 +36,95 @@ static int kv_resolve(const Config* p) {
   return KV_REQ;
 }
 
-static void kv_alloc(RunState* s, const Config* p) {
-  s->kv_type = kv_resolve(p);
-  if (s->kv_type == KV_I8) {
+// Per-session caches are used by every node, but each KV head group is read by the node that runs
+// its attention (node_groups). Bind those streams like the global cache, so a batched session does
+// not pull all of its KV traffic through one node.
+static void kv_cache_bind(const Config* p, KVCache* c) {
+#if defined(__linux__)
+  if (NN <= 1 || p->glm) return;
+  const size_t hb = (size_t)p->seq_len * p->head_dim;
+  for (int l = 0; l < p->n_attn; l++)
+    for (int k = 0; k < NN; k++) {
+      int g0, g1;
+      node_groups(p->n_kv_heads, k, &g0, &g1);
+      size_t idx = (size_t)l * p->n_kv_heads + g0, len = (size_t)(g1 - g0) * hb;
+      if (c->kq) {
+        bind_range(c->kq + idx * hb, len, NODE_ID[k]);
+        bind_range(c->vq + idx * hb, len, NODE_ID[k]);
+        bind_range(c->ks + idx * hb / GS, len / GS * sizeof(float), NODE_ID[k]);
+        bind_range(c->vs + idx * hb / GS, len / GS * sizeof(float), NODE_ID[k]);
+      } else if (c->kf) {
+        bind_range(c->kf + idx * hb, len * sizeof(float), NODE_ID[k]);
+        bind_range(c->vf + idx * hb, len * sizeof(float), NODE_ID[k]);
+      }
+    }
+#else
+  (void)p; (void)c;
+#endif
+}
+
+static void kv_cache_alloc(const Config* p, int type, KVCache* c) {
+  memset(c, 0, sizeof *c);
+  c->type = type;
+  if (type == KV_I8) {
     size_t nq = (size_t)p->n_attn * p->seq_len * p->kv_dim;
     size_t ns = nq / GS;
-    s->key_cache_q = calloc(nq, 1);
-    s->value_cache_q = calloc(nq, 1);
-    s->key_cache_s = calloc(ns, sizeof(float));
-    s->value_cache_s = calloc(ns, sizeof(float));
-    if (!s->key_cache_q || !s->value_cache_q || !s->key_cache_s || !s->value_cache_s) {
+    c->kq = calloc(nq, 1);
+    c->vq = calloc(nq, 1);
+    c->ks = calloc(ns, sizeof(float));
+    c->vs = calloc(ns, sizeof(float));
+    if (!c->kq || !c->vq || !c->ks || !c->vs) {
       fprintf(stderr, "malloc failed (kv i8 cache)!\n");
       exit(EXIT_FAILURE);
     }
   } else {
-    s->key_cache = calloc((size_t)p->n_attn * p->seq_len * p->kv_dim, sizeof(float));
-    // GLM: the attention cache holds the MLA latent only, no separate V
-    s->value_cache = p->glm ? calloc(1, sizeof(float)) : calloc((size_t)p->n_attn * p->seq_len * p->kv_dim, sizeof(float));
+    size_t n = (size_t)p->n_attn * p->seq_len * p->kv_dim;
+    c->kf = calloc(n, sizeof(float));
+    c->vf = p->glm ? calloc(1, sizeof(float)) : calloc(n, sizeof(float));
+    if (!c->kf || !c->vf) {
+      fprintf(stderr, "malloc failed (kv f32 cache)!\n");
+      exit(EXIT_FAILURE);
+    }
   }
+  kv_cache_bind(p, c);
 }
 
-static void kv_free(RunState* s) {
-  free(s->key_cache);
-  free(s->value_cache);
-  free(s->key_cache_q);
-  free(s->value_cache_q);
-  free(s->key_cache_s);
-  free(s->value_cache_s);
+static void kv_cache_free(KVCache* c) {
+  free(c->kq); free(c->vq); free(c->ks); free(c->vs);
+  free(c->kf); free(c->vf);
+  memset(c, 0, sizeof *c);
+}
+
+// make the model state point at this cache (pointer assignment only)
+static void kv_attach(RunState* s, const KVCache* c) {
+  s->key_cache = c->kf;
+  s->value_cache = c->vf;
+  s->key_cache_q = c->kq;
+  s->value_cache_q = c->vq;
+  s->key_cache_s = c->ks;
+  s->value_cache_s = c->vs;
+  s->kv_type = c->type;
+}
+
+static void kv_detach(RunState* s) {
   s->key_cache = s->value_cache = NULL;
   s->key_cache_q = s->value_cache_q = NULL;
   s->key_cache_s = s->value_cache_s = NULL;
+}
+
+static void kv_alloc(RunState* s, const Config* p) {
+  s->kv_type = kv_resolve(p);
+  kv_cache_alloc(p, s->kv_type, &s->own);
+  kv_attach(s, &s->own);
+  s->kv_owned = 1;
+}
+
+static void kv_free(RunState* s) {
+  if (s->kv_owned) {
+    kv_cache_free(&s->own);
+    s->kv_owned = 0;
+  }
+  kv_detach(s);
 }
 
 static inline size_t kv_row_off(const Config* p, int l, int g, int pos) {  return (size_t)l * p->seq_len * p->kv_dim + (size_t)g * p->seq_len * p->head_dim +

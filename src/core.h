@@ -32,7 +32,7 @@ double ROPE_THETA = 500000.0; // Llama 3 default
 double ROPE_FACTOR = 0.0;     // > 0 enables llama3 rope scaling (Llama 3.1 / 3.2)
 double ROPE_LOW_FREQ = 1.0, ROPE_HIGH_FREQ = 4.0, ROPE_ORIG_CTX = 8192.0;
 // architecture info from the extended header
-enum { ARCH_LLAMA3 = 0, ARCH_QWEN2 = 1, ARCH_QWEN3 = 2, ARCH_QWEN35 = 3, ARCH_GLM5 = 4 }; // Qwen*: ChatML template, Qwen tokenizer
+enum { ARCH_LLAMA3 = 0, ARCH_QWEN2 = 1, ARCH_QWEN3 = 2, ARCH_QWEN35 = 3, ARCH_GLM5 = 4, ARCH_INKLING = 5 }; // Qwen*: ChatML template, Qwen tokenizer
 #define ARCH_IS_QWEN (ARCH >= ARCH_QWEN2 && ARCH <= ARCH_QWEN35)
 int ARCH = ARCH_LLAMA3;
 float NORM_EPS = 1e-5f;
@@ -41,6 +41,7 @@ int SPECIAL_START = 128000; // first special token id
 int BOS_ID = 128000;
 int EOS_ID = 128009;
 int Q4_MASK = 0;
+int EMB_PACKED = 0; // the classifier shares the embedding tensor, so pack_q8 repacked it
 // NUMA: nodes in use, their OS ids; threads of node k are [NODE_T0[k], NODE_T0[k+1])
 #define MAX_NODES 8
 int NN = 1;
@@ -103,7 +104,7 @@ typedef struct {
 typedef struct {
   // token embedding table
   QuantizedTensor *q_tokens;    // (vocab_size, dim)
-  float *token_embedding_table; // same, but dequantized
+  float *token_embedding_table; // unused: rows are dequantized on demand (embed_row); kept NULL
 
   // weights for rmsnorms
   float *rms_att_weight; // (layer, dim) rmsnorm weights
@@ -135,7 +136,13 @@ typedef struct {
 } TransformerWeights;
 
 typedef struct {
-  // current wave of activations
+  int8_t *kq, *vq;  // int8 K/V values
+  float *ks, *vs;   // per-GS-group scales
+  float *kf, *vf;   // f32 K/V (kf only for GLM, vf is a dummy there)
+  int type;         // KV_F32 / KV_I8
+} KVCache;
+
+typedef struct {
   float *x;           // activation at current time stamp (dim,)
   float *xb;          // same, but inside a residual branch (dim,)
   float *xb2;         // an additional buffer just for convenience (dim,)
@@ -167,6 +174,8 @@ typedef struct {
   int kv_type;
   int8_t *key_cache_q, *value_cache_q;
   float *key_cache_s, *value_cache_s;
+  KVCache own;   // the cache allocated for this model (kv_alloc) ...
+  int kv_owned;  // ... and whether the pointers above are that allocation (0 = attached session)
   struct GlmState *glm; // GLM-5.3-Flash buffers, or NULL
 } RunState;
 // defined in kv.h (included after this header): allocate/free the cache in the chosen format
@@ -227,6 +236,7 @@ void malloc_run_state(RunState *s, Config *p) {
   s->snap_pos = -1;
   s->spec_S = s->spec_conv = NULL;
   s->spec_pos = -1;
+  s->kv_owned = 0;
   kv_alloc(s, p);
   if (p->glm) {
     int nlin = p->n_layers - p->n_attn;
@@ -279,6 +289,12 @@ void dequantize(QuantizedTensor *qx, float *x, int n) {
     x[i] = qx->q[i] * qx->s[i / GS];
   }
 }
+
+// one row of a Q8 tensor (the embedding of one token): dequantized on demand, never materialized.
+// Defined in quant.h: the layout depends on whether the classifier shares the embedding tensor
+// (then pack_q8 repacks that shared tensor into 4-row blocks).
+static inline void embed_row(const QuantizedTensor *qx, int row, float *dst, int n);
+static inline void embed_row_slice(const QuantizedTensor *qx, int row, int dim, float *dst, int from, int n);
 
 void quantize(QuantizedTensor *qx, float *x, int n) {
   int num_groups = n / GS;
@@ -366,9 +382,7 @@ void memory_map_weights(TransformerWeights *w, Config *p, void *ptr, uint8_t sha
   // now read all the quantized weights
   ptr = (void *)fptr; // now cast the pointer back to void*
   w->q_tokens = init_quantized_tensors(&ptr, 1, p->vocab_size * p->dim, 8);
-  // dequantize token embedding table
-  w->token_embedding_table = malloc((size_t)p->vocab_size * p->dim * sizeof(float));
-  // (dequantized by read_checkpoint once the data is loaded)
+  w->token_embedding_table = NULL; // rows are dequantized on demand (embed_row), never materialized
 
   w->wq = init_quantized_tensors(&ptr, p->n_attn, p->dim * q_dim, Q4_MASK & 1 ? 4 : 8);
   if (p->hybrid && p->attn_gate) w->wgate = init_quantized_tensors(&ptr, p->n_attn, p->dim * q_dim, Q4_MASK & 1 ? 4 : 8);

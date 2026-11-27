@@ -110,7 +110,7 @@ static void glm_map_weights(TransformerWeights* tw, Config* p, void* ptr) {
     // the generic code uses these
     tw->q_tokens = w->embed;
     tw->wcls = w->lm_head;
-    tw->token_embedding_table = malloc((size_t)p->vocab_size * D * sizeof(float));
+    tw->token_embedding_table = NULL; // dequantized per token by the callers
 }
 
 /* every quantized tensor of the model: n tensors of rows x cols (for repacking and NUMA placement);
@@ -389,9 +389,9 @@ static void forward_glm_thread(int tid) {
         memset(s->conv_state + cn * tid / nth, 0, (cn * (tid + 1) / nth - cn * tid / nth) * sizeof(float));
     }
     { // streams <- embedding (every stream the same)
-        const float* emb = tr->weights.token_embedding_table + (size_t)P.token * D;
         int a = (int)((long)D * tid / nth), b = (int)((long)D * (tid + 1) / nth);
-        for (int n = 0; n < hc; n++) memcpy(g->hs + (size_t)n * D + a, emb + a, (b - a) * sizeof(float));
+        for (int n = 0; n < hc; n++)
+            embed_row_slice(tr->weights.q_tokens, P.token, D, g->hs + (size_t)n * D + a, a, b - a);
     }
     barrier(tb);
 

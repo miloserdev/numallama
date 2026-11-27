@@ -20,7 +20,9 @@ static void forward_thread(int tid) {
     const int C = (pos + 1) / 64 < 1 ? 1 : ((pos + 1) / 64 < P.C ? (pos + 1) / 64 : P.C);
     const int T = pos + 1;
     const float att_scale = 1.0f / sqrtf((float)head_size);
-    const float* emb = w->token_embedding_table + (size_t)P.token * dim;
+    float emb_buf[dim];
+    embed_row(w->q_tokens, P.token, emb_buf, dim);
+    const float* emb = emb_buf;
     int r0, r1;
     const int8_t* nq = NB[tb->node].q; // the node's quantized matmul input
     const float* ns = NB[tb->node].s;

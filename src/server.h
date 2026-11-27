@@ -24,6 +24,24 @@
 #include <sys/statvfs.h>
 #define SRV_MAX_BODY (64 << 20)
 
+static long SRV_STARTED, SRV_REQUESTS, SRV_PROMPT_TOKENS, SRV_COMPLETION_TOKENS, SRV_CACHE_TOKENS;
+static volatile sig_atomic_t SRV_STOP;
+static int SRV_LS = -1;
+static void srv_stop_handler(int sig) {
+  (void)sig;
+  SRV_STOP = 1;
+  if (SRV_LS >= 0) shutdown(SRV_LS, SHUT_RDWR);
+  if (SRV_LS >= 0) close(SRV_LS);
+  SRV_LS = -1;
+}
+static void srv_install_stop(void) {
+  struct sigaction sa = {0};
+  sa.sa_handler = srv_stop_handler;
+  sigemptyset(&sa.sa_mask);
+  sigaction(SIGINT, &sa, NULL);
+  sigaction(SIGTERM, &sa, NULL);
+}
+
 typedef struct {
   int fd, failed;
   int stream;
@@ -35,6 +53,7 @@ typedef struct {
   int stop_hit;
   char id[48];
   long created;
+  long t_first;              // time of the first generated token (TTFT); 0 = none yet
   volatile int *hb_stop;     // SSE keep-alive during prefill: cleared on the first content chunk
 } SrvReq;
 
@@ -138,17 +157,27 @@ static void srv_flush(SrvReq *r, int which, int final) {
 typedef struct {
   int fd;
   volatile int *stop, *failed;
+  volatile int *abort; // set on a failed send (the caller's prefill must stop), or NULL
 } SrvHb;
+// sleep up to ms, but wake early when the request stops: pthread_join() must not wait out the
+// whole keep-alive interval after every prefill (that added a fixed ~2 s to every streaming turn)
+static int srv_hb_nap(volatile int *stop, int ms) {
+  for (int i = 0; i < ms / 10; i++) {
+    if (*stop) return 1;
+    struct timespec ts = {0, 10 * 1000 * 1000};
+    nanosleep(&ts, NULL);
+  }
+  return *stop != 0;
+}
 static void *srv_heartbeat(void *arg) {
   SrvHb *hb = arg;
-  while (!*hb->stop) {
-    struct timespec ts = {2, 0};
-    nanosleep(&ts, NULL);
-    if (*hb->stop) break;
+  while (!srv_hb_nap(hb->stop, 2000)) {
     if (send(hb->fd, ": keep-alive\n\n", 14, MSG_NOSIGNAL) != 14) {
       *hb->failed = 1;
-      g_srv_abort = 1; // stop the prefill: the client is gone
-      if (g_sink) g_sink->stop = 1;
+      if (hb->abort) {
+        *hb->abort = 1; // stop the prefill: the client is gone
+        if (g_sink) g_sink->stop = 1;
+      }
       break;
     }
   }
@@ -157,6 +186,7 @@ static void *srv_heartbeat(void *arg) {
 
 static void srv_text(void *ctx, const char *s, int reasoning) {
   SrvReq *r = ctx;
+  if (!r->t_first && s && *s) r->t_first = time_in_ms();
   if (reasoning) {
     sb_puts(&r->reasoning, s);
     if (r->stream) srv_flush(r, 1, 0);
@@ -465,6 +495,17 @@ static void srv_snap_free(SrvSnap *sp) {
 // model. The session whose state currently sits in the model is "live"; any other session is
 // swapped in from its snapshot (memory, else the on-disk dump) on demand. "default" is the
 // anonymous session.
+// Recurrent models: a per-session copy of the state at the end of the prompt (one token before the
+// assistant reply). A retry/regenerate can resume there instead of re-processing the user turn; the
+// token hash guards against a stale slot after a history edit. The KV region is not copied: the
+// model's position-indexed cache can be rewound, only lin_S/conv_state cannot.
+typedef struct {
+  int pos;
+  unsigned hash;
+  long last_use;
+  float *S, *conv;
+} SrvTurn;
+
 typedef struct {
   char id[72];
   int *tok;
@@ -474,6 +515,12 @@ typedef struct {
   int dumped_n;
   long last_use;
   SrvSnap snap; // in-memory state snapshot for a fast swap-back (n == this->n when fresh)
+  SrvTurn turn; // recurrent: prompt-end state for retries/regenerates
+  KVCache kv;   // dense batched path: this session's own KV cache
+  int kv_ready;
+  int kv_n;     // tokens represented in kv (0: not resident)
+  int kv_disk_checked; // the on-disk dump was already tried for this cache
+  int busy;     // a batched request is decoding this session
 } SrvSession;
 
 #define SRV_MAX_SESS 64
@@ -482,6 +529,18 @@ static int g_nsessions;
 static SrvSession *g_live;
 static SrvSession *g_pending_dump; // set by srv_chat, written to disk after the connection closes
 static SrvSession g_fallback; // registry full / persistence off: one anonymous in-memory session
+
+static void srv_metrics_json(SBuf *b, int active, int queued) {
+  sb_puts(b, "{\"uptime_s\":");
+  char t[256];
+  snprintf(t, sizeof t, "%ld", (long)(time(NULL) - SRV_STARTED));
+  sb_puts(b, t);
+  snprintf(t, sizeof t, ",\"requests\":%ld,\"prompt_tokens\":%ld,\"completion_tokens\":%ld,\"cached_tokens\":%ld",
+           SRV_REQUESTS, SRV_PROMPT_TOKENS, SRV_COMPLETION_TOKENS, SRV_CACHE_TOKENS);
+  sb_puts(b, t);
+  snprintf(t, sizeof t, ",\"sessions\":%d,\"active\":%d,\"queued\":%d}", g_nsessions, active, queued);
+  sb_puts(b, t);
+}
 
 // cap the total in-memory snapshot bytes: free the least recently used snapshots (never keep1/2)
 #define SRV_SNAP_BUDGET ((size_t)24 << 30)
@@ -509,6 +568,7 @@ static void srv_snap_budget(Transformer *tr, SrvSession *keep1, SrvSession *keep
 // session then only processes its own tail instead of the whole system prompt. Slots own their
 // state copies, so they coexist regardless of what the physical caches currently hold.
 #define SRV_MAX_SYS 8
+#define SRV_SYS_MIN 2048 // shorter prefixes do not take a slot: a title request must not evict an agent preamble
 typedef struct {
   int n;        // prefix length in tokens (0: empty slot)
   int *tok;     // the rendered prefix tokens
@@ -533,6 +593,12 @@ static SrvSys *srv_sys_slot(void) {
   g_sys_next = (g_sys_next + 1) % SRV_MAX_SYS;
   return v;
 }
+static void srv_sys_restore(Transformer *tr, SrvSys *slot, const SrvSession *S) {
+  long t = time_in_ms();
+  srv_snap_load(tr, &slot->snap);
+  fprintf(stderr, "[server] session %s: restored the %d-token system prefix in %ld ms\n", S->id, slot->n,
+          time_in_ms() - t);
+}
 // file name identity of a prefix: FNV-1a over its tokens
 static unsigned srv_tok_hash(const int *tok, int n) {
   unsigned h = 2166136261u;
@@ -541,6 +607,62 @@ static unsigned srv_tok_hash(const int *tok, int n) {
     h *= 16777619u;
   }
   return h;
+}
+
+#define SRV_TURN_BUDGET ((size_t)4 << 30) // recurrent turn slots across sessions (one is ~160 MB)
+static void srv_turn_free(SrvTurn *t) {
+  free(t->S);
+  free(t->conv);
+  memset(t, 0, sizeof *t);
+}
+static void srv_turn_budget(Transformer *tr, SrvSession *keep) {
+  const Config *p = &tr->config;
+  if (!RECURRENT(p)) return;
+  const size_t bytes = (hyb_state_floats(p) + hyb_conv_floats(p)) * sizeof(float);
+  for (;;) {
+    size_t total = 0;
+    SrvSession *old = NULL;
+    for (int i = 0; i < g_nsessions; i++) {
+      SrvSession *s = &g_sessions[i];
+      if (!s->turn.S) continue;
+      total += bytes;
+      if (s != keep && (!old || s->turn.last_use < old->turn.last_use)) old = s;
+    }
+    if (total <= SRV_TURN_BUDGET || !old) return;
+    srv_turn_free(&old->turn);
+  }
+}
+// copy a recurrent state (lin_S/conv) at pos into the session's turn slot
+static int srv_turn_put(Transformer *tr, SrvSession *S, const float *Ssrc, const float *conv, int pos, const int *tok) {
+  const Config *p = &tr->config;
+  if (!RECURRENT(p) || pos <= 0 || !Ssrc || !conv) return 0;
+  size_t sf = hyb_state_floats(p), cf = hyb_conv_floats(p);
+  if (!S->turn.S) {
+    S->turn.S = malloc(sf * sizeof(float));
+    S->turn.conv = malloc(cf * sizeof(float));
+  }
+  if (!S->turn.S || !S->turn.conv) {
+    srv_turn_free(&S->turn);
+    return 0;
+  }
+  memcpy(S->turn.S, Ssrc, sf * sizeof(float));
+  memcpy(S->turn.conv, conv, cf * sizeof(float));
+  S->turn.pos = pos;
+  S->turn.hash = srv_tok_hash(tok, pos);
+  S->turn.last_use = time(NULL);
+  srv_turn_budget(tr, S);
+  return 1;
+}
+// restore the session's turn state at pos; 1 if the tokens still match the slot
+static int srv_turn_restore(Transformer *tr, SrvSession *S, const int *tok, int pos) {
+  const Config *p = &tr->config;
+  if (!RECURRENT(p) || !S->turn.S || !S->turn.conv || S->turn.pos != pos || pos <= 0) return 0;
+  if (S->turn.hash != srv_tok_hash(tok, pos)) return 0;
+  memcpy(tr->state.lin_S, S->turn.S, hyb_state_floats(p) * sizeof(float));
+  memcpy(tr->state.conv_state, S->turn.conv, hyb_conv_floats(p) * sizeof(float));
+  tr->state.next_pos = pos;
+  S->turn.last_use = time(NULL);
+  return 1;
 }
 
 static SrvSession *srv_session(const char *id, int cap) {
@@ -584,6 +706,7 @@ static void srv_journal(const SrvSession *S, const char *body, int np, int gen, 
 
 static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *sess_hdr, int fd, const char *body) {
   const int ctx = tr->config.seq_len;
+  const long t_req = time_in_ms();
   JNode *req = json_parse(body, NULL);
   JNode *messages = req ? json_get(req, "messages") : NULL;
   if (!req || req->type != J_OBJ || !messages || messages->type != J_ARR || !messages->child) {
@@ -606,7 +729,9 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
   srv_sanitize_id(sid);
   SrvSession *S = srv_session(sid, tr->config.seq_len);
   S->last_use = time(NULL);
+  long t_restore = 0;
   if (S != g_live) { // the model holds another session's state: swap ours in
+    long sw0 = time_in_ms();
     if (g_live && g_live != &g_fallback && g_live->n > 0) // keep the outgoing state for a fast swap-back
       srv_snap_take(tr, &g_live->snap, g_live->n);
     int loaded = 0, from_mem = 0;
@@ -620,7 +745,11 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
       loaded = sess_read(tr, S->tok, S->cap, path);
     }
     if (loaded > 0) {
-      fprintf(stderr, "[server] session %s: restored %d tokens from %s\n", S->id, loaded, from_mem ? "memory" : "disk");
+      if (RECURRENT(&tr->config) && tr->state.snap_S && tr->state.snap_pos > 0)
+        srv_turn_put(tr, S, tr->state.snap_S, tr->state.snap_conv, tr->state.snap_pos, S->tok);
+      t_restore = time_in_ms() - sw0;
+      fprintf(stderr, "[server] session %s: restored %d tokens from %s in %ld ms\n", S->id, loaded,
+              from_mem ? "memory" : "disk", t_restore);
       S->n = loaded;
       S->live = 1;
     } else {
@@ -631,11 +760,18 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
     g_live = S;
   }
   // per-request settings (restored at the end)
-  const float temp0 = sp->temperature, topp0 = sp->topp;
+  const float temp0 = sp->temperature, topp0 = sp->topp, minp0 = sp->min_p;
+  const float pp0 = sp->presence_penalty, fp0 = sp->frequency_penalty;
   const int think0 = THINK;
   if ((v = json_get(req, "temperature")) && v->type == J_NUM) sp->temperature = atof(v->str);
   if ((v = json_get(req, "top_p")) && v->type == J_NUM) sp->topp = atof(v->str);
+  if ((v = json_get(req, "min_p")) && v->type == J_NUM) sp->min_p = atof(v->str);
+  if ((v = json_get(req, "presence_penalty")) && v->type == J_NUM) sp->presence_penalty = atof(v->str);
+  if ((v = json_get(req, "frequency_penalty")) && v->type == J_NUM) sp->frequency_penalty = atof(v->str);
   if (sp->topp <= 0.0f || sp->topp > 1.0f) sp->topp = 1.0f;
+  if (sp->min_p < 0.0f || sp->min_p > 1.0f) sp->min_p = 0.0f;
+  if (sp->presence_penalty < -2.0f || sp->presence_penalty > 2.0f) sp->presence_penalty = 0.0f;
+  if (sp->frequency_penalty < -2.0f || sp->frequency_penalty > 2.0f) sp->frequency_penalty = 0.0f;
   if ((v = json_get(req, "seed")) && v->type == J_NUM) sp->rng_state = (unsigned long long)atoll(v->str) + 1;
   if ((v = json_get(req, "reasoning_effort")) && v->type == J_STR) THINK = strcmp(v->str, "none") && strcmp(v->str, "minimal");
   JNode *kw = json_get(req, "chat_template_kwargs");
@@ -697,7 +833,7 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
   sb_puts(&r.reasoning, "");
   ReplySink sink = {.text = srv_text, .ctx = &r, .max_gen = max_gen, .stop = r.failed};
   volatile int hb_stop = 0, hb_failed = 0;
-  SrvHb hb = {.fd = fd, .stop = &hb_stop, .failed = &hb_failed};
+  SrvHb hb = {.fd = fd, .stop = &hb_stop, .failed = &hb_failed, .abort = &g_srv_abort};
   pthread_t hbt;
   int hb_on = 0;
   if (r.stream) {
@@ -723,25 +859,26 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
   int lcp = 0;
   while (lcp < S->n && lcp < np && S->tok[lcp] == P[lcp]) lcp++;
   const int rec = RECURRENT(&tr->config);
-  SrvSys *sys_slot = sys_len > 1 && sys_len < np ? srv_sys_find(P, sys_len) : NULL;
-  int sys_cap = sys_len > 1 && sys_len < np && !sys_slot; // a new distinct system prefix
+  SrvSys *sys_slot = sys_len >= SRV_SYS_MIN && sys_len < np ? srv_sys_find(P, sys_len) : NULL;
+  int sys_cap = sys_len >= SRV_SYS_MIN && sys_len < np && !sys_slot; // a new distinct system prefix
   int reuse;
   if (!rec) {
     reuse = lcp < np ? lcp : np - 1; // at least one token is fed to get the logits
     if (sys_slot && reuse < sys_len) {
-      srv_snap_load(tr, &sys_slot->snap); // restore the shared prefix's caches (state stands at sys_len)
+      srv_sys_restore(tr, sys_slot, S); // restore the shared prefix's caches (state stands at sys_len)
       reuse = sys_len;
     }
   } else if (sys_slot && S->n < sys_len) {
-    srv_snap_load(tr, &sys_slot->snap); // state stands at sys_len now
+    srv_sys_restore(tr, sys_slot, S); // state stands at sys_len now
     reuse = sys_len; // a fresh session with the shared system prefix resumes right after it
   } else if (lcp == S->n && S->n < np) {
     reuse = S->n; // the state is exactly at the end of the shared prefix
-  } else if (tr->state.snap_S && tr->state.snap_pos > 0 && tr->state.snap_pos <= lcp &&
-             tr->state.snap_pos < np && hybrid_restore(tr, tr->state.snap_pos)) {
-    reuse = tr->state.snap_pos; // back to the end of the previous prompt
+  } else if (S->turn.pos > 0 && S->turn.pos < np && S->turn.pos <= lcp &&
+             srv_turn_restore(tr, S, P, S->turn.pos)) {
+    reuse = S->turn.pos; // retry/regenerate: resume from the prompt-end state
+    fprintf(stderr, "[server] session %s: restored the turn slot at %d tok\n", S->id, reuse);
   } else if (sys_slot) {
-    srv_snap_load(tr, &sys_slot->snap);
+    srv_sys_restore(tr, sys_slot, S);
     reuse = sys_len; // a diverged session with the same system prefix still beats a full re-feed
   } else {
     reuse = 0;
@@ -765,6 +902,8 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
       fprintf(stderr, "[server] session %s: diverging request (shared %d of %d tok), the session restarts\n",
               S->id, lcp, S->n);
     }
+    S->last_dump = 0; // the branch changed: do not throttle the next dump, or a restart loses it
+    S->dumped_n = 0;
   }
   if (reuse == sys_len && S->n < sys_len)
     memcpy(S->tok, P, (size_t)sys_len * sizeof(int)); // the session inherits the shared system prefix
@@ -808,7 +947,10 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
       chat_feed(tr, &h, P + reuse, np - 1 - reuse);
     }
   }
-  if (rec && !g_srv_abort && h.n == np - 1) hybrid_snapshot(tr);
+  if (rec && !g_srv_abort && h.n == np - 1) {
+    hybrid_snapshot(tr);
+    srv_turn_put(tr, S, tr->state.lin_S, tr->state.conv_state, h.n, S->tok);
+  }
   float *logits = g_srv_abort ? NULL : chat_feed(tr, &h, P + h.n, np - h.n);
   long t1 = time_in_ms();
   if (!logits) { // client gone mid-prefill: keep the processed prefix (the snapshot below), skip the reply
@@ -946,16 +1088,22 @@ static void srv_chat(Transformer *tr, Tokenizer *tk, Sampler *sp, const char *se
     srv_respond(fd, 200, "application/json", b.buf);
     free(b.buf);
   }
-  fprintf(stderr, "[server] prompt %d tok (cached %d) %.0f tok/s | reply %d tok %.1f tok/s | %s%s%s\n", np, reuse,
-          (np - reuse) * 1000.0 / (t1 - t0 > 0 ? t1 - t0 : 1), gen, gen * 1000.0 / (t2 - t1 > 0 ? t2 - t1 : 1), finish,
-          r.stream ? ", stream" : "", r.failed ? ", client disconnected" : "");
+  SRV_REQUESTS++; SRV_PROMPT_TOKENS += np; SRV_COMPLETION_TOKENS += gen; SRV_CACHE_TOKENS += reuse;
+  fprintf(stderr, "[server] prompt %d tok (cached %d) %.0f tok/s | reply %d tok %.1f tok/s | %s%s%s"
+                  " | restore %ld ms | prefill %ld ms | ttft %ld ms\n",
+          np, reuse, (np - reuse) * 1000.0 / (t1 - t0 > 0 ? t1 - t0 : 1), gen,
+          gen * 1000.0 / (t2 - t1 > 0 ? t2 - t1 : 1), finish, r.stream ? ", stream" : "",
+          r.failed ? ", client disconnected" : "", t_restore, t1 - t0, r.t_first ? r.t_first - t_req : -1);
   if (S != &g_fallback && r.content.buf) { // durable record + restorable state (best effort)
     if (!r.failed) srv_journal(S, body, np, gen, reuse, finish);
     // a snapshot costs seconds on a big session: throttle it; the memory snapshot makes the next
     // session swap a memcpy, the on-disk dump (written after the connection closes) survives restarts
     long now = time(NULL);
     if (S->n > 0 && (S->last_dump == 0 || S->n - S->dumped_n >= 2048 || now - S->last_dump >= 30)) {
-      srv_snap_take(tr, &S->snap, S->n);
+      long sv0 = time_in_ms();
+      int ok = srv_snap_take(tr, &S->snap, S->n);
+      long sv = time_in_ms() - sv0;
+      if (ok) fprintf(stderr, "[server] session %s: in-memory snapshot %d tok in %ld ms\n", S->id, S->n, sv);
       srv_snap_budget(tr, S, g_live);
       if (SRV_SESS_DIR) g_pending_dump = S;
     }
@@ -969,6 +1117,9 @@ done:
   g_tools = NULL;
   sp->temperature = temp0;
   sp->topp = topp0;
+  sp->min_p = minp0;
+  sp->presence_penalty = pp0;
+  sp->frequency_penalty = fp0;
   THINK = think0;
   json_free(req);
 }
@@ -1034,8 +1185,10 @@ static int srv_read(int fd, char *method, char *path, char **body, int *authoriz
   return 1;
 }
 
-static void server(Transformer *tr, Tokenizer *tk, Sampler *sp) {
+static void server_serial(Transformer *tr, Tokenizer *tk, Sampler *sp) {
   signal(SIGPIPE, SIG_IGN);
+  SRV_STARTED = time(NULL); SRV_STOP = 0; SRV_LS = -1;
+  srv_install_stop();
   init_special_tokens(tk);
   int ls = socket(AF_INET, SOCK_STREAM, 0);
   int one = 1;
@@ -1063,7 +1216,7 @@ static void server(Transformer *tr, Tokenizer *tk, Sampler *sp) {
           snprintf(path, sizeof path, "%s/%s", SRV_SESS_DIR, e->d_name);
           int *tok = malloc((size_t)tr->config.seq_len * sizeof(int));
           int n = sess_read(tr, tok, tr->config.seq_len, path); // a persisted system prefix
-          if (n > 1) {
+          if (n >= SRV_SYS_MIN) {
             SrvSys *slot = srv_sys_slot();
             srv_snap_free(&slot->snap);
             free(slot->tok);
@@ -1082,9 +1235,10 @@ static void server(Transformer *tr, Tokenizer *tk, Sampler *sp) {
   }
   fprintf(stderr, "[server] model %s, context %d, listening on http://%s:%d/v1%s\n", SRV_MODEL, tr->config.seq_len, SRV_HOST,
           SRV_PORT, SRV_KEY ? " (API key required)" : "");
-  for (;;) {
+  SRV_LS = ls;
+  while (!SRV_STOP) {
     int fd = accept(ls, NULL, NULL);
-    if (fd < 0) continue;
+    if (fd < 0) { if (SRV_STOP) break; continue; }
     struct timeval tv = {.tv_sec = 60};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
@@ -1102,6 +1256,11 @@ static void server(Transformer *tr, Tokenizer *tk, Sampler *sp) {
         srv_respond(fd, 200, "application/json", "{\"status\": \"ok\"}");
       } else if (!authorized) {
         srv_error(fd, 401, "invalid_request_error", "invalid API key");
+      } else if (!strcmp(method, "GET") && !strcmp(path, "/metrics")) {
+        SBuf b = {0};
+        srv_metrics_json(&b, 0, 0);
+        srv_respond(fd, 200, "application/json", b.buf);
+        free(b.buf);
       } else if (!strcmp(method, "GET") && (!strcmp(path, "/v1/models") || !strcmp(path, "/models"))) {
         SBuf b = {0};
         sb_puts(&b, "{\"object\": \"list\", \"data\": [{\"id\": ");

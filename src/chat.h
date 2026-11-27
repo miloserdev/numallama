@@ -731,6 +731,7 @@ static void reply_token(ReplyState *rs, Tokenizer *tk, int next) {
 static int chat_reply(Transformer *tr, Tokenizer *tk, Sampler *sp, ChatHistory *h, float *logits, int *ended, int *gen,
                       JNode **calls) {
   ReplyState rs = {.mode = 0, .n_calls = 0, .token = -1, .calls = calls};
+  sampler_reset(sp); // presence / frequency penalties count only this completion
   if (THINK_IN_PROMPT && THINK) { out_ctl("\033[2m"); rs.think = 1; } // the prompt already opened <think>
   sb_puts(&rs.buf, "");
   const int V = tr->config.vocab_size;

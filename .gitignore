@@ -18,9 +18,13 @@ models/
 /tests/check_multi
 /tests/check_draft
 /tests/check_kv
+/tests/check_seqs
 # local runtime artifacts
 /workspace/
 /.opencode/
 /opencode.json
 /monitor-gpu.sh
 /{path}
+/runq_portable
+/tests/check_inkling
+/.qoder/
